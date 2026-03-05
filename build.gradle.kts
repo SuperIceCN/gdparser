@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "dev.superice"
-version = "1.0-SNAPSHOT"
+version = "0.2.1"
 
 fun normalizedOsName(name: String): String = when {
     name.contains("win", ignoreCase = true) -> "windows"
