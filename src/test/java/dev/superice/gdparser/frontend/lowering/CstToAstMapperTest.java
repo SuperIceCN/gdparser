@@ -8,12 +8,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
 
 import java.io.IOException;
+import java.lang.reflect.RecordComponent;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -179,6 +181,68 @@ class CstToAstMapperTest {
     }
 
     @Test
+    void dedicatedSemanticNodesShouldLowerToSpecificAstRecords() {
+        var source = """
+                #region Demo
+                @tool
+                class_name Demo
+                extends Node
+                
+                enum Kind { A, B = 2 }
+                
+                @export var value: int = 1
+                
+                @static_unload
+                class Inner extends RefCounted:
+                    pass
+                
+                func foo():
+                    return 1
+                
+                func _init():
+                    .foo()
+                    var target = $"../Node" as Node
+                    var matches = target is Node
+                    var misses = target is not Node2D
+                    var owner = self
+                    var scene = preload("res://scene.tscn")
+                    var awaited = await foo()
+                    while true:
+                        continue
+                        break
+                    breakpoint
+                    match target:
+                        var bound when bound is Node:
+                            pass
+                    assert(target != null, "target required")
+                #endregion
+                """;
+
+        var result = map(source);
+
+        assertFalse(hasErrors(result), () -> "Unexpected errors: " + result.diagnostics());
+        assertTrue(result.diagnostics().isEmpty(), () -> "Unexpected diagnostics: " + result.diagnostics());
+        assertTrue(containsAstValue(result.ast(), AnnotationStatement.class));
+        assertTrue(containsAstValue(result.ast(), RegionDirectiveStatement.class));
+        assertTrue(containsAstValue(result.ast(), EnumDeclaration.class));
+        assertTrue(containsAstValue(result.ast(), ClassDeclaration.class));
+        assertTrue(containsAstValue(result.ast(), ConstructorDeclaration.class));
+        assertTrue(containsAstValue(result.ast(), BaseCallExpression.class));
+        assertTrue(containsAstValue(result.ast(), GetNodeExpression.class));
+        assertTrue(containsAstValue(result.ast(), CastExpression.class));
+        assertTrue(containsAstValue(result.ast(), TypeTestExpression.class));
+        assertTrue(containsAstValue(result.ast(), SelfExpression.class));
+        assertTrue(containsAstValue(result.ast(), PreloadExpression.class));
+        assertTrue(containsAstValue(result.ast(), AwaitExpression.class));
+        assertTrue(containsAstValue(result.ast(), PatternBindingExpression.class));
+        assertTrue(containsAstValue(result.ast(), ContinueStatement.class));
+        assertTrue(containsAstValue(result.ast(), BreakStatement.class));
+        assertTrue(containsAstValue(result.ast(), BreakpointStatement.class));
+        assertTrue(containsAstValue(result.ast(), AssertStatement.class));
+        assertNoUnknownNodes(result.ast(), "focused snippet");
+    }
+
+    @Test
     void invalidSourceShouldEmitErrorDiagnosticsWithSpan() {
         var source = "func _ready(: pass";
         var result = map(source);
@@ -199,7 +263,7 @@ class CstToAstMapperTest {
     }
 
     @TestFactory
-    List<DynamicTest> fixtureScriptsShouldLowerWithoutErrorDiagnostics() throws IOException {
+    List<DynamicTest> fixtureScriptsShouldLowerWithoutDiagnosticsOrUnknownNodes() throws IOException {
         var scripts = fixtureScripts();
         var tests = new ArrayList<DynamicTest>();
 
@@ -209,7 +273,8 @@ class CstToAstMapperTest {
                 var result = map(source);
 
                 assertFalse(result.ast().statements().isEmpty());
-                assertFalse(hasErrors(result), () -> "Unexpected errors in " + script.getFileName() + ": " + result.diagnostics());
+                assertTrue(result.diagnostics().isEmpty(), () -> "Unexpected diagnostics in " + script.getFileName() + ": " + result.diagnostics());
+                assertNoUnknownNodes(result.ast(), script.getFileName().toString());
             }));
         }
 
@@ -233,5 +298,60 @@ class CstToAstMapperTest {
     private static AstMappingResult map(String source) {
         var root = parserFacade.parseCstRoot(source);
         return mapper.map(source, root);
+    }
+
+    private static boolean containsAstValue(SourceFile sourceFile, Class<?> expectedType) {
+        var found = new boolean[]{false};
+        visitAst(sourceFile, value -> {
+            if (expectedType.isInstance(value)) {
+                found[0] = true;
+            }
+        });
+        return found[0];
+    }
+
+    private static void assertNoUnknownNodes(SourceFile sourceFile, String context) {
+        var unknownTypes = new ArrayList<String>();
+        visitAst(sourceFile, value -> {
+            if (value instanceof UnknownStatement || value instanceof UnknownExpression || value instanceof UnknownAttributeStep) {
+                unknownTypes.add(value.getClass().getSimpleName());
+            }
+        });
+        assertTrue(unknownTypes.isEmpty(), () -> "Unexpected unknown nodes in " + context + ": " + unknownTypes);
+    }
+
+    private static void visitAst(Object value, Consumer<Object> consumer) {
+        if (value == null) {
+            return;
+        }
+        if (value instanceof List<?> list) {
+            for (var element : list) {
+                visitAst(element, consumer);
+            }
+            return;
+        }
+
+        var type = value.getClass();
+        if (!type.isRecord()) {
+            return;
+        }
+
+        consumer.accept(value);
+        for (var component : type.getRecordComponents()) {
+            visitAst(readRecordComponent(component, value), consumer);
+        }
+    }
+
+    private static Object readRecordComponent(RecordComponent component, Object instance) {
+        try {
+            return component.getAccessor().invoke(instance);
+        } catch (RuntimeException exception) {
+            throw exception;
+        } catch (Throwable throwable) {
+            throw new IllegalStateException(
+                    "Cannot access record component '%s' on %s".formatted(component.getName(), instance.getClass().getName()),
+                    throwable
+            );
+        }
     }
 }

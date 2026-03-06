@@ -1,6 +1,68 @@
 package dev.superice.gdparser.frontend.lowering;
 
-import dev.superice.gdparser.frontend.ast.*;
+import dev.superice.gdparser.frontend.ast.AnnotationStatement;
+import dev.superice.gdparser.frontend.ast.ArrayExpression;
+import dev.superice.gdparser.frontend.ast.AssertStatement;
+import dev.superice.gdparser.frontend.ast.AssignmentExpression;
+import dev.superice.gdparser.frontend.ast.AttributeCallStep;
+import dev.superice.gdparser.frontend.ast.AttributeExpression;
+import dev.superice.gdparser.frontend.ast.AttributePropertyStep;
+import dev.superice.gdparser.frontend.ast.AttributeStep;
+import dev.superice.gdparser.frontend.ast.AttributeSubscriptStep;
+import dev.superice.gdparser.frontend.ast.AstDiagnostic;
+import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
+import dev.superice.gdparser.frontend.ast.AstFactory;
+import dev.superice.gdparser.frontend.ast.AstMappingResult;
+import dev.superice.gdparser.frontend.ast.AwaitExpression;
+import dev.superice.gdparser.frontend.ast.BaseCallExpression;
+import dev.superice.gdparser.frontend.ast.BinaryExpression;
+import dev.superice.gdparser.frontend.ast.Block;
+import dev.superice.gdparser.frontend.ast.BreakStatement;
+import dev.superice.gdparser.frontend.ast.BreakpointStatement;
+import dev.superice.gdparser.frontend.ast.CallExpression;
+import dev.superice.gdparser.frontend.ast.CastExpression;
+import dev.superice.gdparser.frontend.ast.ClassDeclaration;
+import dev.superice.gdparser.frontend.ast.ClassNameStatement;
+import dev.superice.gdparser.frontend.ast.CommentStatement;
+import dev.superice.gdparser.frontend.ast.ConditionalExpression;
+import dev.superice.gdparser.frontend.ast.ConstructorDeclaration;
+import dev.superice.gdparser.frontend.ast.ContinueStatement;
+import dev.superice.gdparser.frontend.ast.DeclarationKind;
+import dev.superice.gdparser.frontend.ast.DictEntry;
+import dev.superice.gdparser.frontend.ast.DictionaryExpression;
+import dev.superice.gdparser.frontend.ast.ElifClause;
+import dev.superice.gdparser.frontend.ast.EnumDeclaration;
+import dev.superice.gdparser.frontend.ast.EnumMember;
+import dev.superice.gdparser.frontend.ast.Expression;
+import dev.superice.gdparser.frontend.ast.ExpressionStatement;
+import dev.superice.gdparser.frontend.ast.ExtendsStatement;
+import dev.superice.gdparser.frontend.ast.ForStatement;
+import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
+import dev.superice.gdparser.frontend.ast.GetNodeExpression;
+import dev.superice.gdparser.frontend.ast.IdentifierExpression;
+import dev.superice.gdparser.frontend.ast.IfStatement;
+import dev.superice.gdparser.frontend.ast.LambdaExpression;
+import dev.superice.gdparser.frontend.ast.LiteralExpression;
+import dev.superice.gdparser.frontend.ast.MatchSection;
+import dev.superice.gdparser.frontend.ast.MatchStatement;
+import dev.superice.gdparser.frontend.ast.Parameter;
+import dev.superice.gdparser.frontend.ast.PassStatement;
+import dev.superice.gdparser.frontend.ast.PatternBindingExpression;
+import dev.superice.gdparser.frontend.ast.PreloadExpression;
+import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.RegionDirectiveStatement;
+import dev.superice.gdparser.frontend.ast.ReturnStatement;
+import dev.superice.gdparser.frontend.ast.SelfExpression;
+import dev.superice.gdparser.frontend.ast.SignalStatement;
+import dev.superice.gdparser.frontend.ast.SourceFile;
+import dev.superice.gdparser.frontend.ast.Statement;
+import dev.superice.gdparser.frontend.ast.SubscriptExpression;
+import dev.superice.gdparser.frontend.ast.TypeRef;
+import dev.superice.gdparser.frontend.ast.TypeTestExpression;
+import dev.superice.gdparser.frontend.ast.UnaryExpression;
+import dev.superice.gdparser.frontend.ast.UnknownAttributeStep;
+import dev.superice.gdparser.frontend.ast.VariableDeclaration;
+import dev.superice.gdparser.frontend.ast.WhileStatement;
 import dev.superice.gdparser.frontend.cst.CstErrorDetector;
 import dev.superice.gdparser.frontend.cst.CstNodeView;
 import org.jetbrains.annotations.NotNull;
@@ -72,9 +134,52 @@ public final class CstToAstMapper {
         private @NotNull List<Statement> mapStatements(List<CstNodeView> nodes) {
             var statements = new ArrayList<Statement>();
             for (var node : nodes) {
-                statements.add(mapStatement(node));
+                statements.addAll(mapStatementSequence(node));
             }
             return List.copyOf(statements);
+        }
+
+        private @NotNull List<Statement> mapStatementSequence(CstNodeView node) {
+            return switch (node.type()) {
+                case "annotation" -> List.of(mapAnnotationStatement(node));
+                case "annotations" -> mapAnnotationStatements(node);
+                default -> {
+                    var statements = new ArrayList<Statement>();
+                    statements.addAll(mapAnnotationStatements(findNamedChildByType(node, "annotations")));
+                    statements.add(mapStatement(node));
+                    yield List.copyOf(statements);
+                }
+            };
+        }
+
+        private @NotNull List<Statement> mapAnnotationStatements(@Nullable CstNodeView annotationsNode) {
+            if (annotationsNode == null) {
+                return List.of();
+            }
+            if (annotationsNode.type().equals("annotation")) {
+                return List.of(mapAnnotationStatement(annotationsNode));
+            }
+
+            var statements = new ArrayList<Statement>();
+            for (var child : annotationsNode.namedChildren()) {
+                if (child.type().equals("annotation")) {
+                    statements.add(mapAnnotationStatement(child));
+                }
+            }
+            return List.copyOf(statements);
+        }
+
+        private @NotNull AnnotationStatement mapAnnotationStatement(CstNodeView node) {
+            var nameNode = firstNamedChild(node);
+            if (nameNode == null) {
+                error("annotation missing name", node);
+                return new AnnotationStatement("", List.of(), AstFactory.range(node.range()));
+            }
+            return new AnnotationStatement(
+                    textTrimmed(nameNode),
+                    mapArgumentList(node.childByField("arguments")),
+                    AstFactory.range(node.range())
+            );
         }
 
         private @NotNull Statement mapStatement(CstNodeView node) {
@@ -86,11 +191,19 @@ public final class CstToAstMapper {
                         mapVariableDeclaration(node, DeclarationKind.VAR);
                 case "const_statement" -> mapVariableDeclaration(node, DeclarationKind.CONST);
                 case "function_definition" -> mapFunctionDeclaration(node);
+                case "constructor_definition" -> mapConstructorDeclaration(node);
+                case "class_definition" -> mapClassDeclaration(node);
+                case "enum_definition" -> mapEnumDeclaration(node);
                 case "if_statement" -> mapIfStatement(node);
                 case "for_statement" -> mapForStatement(node);
                 case "while_statement" -> mapWhileStatement(node);
                 case "match_statement" -> mapMatchStatement(node);
                 case "return_statement" -> mapReturnStatement(node);
+                case "break_statement" -> new BreakStatement(AstFactory.range(node.range()));
+                case "continue_statement" -> new ContinueStatement(AstFactory.range(node.range()));
+                case "breakpoint_statement" -> new BreakpointStatement(AstFactory.range(node.range()));
+                case "region_start", "region_end" -> mapRegionDirectiveStatement(node);
+                case "comment" -> new CommentStatement(text(node), AstFactory.range(node.range()));
                 case "expression_statement" -> mapExpressionStatement(node);
                 case "pass_statement" -> new PassStatement(AstFactory.range(node.range()));
                 default -> {
@@ -108,6 +221,58 @@ public final class CstToAstMapper {
                     textTrimmed(nameNode),
                     extractExtendsTarget(extendsNode),
                     iconNode == null ? null : textTrimmed(iconNode),
+                    AstFactory.range(node.range())
+            );
+        }
+
+        private @NotNull ClassDeclaration mapClassDeclaration(CstNodeView node) {
+            var nameNode = requireField(node, "name");
+            var extendsNode = node.childByField("extends");
+            var bodyNode = requireField(node, "body");
+            return new ClassDeclaration(
+                    textTrimmed(nameNode),
+                    extractExtendsTarget(extendsNode),
+                    mapBody(bodyNode, AstFactory.range(node.range())),
+                    AstFactory.range(node.range())
+            );
+        }
+
+        private @NotNull ConstructorDeclaration mapConstructorDeclaration(CstNodeView node) {
+            var parametersNode = requireField(node, "parameters");
+            var argumentsNode = node.childByField("arguments");
+            var returnTypeNode = node.childByField("return_type");
+            var bodyNode = requireField(node, "body");
+            return new ConstructorDeclaration(
+                    mapParameters(parametersNode),
+                    mapArgumentList(argumentsNode),
+                    mapTypeRef(returnTypeNode),
+                    mapBody(bodyNode, AstFactory.range(node.range())),
+                    AstFactory.range(node.range())
+            );
+        }
+
+        private @NotNull EnumDeclaration mapEnumDeclaration(CstNodeView node) {
+            var nameNode = node.childByField("name");
+            var bodyNode = requireField(node, "body");
+            var members = new ArrayList<EnumMember>();
+            for (var child : bodyNode.namedChildren()) {
+                if (child.type().equals("enumerator")) {
+                    members.add(mapEnumMember(child));
+                }
+            }
+            return new EnumDeclaration(
+                    nameNode == null ? null : textTrimmed(nameNode),
+                    List.copyOf(members),
+                    AstFactory.range(node.range())
+            );
+        }
+
+        private @NotNull EnumMember mapEnumMember(CstNodeView node) {
+            var nameNode = requireField(node, "left");
+            var valueNode = node.childByField("right");
+            return new EnumMember(
+                    textTrimmed(nameNode),
+                    valueNode == null ? null : mapExpression(valueNode),
                     AstFactory.range(node.range())
             );
         }
@@ -236,8 +401,8 @@ public final class CstToAstMapper {
 
         private @NotNull MatchSection mapMatchSection(CstNodeView sectionNode) {
             var bodyNode = requireField(sectionNode, "body");
-            var patterns = new ArrayList<Expression>();
             Expression guard = null;
+            var patterns = new ArrayList<Expression>();
 
             for (var child : sectionNode.namedChildren()) {
                 if (child == bodyNode) {
@@ -269,13 +434,35 @@ public final class CstToAstMapper {
             );
         }
 
-        private @NotNull ExpressionStatement mapExpressionStatement(CstNodeView node) {
+        private @NotNull RegionDirectiveStatement mapRegionDirectiveStatement(CstNodeView node) {
+            var labelNode = firstNamedChild(node);
+            return new RegionDirectiveStatement(
+                    node.type().equals("region_start") ? "start" : "end",
+                    labelNode == null ? null : textTrimmed(labelNode),
+                    AstFactory.range(node.range())
+            );
+        }
+
+        private @NotNull Statement mapExpressionStatement(CstNodeView node) {
             var expressionNode = firstNamedChild(node);
             if (expressionNode == null) {
                 error("expression_statement missing expression", node);
                 return new ExpressionStatement(AstFactory.unknownExpression(node, text(node)), AstFactory.range(node.range()));
             }
+            if (isCallToIdentifier(expressionNode, "assert")) {
+                return mapAssertStatement(expressionNode);
+            }
             return new ExpressionStatement(mapExpression(expressionNode), AstFactory.range(node.range()));
+        }
+
+        private @NotNull AssertStatement mapAssertStatement(CstNodeView callNode) {
+            var arguments = mapArgumentList(callNode.childByField("arguments"));
+            if (arguments.isEmpty()) {
+                error("assert missing condition", callNode);
+                return new AssertStatement(AstFactory.unknownExpression(callNode, text(callNode)), null, AstFactory.range(callNode.range()));
+            }
+            var message = arguments.size() > 1 ? arguments.get(1) : null;
+            return new AssertStatement(arguments.getFirst(), message, AstFactory.range(callNode.range()));
         }
 
         private @NotNull Block mapBody(@Nullable CstNodeView bodyNode, Range fallbackRange) {
@@ -287,11 +474,12 @@ public final class CstToAstMapper {
 
         private @NotNull Expression mapExpression(CstNodeView node) {
             return switch (node.type()) {
-                case "identifier", "name" ->
-                        new IdentifierExpression(textTrimmed(node), AstFactory.range(node.range()));
-                case "integer", "float", "string", "string_name", "true", "false", "null", "node_path", "get_node" ->
+                case "identifier", "name" -> mapIdentifierExpression(node);
+                case "integer", "float", "string", "string_name", "true", "false", "null", "node_path" ->
                         new LiteralExpression(node.type(), text(node), AstFactory.range(node.range()));
+                case "get_node" -> new GetNodeExpression(text(node), AstFactory.range(node.range()));
                 case "call" -> mapCallExpression(node);
+                case "base_call" -> mapBaseCallExpression(node);
                 case "attribute" -> mapAttributeExpression(node);
                 case "subscript" -> mapSubscriptExpression(node);
                 case "binary_operator" -> mapBinaryExpression(node);
@@ -301,12 +489,38 @@ public final class CstToAstMapper {
                 case "array" -> mapArrayExpression(node);
                 case "dictionary" -> mapDictionaryExpression(node);
                 case "lambda" -> mapLambdaExpression(node);
+                case "await_expression" -> mapAwaitExpression(node);
+                case "pattern_binding" -> mapPatternBindingExpression(node);
                 case "parenthesized_expression" -> mapParenthesizedExpression(node);
                 default -> {
                     warn("Unsupported expression node: " + node.type(), node);
                     yield AstFactory.unknownExpression(node, text(node));
                 }
             };
+        }
+
+        private @NotNull Expression mapIdentifierExpression(CstNodeView node) {
+            return textTrimmed(node).equals("self")
+                    ? new SelfExpression(AstFactory.range(node.range()))
+                    : new IdentifierExpression(textTrimmed(node), AstFactory.range(node.range()));
+        }
+
+        private @NotNull Expression mapPatternBindingExpression(CstNodeView node) {
+            var nameNode = firstNamedChild(node);
+            if (nameNode == null) {
+                error("pattern_binding missing identifier", node);
+                return AstFactory.unknownExpression(node, text(node));
+            }
+            return new PatternBindingExpression(textTrimmed(nameNode), AstFactory.range(node.range()));
+        }
+
+        private @NotNull Expression mapAwaitExpression(CstNodeView node) {
+            var valueNode = firstNamedChild(node);
+            if (valueNode == null) {
+                error("await_expression missing awaited value", node);
+                return new AwaitExpression(AstFactory.unknownExpression(node, text(node)), AstFactory.range(node.range()));
+            }
+            return new AwaitExpression(mapExpression(valueNode), AstFactory.range(node.range()));
         }
 
         private @NotNull Expression mapParenthesizedExpression(CstNodeView node) {
@@ -318,16 +532,39 @@ public final class CstToAstMapper {
             return mapExpression(inner);
         }
 
-        private @NotNull CallExpression mapCallExpression(CstNodeView node) {
+        private @NotNull Expression mapCallExpression(CstNodeView node) {
             var argumentsNode = node.childByField("arguments");
             var calleeNode = firstNamedChildExcluding(node, argumentsNode);
             if (calleeNode == null) {
                 error("call missing callee", node);
                 return new CallExpression(AstFactory.unknownExpression(node, text(node)), List.of(), AstFactory.range(node.range()));
             }
+
+            var arguments = mapArgumentList(argumentsNode);
+            if (isIdentifierNode(calleeNode, "preload")) {
+                if (arguments.isEmpty()) {
+                    error("preload missing path argument", node);
+                    return new PreloadExpression(AstFactory.unknownExpression(node, text(node)), AstFactory.range(node.range()));
+                }
+                return new PreloadExpression(arguments.getFirst(), AstFactory.range(node.range()));
+            }
+
             return new CallExpression(
                     mapExpression(calleeNode),
-                    mapArgumentList(argumentsNode),
+                    arguments,
+                    AstFactory.range(node.range())
+            );
+        }
+
+        private @NotNull BaseCallExpression mapBaseCallExpression(CstNodeView node) {
+            var nameNode = firstNamedChild(node);
+            if (nameNode == null) {
+                error("base_call missing target name", node);
+                return new BaseCallExpression("", List.of(), AstFactory.range(node.range()));
+            }
+            return new BaseCallExpression(
+                    textTrimmed(nameNode),
+                    mapArgumentList(node.childByField("arguments")),
                     AstFactory.range(node.range())
             );
         }
@@ -353,6 +590,10 @@ public final class CstToAstMapper {
 
         private @NotNull AttributeStep mapAttributeStep(CstNodeView node) {
             return switch (node.type()) {
+                case "identifier", "name" -> new AttributePropertyStep(
+                        textTrimmed(node),
+                        AstFactory.range(node.range())
+                );
                 case "attribute_call" -> new AttributeCallStep(
                         textTrimmed(firstNamedChild(node)),
                         mapArgumentList(node.childByField("arguments")),
@@ -388,16 +629,25 @@ public final class CstToAstMapper {
             );
         }
 
-        private @NotNull BinaryExpression mapBinaryExpression(CstNodeView node) {
+        private @NotNull Expression mapBinaryExpression(CstNodeView node) {
             var leftNode = requireField(node, "left");
             var rightNode = requireField(node, "right");
-            var operator = firstOperator(node, "<binary-op>");
-            return new BinaryExpression(
-                    operator,
-                    mapExpression(leftNode),
-                    mapExpression(rightNode),
-                    AstFactory.range(node.range())
-            );
+            var operator = operatorBetween(leftNode, rightNode, "<binary-op>");
+            var left = mapExpression(leftNode);
+
+            return switch (operator) {
+                case "as" -> new CastExpression(left, mapTypeRefFromNode(rightNode), AstFactory.range(node.range()));
+                case "is" ->
+                        new TypeTestExpression(left, mapTypeRefFromNode(rightNode), false, AstFactory.range(node.range()));
+                case "is not" ->
+                        new TypeTestExpression(left, mapTypeRefFromNode(rightNode), true, AstFactory.range(node.range()));
+                default -> new BinaryExpression(
+                        operator,
+                        left,
+                        mapExpression(rightNode),
+                        AstFactory.range(node.range())
+                );
+            };
         }
 
         private @NotNull UnaryExpression mapUnaryExpression(CstNodeView node) {
@@ -406,7 +656,7 @@ public final class CstToAstMapper {
                 error("unary_operator missing operand", node);
                 return new UnaryExpression("<unary-op>", AstFactory.unknownExpression(node, text(node)), AstFactory.range(node.range()));
             }
-            var operator = firstOperator(node, "<unary-op>");
+            var operator = prefixOperator(node, operandNode, "<unary-op>");
             return new UnaryExpression(operator, mapExpression(operandNode), AstFactory.range(node.range()));
         }
 
@@ -425,7 +675,7 @@ public final class CstToAstMapper {
         private @NotNull AssignmentExpression mapAssignmentExpression(CstNodeView node) {
             var leftNode = requireField(node, "left");
             var rightNode = requireField(node, "right");
-            var operator = firstOperator(node, node.type().equals("assignment") ? "=" : "<aug-assignment-op>");
+            var operator = operatorBetween(leftNode, rightNode, node.type().equals("assignment") ? "=" : "<aug-assignment-op>");
             return new AssignmentExpression(
                     operator,
                     mapExpression(leftNode),
@@ -563,6 +813,10 @@ public final class CstToAstMapper {
             return new TypeRef(textTrimmed(node), AstFactory.range(node.range()));
         }
 
+        private @NotNull TypeRef mapTypeRefFromNode(CstNodeView node) {
+            return new TypeRef(textTrimmed(node), AstFactory.range(node.range()));
+        }
+
         private @NotNull List<Expression> mapArgumentList(@Nullable CstNodeView argumentsNode) {
             if (argumentsNode == null) {
                 return List.of();
@@ -583,6 +837,29 @@ public final class CstToAstMapper {
                 return target == null ? null : textTrimmed(target);
             }
             return textTrimmed(extendsNode);
+        }
+
+        private boolean isCallToIdentifier(CstNodeView node, String name) {
+            if (!node.type().equals("call")) {
+                return false;
+            }
+            var argumentsNode = node.childByField("arguments");
+            var calleeNode = firstNamedChildExcluding(node, argumentsNode);
+            return calleeNode != null && isIdentifierNode(calleeNode, name);
+        }
+
+        private boolean isIdentifierNode(CstNodeView node, String name) {
+            return (node.type().equals("identifier") || node.type().equals("name"))
+                    && textTrimmed(node).equals(name);
+        }
+
+        private @Nullable CstNodeView findNamedChildByType(CstNodeView node, String nodeType) {
+            for (var child : node.namedChildren()) {
+                if (child.type().equals(nodeType)) {
+                    return child;
+                }
+            }
+            return null;
         }
 
         private @NotNull CstNodeView requireField(CstNodeView node, String fieldName) {
@@ -608,13 +885,24 @@ public final class CstToAstMapper {
             return null;
         }
 
-        private @NotNull String firstOperator(CstNodeView node, String fallback) {
-            for (var child : node.children()) {
-                if (!child.isNamed()) {
-                    return child.type();
-                }
+        private @NotNull String operatorBetween(CstNodeView leftNode, CstNodeView rightNode, String fallback) {
+            var start = Math.max(0, leftNode.range().endByte());
+            var end = Math.min(sourceBytes.length, rightNode.range().startByte());
+            if (start >= end) {
+                return fallback;
             }
-            return fallback;
+            var operator = new String(sourceBytes, start, end - start, StandardCharsets.UTF_8).trim();
+            return operator.isEmpty() ? fallback : operator;
+        }
+
+        private @NotNull String prefixOperator(CstNodeView node, CstNodeView operandNode, String fallback) {
+            var start = Math.max(0, node.range().startByte());
+            var end = Math.min(sourceBytes.length, operandNode.range().startByte());
+            if (start >= end) {
+                return fallback;
+            }
+            var operator = new String(sourceBytes, start, end - start, StandardCharsets.UTF_8).trim();
+            return operator.isEmpty() ? fallback : operator;
         }
 
         private @NotNull String text(CstNodeView node) {
