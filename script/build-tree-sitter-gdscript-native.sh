@@ -8,7 +8,7 @@ GRAMMAR_DIR="${GRAMMAR_DIR:-${REPO_ROOT}/vendor/tree-sitter-gdscript}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/native}"
 TARGETS="${TARGETS:-windows-x86_64,linux-x86_64,macos-x86_64,macos-aarch64}"
 VENDOR_REPO="${VENDOR_REPO:-https://github.com/PrestonKnopp/tree-sitter-gdscript.git}"
-VENDOR_REF="${VENDOR_REF:-v6.1.0}"
+VENDOR_REF="${VENDOR_REF:-c5c8fa4}"
 SKIP_VENDOR_UPDATE="${SKIP_VENDOR_UPDATE:-false}"
 
 usage() {
@@ -22,7 +22,7 @@ Options:
   --output-root DIR        Output root (default: native)
   --targets csv            Comma-separated targets (default: windows-x86_64,linux-x86_64,macos-x86_64,macos-aarch64)
   --vendor-repo URL        Vendor git repository URL
-  --vendor-ref REF         Vendor git ref (tag/branch/commit), default: v6.1.0
+  --vendor-ref REF         Vendor git ref (tag/branch/commit), default: c5c8fa4
   --skip-vendor-update     Skip updating/cloning vendor repository
   -h, --help               Show help
 EOF

@@ -706,9 +706,20 @@ public final class CstToAstMapper {
         private @NotNull DictionaryExpression mapDictionaryExpression(CstNodeView node) {
             var entries = new ArrayList<DictEntry>();
             var openEnded = false;
+            String lockedStyle = null;
             for (var child : node.namedChildren()) {
                 if (child.type().equals("pair")) {
-                    entries.add(mapDictionaryEntry(child));
+                    var leftNode = child.childByField("left");
+                    var valueNode = child.childByField("value");
+                    var style = dictionaryEntryStyle(leftNode, valueNode);
+                    if (style != null) {
+                        if (lockedStyle == null) {
+                            lockedStyle = style;
+                        } else if (!lockedStyle.equals(style)) {
+                            error("Mixing dictionary styles is not allowed.", child);
+                        }
+                    }
+                    entries.add(mapDictionaryEntry(child, style));
                 } else if (child.type().equals("pattern_open_ending")) {
                     openEnded = true;
                 } else {
@@ -718,10 +729,43 @@ public final class CstToAstMapper {
             return new DictionaryExpression(List.copyOf(entries), openEnded, AstFactory.range(node.range()));
         }
 
-        private @NotNull DictEntry mapDictionaryEntry(CstNodeView node) {
+        private @NotNull DictEntry mapDictionaryEntry(CstNodeView node, @Nullable String style) {
             var leftNode = requireField(node, "left");
             var valueNode = requireField(node, "value");
-            return new DictEntry(mapExpression(leftNode), mapExpression(valueNode), AstFactory.range(node.range()));
+            var resolvedStyle = style != null ? style : dictionaryEntryStyle(leftNode, valueNode);
+            var key = "=".equals(resolvedStyle)
+                    ? mapLuaStyleDictionaryKey(leftNode)
+                    : mapExpression(leftNode);
+            return new DictEntry(key, mapExpression(valueNode), AstFactory.range(node.range()));
+        }
+
+        private @Nullable String dictionaryEntryStyle(@Nullable CstNodeView leftNode, @Nullable CstNodeView valueNode) {
+            if (leftNode == null || valueNode == null) {
+                return null;
+            }
+            var operator = operatorBetween(leftNode, valueNode, "");
+            if ("=".equals(operator)) {
+                return "=";
+            }
+            if (":".equals(operator)) {
+                return ":";
+            }
+            return null;
+        }
+
+        private @NotNull Expression mapLuaStyleDictionaryKey(CstNodeView leftNode) {
+            var range = AstFactory.range(leftNode.range());
+            return switch (leftNode.type()) {
+                case "identifier", "name" -> {
+                    var name = textTrimmed(leftNode);
+                    yield new LiteralExpression("string_name", "&\"" + name + "\"", range);
+                }
+                case "string" -> new LiteralExpression("string_name", "&" + text(leftNode), range);
+                default -> {
+                    error("Expected identifier or string as Lua-style dictionary key", leftNode);
+                    yield mapExpression(leftNode);
+                }
+            };
         }
 
         private @NotNull LambdaExpression mapLambdaExpression(CstNodeView node) {

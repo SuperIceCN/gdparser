@@ -180,6 +180,70 @@ class CstToAstMapperTest {
     }
 
     @Test
+    void luaStyleIdentifierKeyShouldLowerToStringNameLiteral() {
+        var result = map("""
+                func f():
+                    return {x = 1}
+                """);
+        assertFalse(hasErrors(result));
+
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var returnStatement = assertInstanceOf(ReturnStatement.class, function.body().statements().getFirst());
+        var dictionary = assertInstanceOf(DictionaryExpression.class, returnStatement.value());
+        assertEquals(1, dictionary.entries().size());
+
+        var key = assertInstanceOf(LiteralExpression.class, dictionary.entries().getFirst().key());
+        assertEquals("string_name", key.kind());
+        assertEquals("&\"x\"", key.sourceText());
+        assertFalse(dictionary.entries().getFirst().key() instanceof IdentifierExpression);
+    }
+
+    @Test
+    void luaStyleStringKeyShouldLowerToStringNameLiteral() {
+        var result = map("""
+                func f():
+                    return {"name" = 1}
+                """);
+        assertFalse(hasErrors(result));
+
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var returnStatement = assertInstanceOf(ReturnStatement.class, function.body().statements().getFirst());
+        var dictionary = assertInstanceOf(DictionaryExpression.class, returnStatement.value());
+        assertEquals(1, dictionary.entries().size());
+
+        var key = assertInstanceOf(LiteralExpression.class, dictionary.entries().getFirst().key());
+        assertEquals("string_name", key.kind());
+        assertEquals("&\"name\"", key.sourceText());
+    }
+
+    @Test
+    void pythonStyleIdentifierKeyShouldRemainIdentifierExpression() {
+        var result = map("""
+                func f():
+                    return {x: 1}
+                """);
+        assertFalse(hasErrors(result));
+
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var returnStatement = assertInstanceOf(ReturnStatement.class, function.body().statements().getFirst());
+        var dictionary = assertInstanceOf(DictionaryExpression.class, returnStatement.value());
+        var key = assertInstanceOf(IdentifierExpression.class, dictionary.entries().getFirst().key());
+        assertEquals("x", key.name());
+    }
+
+    @Test
+    void mixedDictionaryStylesShouldEmitError() {
+        var result = map("""
+                func f():
+                    return {x: 1, y = 2}
+                """);
+        assertTrue(hasErrors(result));
+        assertTrue(result.diagnostics().stream().anyMatch(diagnostic ->
+                diagnostic.severity() == AstDiagnosticSeverity.ERROR
+                        && diagnostic.message().contains("Mixing dictionary styles is not allowed.")));
+    }
+
+    @Test
     void dedicatedSemanticNodesShouldLowerToSpecificAstRecords() {
         var source = """
                 #region Demo
