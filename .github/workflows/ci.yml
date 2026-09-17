@@ -19,6 +19,7 @@ jobs:
         os:
           - windows-latest
           - ubuntu-latest
+          - ubuntu-24.04-arm
           - macos-14
 
     steps:

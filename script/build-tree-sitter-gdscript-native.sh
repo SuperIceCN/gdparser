@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 GRAMMAR_DIR="${GRAMMAR_DIR:-${REPO_ROOT}/vendor/tree-sitter-gdscript}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/native}"
-TARGETS="${TARGETS:-windows-x86_64,linux-x86_64,macos-x86_64,macos-aarch64}"
+TARGETS="${TARGETS:-windows-x86_64,linux-x86_64,linux-aarch64,macos-x86_64,macos-aarch64}"
 VENDOR_REPO="${VENDOR_REPO:-https://github.com/PrestonKnopp/tree-sitter-gdscript.git}"
 VENDOR_REF="${VENDOR_REF:-c5c8fa4}"
 SKIP_VENDOR_UPDATE="${SKIP_VENDOR_UPDATE:-false}"
@@ -20,7 +20,7 @@ Usage:
 Options:
   --grammar-dir DIR        Grammar path (default: vendor/tree-sitter-gdscript)
   --output-root DIR        Output root (default: native)
-  --targets csv            Comma-separated targets (default: windows-x86_64,linux-x86_64,macos-x86_64,macos-aarch64)
+  --targets csv            Comma-separated targets (default: windows-x86_64,linux-x86_64,linux-aarch64,macos-x86_64,macos-aarch64)
   --vendor-repo URL        Vendor git repository URL
   --vendor-ref REF         Vendor git ref (tag/branch/commit), default: c5c8fa4
   --skip-vendor-update     Skip updating/cloning vendor repository

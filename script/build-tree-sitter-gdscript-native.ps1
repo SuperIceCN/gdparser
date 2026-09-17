@@ -1,7 +1,7 @@
 param(
     [string]$GrammarDir = "",
     [string]$OutputRoot = "",
-    [string[]]$Targets = @("windows-x86_64", "linux-x86_64", "macos-x86_64", "macos-aarch64"),
+    [string[]]$Targets = @("windows-x86_64", "linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64"),
     [string]$VendorRepo = "https://github.com/PrestonKnopp/tree-sitter-gdscript.git",
     [string]$VendorRef = "c5c8fa4",
     [switch]$SkipVendorUpdate
