@@ -71,6 +71,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.regex.Pattern;
 
 /// Maps GDScript CST nodes to a stable Java AST and emits lowering diagnostics.
 /// The lowered AST intentionally models GDScript 4.x only, so legacy 3.x syntax
@@ -88,7 +89,7 @@ public final class CstToAstMapper {
             context.warn("Expected source root node but got: " + root.type(), root);
         }
 
-        var statements = context.mapStatements(root.namedChildren());
+        var statements = context.mapStatements(context.significantNamedChildren(root));
         var ast = new SourceFile(List.copyOf(statements), AstFactory.range(root.range()));
         return new AstMappingResult(ast, context.diagnostics());
     }
@@ -108,6 +109,11 @@ public final class CstToAstMapper {
     }
 
     private static final class MappingContext {
+
+        /// The grammar models trailing `\` line continuations as named extra nodes, so they can
+        /// surface between the named children of any construct that spans a continued line.
+        private static final String LINE_CONTINUATION_TYPE = "line_continuation";
+        private static final Pattern LINE_CONTINUATION_PATTERN = Pattern.compile("\\\\\\r?\\n");
 
         private final byte[] sourceBytes;
         private final List<AstDiagnostic> diagnostics;
@@ -161,7 +167,7 @@ public final class CstToAstMapper {
             }
 
             var statements = new ArrayList<Statement>();
-            for (var child : annotationsNode.namedChildren()) {
+            for (var child : significantNamedChildren(annotationsNode)) {
                 if (child.type().equals("annotation")) {
                     statements.add(mapAnnotationStatement(child));
                 }
@@ -261,7 +267,7 @@ public final class CstToAstMapper {
             var nameNode = node.childByField("name");
             var bodyNode = requireField(node, "body");
             var members = new ArrayList<EnumMember>();
-            for (var child : bodyNode.namedChildren()) {
+            for (var child : significantNamedChildren(bodyNode)) {
                 if (child.type().equals("enumerator")) {
                     members.add(mapEnumMember(child));
                 }
@@ -344,7 +350,7 @@ public final class CstToAstMapper {
             var elifClauses = new ArrayList<ElifClause>();
             Block elseBody = null;
 
-            for (var child : node.namedChildren()) {
+            for (var child : significantNamedChildren(node)) {
                 if (child.type().equals("elif_clause")) {
                     var elifCondition = requireField(child, "condition");
                     var elifBody = requireField(child, "body");
@@ -398,7 +404,7 @@ public final class CstToAstMapper {
             var bodyNode = requireField(node, "body");
             var sections = new ArrayList<MatchSection>();
 
-            for (var child : bodyNode.namedChildren()) {
+            for (var child : significantNamedChildren(bodyNode)) {
                 if (child.type().equals("pattern_section")) {
                     sections.add(mapMatchSection(child));
                 }
@@ -412,7 +418,7 @@ public final class CstToAstMapper {
             Expression guard = null;
             var patterns = new ArrayList<Expression>();
 
-            for (var child : sectionNode.namedChildren()) {
+            for (var child : significantNamedChildren(sectionNode)) {
                 if (child == bodyNode) {
                     continue;
                 }
@@ -483,7 +489,7 @@ public final class CstToAstMapper {
             if (bodyNode == null) {
                 return new Block(List.of(), fallbackRange);
             }
-            return new Block(mapStatements(bodyNode.namedChildren()), AstFactory.range(bodyNode.range()));
+            return new Block(mapStatements(significantNamedChildren(bodyNode)), AstFactory.range(bodyNode.range()));
         }
 
         private @NotNull Expression mapExpression(CstNodeView node) {
@@ -576,7 +582,7 @@ public final class CstToAstMapper {
         }
 
         private @NotNull AttributeExpression mapAttributeExpression(CstNodeView node) {
-            var namedChildren = node.namedChildren();
+            var namedChildren = significantNamedChildren(node);
             if (namedChildren.isEmpty()) {
                 error("attribute missing base expression", node);
                 return new AttributeExpression(
@@ -693,7 +699,7 @@ public final class CstToAstMapper {
         private @NotNull ArrayExpression mapArrayExpression(CstNodeView node) {
             var elements = new ArrayList<Expression>();
             var openEnded = false;
-            for (var child : node.namedChildren()) {
+            for (var child : significantNamedChildren(node)) {
                 if (child.type().equals("pattern_open_ending")) {
                     openEnded = true;
                 } else {
@@ -707,7 +713,7 @@ public final class CstToAstMapper {
             var entries = new ArrayList<DictEntry>();
             var openEnded = false;
             String lockedStyle = null;
-            for (var child : node.namedChildren()) {
+            for (var child : significantNamedChildren(node)) {
                 if (child.type().equals("pair")) {
                     var leftNode = child.childByField("left");
                     var valueNode = child.childByField("value");
@@ -789,7 +795,7 @@ public final class CstToAstMapper {
             }
 
             var parameters = new ArrayList<Parameter>();
-            for (var child : parametersNode.namedChildren()) {
+            for (var child : significantNamedChildren(parametersNode)) {
                 parameters.add(mapParameter(child));
             }
             return List.copyOf(parameters);
@@ -872,7 +878,7 @@ public final class CstToAstMapper {
                 return List.of();
             }
             var arguments = new ArrayList<Expression>();
-            for (var child : argumentsNode.namedChildren()) {
+            for (var child : significantNamedChildren(argumentsNode)) {
                 arguments.add(mapExpression(child));
             }
             return List.copyOf(arguments);
@@ -968,7 +974,7 @@ public final class CstToAstMapper {
         }
 
         private @Nullable CstNodeView findNamedChildByType(CstNodeView node, String nodeType) {
-            for (var child : node.namedChildren()) {
+            for (var child : significantNamedChildren(node)) {
                 if (child.type().equals(nodeType)) {
                     return child;
                 }
@@ -986,17 +992,34 @@ public final class CstToAstMapper {
         }
 
         private @Nullable CstNodeView firstNamedChild(CstNodeView node) {
-            var children = node.namedChildren();
+            var children = significantNamedChildren(node);
             return children.isEmpty() ? null : children.getFirst();
         }
 
         private @Nullable CstNodeView firstNamedChildExcluding(CstNodeView node, @Nullable CstNodeView excludedNode) {
-            for (var child : node.namedChildren()) {
+            for (var child : significantNamedChildren(node)) {
                 if (child != excludedNode) {
                     return child;
                 }
             }
             return null;
+        }
+
+        private boolean isLineContinuation(CstNodeView node) {
+            return node.type().equals(LINE_CONTINUATION_TYPE);
+        }
+
+        /// Named children with `line_continuation` extras removed. Continuations carry no
+        /// semantic meaning for the AST, so every child enumeration during lowering skips them.
+        private @NotNull List<CstNodeView> significantNamedChildren(CstNodeView node) {
+            var children = node.namedChildren();
+            var filtered = new ArrayList<CstNodeView>(children.size());
+            for (var child : children) {
+                if (!isLineContinuation(child)) {
+                    filtered.add(child);
+                }
+            }
+            return filtered.size() == children.size() ? children : List.copyOf(filtered);
         }
 
         private @NotNull String operatorBetween(CstNodeView leftNode, CstNodeView rightNode, String fallback) {
@@ -1005,8 +1028,7 @@ public final class CstToAstMapper {
             if (start >= end) {
                 return fallback;
             }
-            var operator = new String(sourceBytes, start, end - start, StandardCharsets.UTF_8).trim();
-            return operator.isEmpty() ? fallback : operator;
+            return normalizeOperatorText(new String(sourceBytes, start, end - start, StandardCharsets.UTF_8), fallback);
         }
 
         private @NotNull String prefixOperator(CstNodeView node, CstNodeView operandNode, String fallback) {
@@ -1015,7 +1037,13 @@ public final class CstToAstMapper {
             if (start >= end) {
                 return fallback;
             }
-            var operator = new String(sourceBytes, start, end - start, StandardCharsets.UTF_8).trim();
+            return normalizeOperatorText(new String(sourceBytes, start, end - start, StandardCharsets.UTF_8), fallback);
+        }
+
+        /// Recovers the operator from raw source text that may embed `\` line continuations,
+        /// then collapses whitespace so multi-word operators such as `is not` stay comparable.
+        private @NotNull String normalizeOperatorText(String rawText, String fallback) {
+            var operator = LINE_CONTINUATION_PATTERN.matcher(rawText).replaceAll("").replaceAll("\\s+", " ").trim();
             return operator.isEmpty() ? fallback : operator;
         }
 
