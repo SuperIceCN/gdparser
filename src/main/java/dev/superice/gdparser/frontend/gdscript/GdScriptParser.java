@@ -1,6 +1,8 @@
 package dev.superice.gdparser.frontend.gdscript;
 
 import dev.superice.gdparser.frontend.ast.AnnotationStatement;
+import dev.superice.gdparser.frontend.ast.ArrayExpression;
+import dev.superice.gdparser.frontend.ast.AssignmentExpression;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AstMappingResult;
@@ -9,23 +11,30 @@ import dev.superice.gdparser.frontend.ast.AttributeExpression;
 import dev.superice.gdparser.frontend.ast.AttributePropertyStep;
 import dev.superice.gdparser.frontend.ast.AttributeStep;
 import dev.superice.gdparser.frontend.ast.AttributeSubscriptStep;
+import dev.superice.gdparser.frontend.ast.AwaitExpression;
 import dev.superice.gdparser.frontend.ast.BinaryExpression;
 import dev.superice.gdparser.frontend.ast.Block;
 import dev.superice.gdparser.frontend.ast.CallExpression;
+import dev.superice.gdparser.frontend.ast.CastExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.ClassNameStatement;
+import dev.superice.gdparser.frontend.ast.ConditionalExpression;
 import dev.superice.gdparser.frontend.ast.ConstructorDeclaration;
 import dev.superice.gdparser.frontend.ast.DeclarationKind;
+import dev.superice.gdparser.frontend.ast.DictEntry;
+import dev.superice.gdparser.frontend.ast.DictionaryExpression;
 import dev.superice.gdparser.frontend.ast.EnumDeclaration;
 import dev.superice.gdparser.frontend.ast.EnumMember;
 import dev.superice.gdparser.frontend.ast.Expression;
 import dev.superice.gdparser.frontend.ast.ExpressionStatement;
 import dev.superice.gdparser.frontend.ast.ExtendsStatement;
 import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
+import dev.superice.gdparser.frontend.ast.GetNodeExpression;
 import dev.superice.gdparser.frontend.ast.IdentifierExpression;
 import dev.superice.gdparser.frontend.ast.LiteralExpression;
 import dev.superice.gdparser.frontend.ast.Parameter;
 import dev.superice.gdparser.frontend.ast.PassStatement;
+import dev.superice.gdparser.frontend.ast.PreloadExpression;
 import dev.superice.gdparser.frontend.ast.Range;
 import dev.superice.gdparser.frontend.ast.SelfExpression;
 import dev.superice.gdparser.frontend.ast.SignalStatement;
@@ -33,6 +42,7 @@ import dev.superice.gdparser.frontend.ast.SourceFile;
 import dev.superice.gdparser.frontend.ast.Statement;
 import dev.superice.gdparser.frontend.ast.SubscriptExpression;
 import dev.superice.gdparser.frontend.ast.TypeRef;
+import dev.superice.gdparser.frontend.ast.TypeTestExpression;
 import dev.superice.gdparser.frontend.ast.UnaryExpression;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import org.jetbrains.annotations.NotNull;
@@ -186,9 +196,9 @@ public final class GdScriptParser {
     private static boolean isNodeName(GdToken token) {
         return switch (token.type()) {
             case IDENTIFIER, AND, AS, ASSERT, AWAIT, BREAK, BREAKPOINT, CLASS_NAME, CLASS, CONST,
-                    CONST_PI, CONST_INF, CONST_NAN, CONST_TAU, CONTINUE, ELIF, ELSE, ENUM, EXTENDS,
-                    FOR, FUNC, IF, IN, IS, MATCH, NAMESPACE, NOT, OR, PASS, PRELOAD, RETURN, SELF,
-                    SIGNAL, STATIC, SUPER, TRAIT, UNDERSCORE, VAR, VOID, WHILE, WHEN, YIELD -> true;
+                 CONST_PI, CONST_INF, CONST_NAN, CONST_TAU, CONTINUE, ELIF, ELSE, ENUM, EXTENDS,
+                 FOR, FUNC, IF, IN, IS, MATCH, NAMESPACE, NOT, OR, PASS, PRELOAD, RETURN, SELF,
+                 SIGNAL, STATIC, SUPER, TRAIT, UNDERSCORE, VAR, VOID, WHILE, WHEN, YIELD -> true;
             default -> false;
         };
     }
@@ -535,11 +545,14 @@ public final class GdScriptParser {
             case "export" ->
                     "The \"export\" keyword was removed in Godot 4. Use an export annotation (\"@export\", \"@export_range\", etc.) instead.";
             case "tool" -> "The \"tool\" keyword was removed in Godot 4. Use the \"@tool\" annotation instead.";
-            case "onready" -> "The \"onready\" keyword was removed in Godot 4. Use the \"@onready\" annotation instead.";
-            case "remote" -> "The \"remote\" keyword was removed in Godot 4. Use the \"@rpc\" annotation with \"any_peer\" instead.";
+            case "onready" ->
+                    "The \"onready\" keyword was removed in Godot 4. Use the \"@onready\" annotation instead.";
+            case "remote" ->
+                    "The \"remote\" keyword was removed in Godot 4. Use the \"@rpc\" annotation with \"any_peer\" instead.";
             case "remotesync" ->
                     "The \"remotesync\" keyword was removed in Godot 4. Use the \"@rpc\" annotation with \"any_peer\" and \"call_local\" instead.";
-            case "puppet" -> "The \"puppet\" keyword was removed in Godot 4. Use the \"@rpc\" annotation with \"authority\" instead.";
+            case "puppet" ->
+                    "The \"puppet\" keyword was removed in Godot 4. Use the \"@rpc\" annotation with \"authority\" instead.";
             case "puppetsync" ->
                     "The \"puppetsync\" keyword was removed in Godot 4. Use the \"@rpc\" annotation with \"authority\" and \"call_local\" instead.";
             case "master" ->
@@ -721,7 +734,9 @@ public final class GdScriptParser {
                 result = parseConstant();
             }
             default -> {
-                var expression = parseExpression();
+                // Only statement-level expressions may contain assignments (Godot's
+                // `parse_expression(true)` call site in `parse_expression_statement`).
+                var expression = parseExpression(true);
                 if (expression == null) {
                     // Godot's advance() soft-fails at EOF; mirror that by guarding the advance
                     // so `previous` (and thus the error location/name) matches Godot exactly.
@@ -731,7 +746,9 @@ public final class GdScriptParser {
                     pushError("Expected statement, found \"%s\" instead.".formatted(previous.type().displayName()));
                     result = null;
                 } else {
-                    result = new ExpressionStatement(expression, range(statementStartByte, expression.range().endByte()));
+                    // The statement ends at the last consumed token, not the expression node's
+                    // own end (a trailing grouping `)` belongs to the consumed span).
+                    result = new ExpressionStatement(expression, range(statementStartByte, previous.endByte()));
                     endStatement("expression");
                 }
             }
@@ -767,7 +784,7 @@ public final class GdScriptParser {
                     // Allow for trailing comma.
                     break;
                 }
-                var argument = parseExpression();
+                var argument = parseExpression(false);
                 if (argument == null) {
                     pushError("Expected expression as the annotation argument.");
                 } else {
@@ -894,7 +911,7 @@ public final class GdScriptParser {
         }
 
         if (match(GdTokenType.EQUAL)) {
-            value = parseExpression();
+            value = parseExpression(false);
             if (value == null) {
                 pushError("Expected expression for variable initial value after \"=\".");
             }
@@ -1058,7 +1075,7 @@ public final class GdScriptParser {
 
         Expression value;
         if (consume(GdTokenType.EQUAL, "Expected initializer after constant name.")) {
-            value = parseExpression();
+            value = parseExpression(false);
             if (value == null) {
                 pushError("Expected initializer expression for constant.");
                 return null;
@@ -1083,7 +1100,7 @@ public final class GdScriptParser {
 
         Expression defaultValue = null;
         if (match(GdTokenType.EQUAL)) {
-            defaultValue = parseExpression();
+            defaultValue = parseExpression(false);
         }
         return new Parameter(named.name(), named.type(), defaultValue, false,
                 range(parameterStartByte, previous.endByte()));
@@ -1160,7 +1177,7 @@ public final class GdScriptParser {
 
                 Expression value = null;
                 if (match(GdTokenType.EQUAL)) {
-                    value = parseExpression();
+                    value = parseExpression(false);
                     if (value == null) {
                         pushError("Expected expression value after \"=\".");
                     } else {
@@ -1326,7 +1343,15 @@ public final class GdScriptParser {
     }
 
     private @FunctionalInterface interface InfixRule {
-        @Nullable Expression parse(@Nullable Expression left, Precedence precedence);
+        /// `precedence` is the enclosing `parsePrecedence` cutoff (used by the suffix chain's
+        /// continuation check); `canAssign` is Godot's `p_can_assign`, consulted only by the
+        /// assignment rule (every other infix parses its operands with `canAssign == false`,
+        /// matching the vendor call sites); `extentStart` is the byte offset of the first token
+        /// of the left operand's consumed source span, which can precede the operand node's own
+        /// range (e.g. a grouping's `(`) and is the correct left edge for the combined node's
+        /// range (the tree-sitter path spans enclosing CST nodes over the whole consumed text).
+        @Nullable Expression parse(@Nullable Expression left, Precedence precedence, boolean canAssign,
+                                   int extentStart);
     }
 
     private record ParseRule(@Nullable PrefixRule prefix, @Nullable InfixRule infix,
@@ -1334,11 +1359,13 @@ public final class GdScriptParser {
         private static final ParseRule NONE = new ParseRule(null, null, Precedence.NONE);
     }
 
-    /// The declaration-scoped slice of `GDScriptParser::get_rule()`: literals, identifiers, `self`,
-    /// unary/binary `+`/`-`, the remaining binary operators, and the call/attribute/subscript
-    /// suffixes. Identifier-like tokens (including the builtin constants `PI`/`TAU`/`INF`/`NAN`)
-    /// are normalized to `IDENTIFIER` by `parsePrecedence` before this lookup. Rules outside the
-    /// subset resolve to `ParseRule.NONE`.
+    /// Port of `GDScriptParser::get_rule()` for the Phase 2/3 expression slice: literals,
+    /// identifiers, `self`, the full unary/binary operator families, grouping/array/dictionary
+    /// prefixes, `await`/`preload`/`super`/get-node prefixes, ternary, `as`/`is`/`not in`, the
+    /// assignment family, and the call/attribute/subscript suffixes. Identifier-like tokens
+    /// (including the builtin constants `PI`/`TAU`/`INF`/`NAN`) are normalized to `IDENTIFIER`
+    /// by `parsePrecedence` before this lookup. Rules outside the subset resolve to
+    /// `ParseRule.NONE`.
     private @NotNull ParseRule ruleFor(GdTokenType type) {
         return switch (type) {
             case LITERAL -> new ParseRule(this::parseLiteralExpression, null, Precedence.NONE);
@@ -1346,7 +1373,10 @@ public final class GdScriptParser {
             case SELF -> new ParseRule(this::parseSelfExpression, null, Precedence.NONE);
             case PLUS, MINUS -> new ParseRule(this::parseUnaryOperator, this::parseBinaryOperator,
                     Precedence.ADDITION_SUBTRACTION);
-            case STAR, SLASH, PERCENT -> new ParseRule(null, this::parseBinaryOperator, Precedence.FACTOR);
+            case TILDE, BANG -> new ParseRule(this::parseUnaryOperator, null, Precedence.NONE);
+            case NOT -> new ParseRule(this::parseUnaryOperator, this::parseNotInOperator, Precedence.CONTENT_TEST);
+            case STAR, SLASH -> new ParseRule(null, this::parseBinaryOperator, Precedence.FACTOR);
+            case PERCENT -> new ParseRule(this::parseGetNodeExpression, this::parseBinaryOperator, Precedence.FACTOR);
             case STAR_STAR -> new ParseRule(null, this::parseBinaryOperator, Precedence.POWER);
             case LESS, LESS_EQUAL, GREATER, GREATER_EQUAL, EQUAL_EQUAL, BANG_EQUAL ->
                     new ParseRule(null, this::parseBinaryOperator, Precedence.COMPARISON);
@@ -1357,34 +1387,74 @@ public final class GdScriptParser {
             case CARET -> new ParseRule(null, this::parseBinaryOperator, Precedence.BIT_XOR);
             case LESS_LESS, GREATER_GREATER -> new ParseRule(null, this::parseBinaryOperator, Precedence.BIT_SHIFT);
             case IN -> new ParseRule(null, this::parseBinaryOperator, Precedence.CONTENT_TEST);
-            case PARENTHESIS_OPEN -> new ParseRule(null, this::parseSuffixChain, Precedence.CALL);
-            case BRACKET_OPEN -> new ParseRule(null, this::parseSuffixChain, Precedence.SUBSCRIPT);
+            case IF -> new ParseRule(null, this::parseTernaryOperator, Precedence.TERNARY);
+            case AS -> new ParseRule(null, this::parseCast, Precedence.CAST);
+            case IS -> new ParseRule(null, this::parseTypeTest, Precedence.TYPE_TEST);
+            case EQUAL, PLUS_EQUAL, MINUS_EQUAL, STAR_EQUAL, STAR_STAR_EQUAL, SLASH_EQUAL, PERCENT_EQUAL,
+                 LESS_LESS_EQUAL, GREATER_GREATER_EQUAL, AMPERSAND_EQUAL, PIPE_EQUAL, CARET_EQUAL ->
+                    new ParseRule(null, this::parseAssignment, Precedence.ASSIGNMENT);
+            case QUESTION_MARK -> new ParseRule(null, this::parseInvalidToken, Precedence.CAST);
+            case AWAIT -> new ParseRule(this::parseAwaitExpression, null, Precedence.NONE);
+            case DOLLAR -> new ParseRule(this::parseGetNodeExpression, null, Precedence.NONE);
+            case PRELOAD -> new ParseRule(this::parsePreloadExpression, null, Precedence.NONE);
+            case SUPER -> new ParseRule(this::parseSuperExpression, null, Precedence.NONE);
+            case PARENTHESIS_OPEN -> new ParseRule(this::parseGroupingExpression, this::parseSuffixChain,
+                    Precedence.CALL);
+            case BRACKET_OPEN -> new ParseRule(this::parseArrayExpression, this::parseSuffixChain,
+                    Precedence.SUBSCRIPT);
+            case BRACE_OPEN -> new ParseRule(this::parseDictionaryExpression, null, Precedence.NONE);
             case PERIOD -> new ParseRule(null, this::parseSuffixChain, Precedence.ATTRIBUTE);
             default -> ParseRule.NONE;
         };
     }
 
-    /// Port of `GDScriptParser::parse_expression` / `parse_precedence`, minus the assignment
-    /// context flags (assignments are outside the current rule-table slice).
-    private @Nullable Expression parseExpression() {
-        return parsePrecedence(Precedence.ASSIGNMENT);
+    /// Port of `GDScriptParser::parse_expression`. `canAssign` gates the assignment infix family
+    /// (only statement-level expressions pass `true`, like the vendor call sites);
+    /// `stopOnAssign` makes the Pratt loop stop before an `=` token (used by dictionary keys to
+    /// detect the Lua-style separator).
+    private @Nullable Expression parseExpression(boolean canAssign) {
+        return parseExpression(canAssign, false);
+    }
+
+    private @Nullable Expression parseExpression(boolean canAssign, boolean stopOnAssign) {
+        return parsePrecedence(Precedence.ASSIGNMENT, canAssign, stopOnAssign);
     }
 
     private @Nullable Expression parsePrecedence(Precedence precedence) {
+        return parsePrecedence(precedence, false, false);
+    }
+
+    private @Nullable Expression parsePrecedence(Precedence precedence, boolean canAssign, boolean stopOnAssign) {
+        // Switch multiline mode on for grouping tokens, before consuming them (vendor order:
+        // the flag must be active before the tokenizer scans the following token).
+        var pushedGrouping = current.type() == GdTokenType.PARENTHESIS_OPEN
+                || current.type() == GdTokenType.BRACE_OPEN || current.type() == GdTokenType.BRACKET_OPEN;
+        if (pushedGrouping) {
+            pushMultiline();
+        }
         // Godot normalizes identifier-like tokens (match/when/builtin constants) to plain
         // identifiers before consulting the rule table.
         var rule = ruleFor(isIdentifier(current) ? GdTokenType.IDENTIFIER : current.type());
         if (rule.prefix() == null) {
-            // Expected expression; the caller reports the proper context-specific error.
+            // Expected expression; the caller reports the proper context-specific error. All
+            // grouping tokens currently have prefix rules, so the pop below is unreachable —
+            // it guards the multiline balance against future rule-table regressions.
+            if (pushedGrouping) {
+                popMultiline();
+            }
             return null;
         }
 
+        // The first token of this frame starts the consumed span of every expression built here
+        // (infix folds keep that left edge, e.g. a grouping's `(` precedes the inner node's range).
+        var extentStart = current.startByte();
         advance(); // Only consume the token if there's a valid rule.
         var left = rule.prefix().parse();
 
         while (precedence.ordinal() <= ruleFor(current.type()).precedence().ordinal()) {
             var infixRule = ruleFor(current.type());
-            if (left == null || infixRule.infix() == null) {
+            if (left == null || infixRule.infix() == null
+                    || (stopOnAssign && current.type() == GdTokenType.EQUAL)) {
                 return left;
             }
             // Switch multiline mode on for infix grouping operators, before consuming the token.
@@ -1392,7 +1462,7 @@ public final class GdScriptParser {
                 pushMultiline();
             }
             advance();
-            left = infixRule.infix().parse(left, precedence);
+            left = infixRule.infix().parse(left, precedence, canAssign, extentStart);
         }
         return left;
     }
@@ -1413,22 +1483,313 @@ public final class GdScriptParser {
         return new SelfExpression(tokenRange(previous));
     }
 
-    /// Port of `GDScriptParser::parse_unary_operator` for `+`/`-` (the remaining prefix operators
-    /// are outside the current rule-table slice).
+    /// Port of `GDScriptParser::parse_grouping`: produces the inner expression itself (no wrapper
+    /// node). Multiline was pushed by `parsePrecedence` before the `(` was consumed; the pop
+    /// happens here before the closing parenthesis (vendor order), even on failure.
+    private @Nullable Expression parseGroupingExpression() {
+        var grouped = parseExpression(false);
+        popMultiline();
+        if (grouped == null) {
+            pushError("Expected grouping expression.");
+            return null;
+        }
+        consume(GdTokenType.PARENTHESIS_CLOSE, "Expected closing \")\" after grouping expression.");
+        return grouped;
+    }
+
+    /// Port of `GDScriptParser::parse_array`: elements parse with assignment disallowed; a failed
+    /// element is reported and skipped (Godot inserts no placeholder); trailing comma allowed.
+    private @NotNull Expression parseArrayExpression() {
+        var start = previous.startByte();
+        var elements = new ArrayList<Expression>();
+        if (!check(GdTokenType.BRACKET_CLOSE)) {
+            do {
+                if (check(GdTokenType.BRACKET_CLOSE)) {
+                    // Allow for trailing comma.
+                    break;
+                }
+                var element = parseExpression(false);
+                if (element == null) {
+                    pushError("Expected expression as array element.");
+                } else {
+                    elements.add(element);
+                }
+            } while (match(GdTokenType.COMMA) && !isAtEnd());
+        }
+        popMultiline();
+        consume(GdTokenType.BRACKET_CLOSE, "Expected closing \"]\" after array elements.");
+        return new ArrayExpression(List.copyOf(elements), false, range(start, previous.endByte()));
+    }
+
+    /// Dictionary styles tracked by `parseDictionaryExpression` (vendor `DictionaryNode::Style`).
+    private enum DictStyle {PYTHON_DICT, LUA_TABLE}
+
+    /// Port of `GDScriptParser::parse_dictionary`: Python (`{key: value}`) and Lua
+    /// (`{key = value}`) styles are decided by the first entry's separator and cannot be mixed.
+    /// Lua-style identifier/string keys normalize to `string_name` literals (the AST contract's
+    /// pinned shape, mirroring the tree-sitter mapper). Keys parse with `stopOnAssign` so the
+    /// Pratt loop leaves a Lua `=` separator unconsumed. A missing key or value is reported; the
+    /// entry is kept with a zero-width `null` literal placeholder for the missing side (the AST
+    /// analog of Godot's dummy recovery `LiteralNode`) and dropped only when both sides failed.
+    private @NotNull Expression parseDictionaryExpression() {
+        var start = previous.startByte();
+        var entries = new ArrayList<DictEntry>();
+        DictStyle style = null;
+        if (!check(GdTokenType.BRACE_CLOSE)) {
+            do {
+                if (check(GdTokenType.BRACE_CLOSE)) {
+                    // Allow for trailing comma.
+                    break;
+                }
+                var keyExtentStart = current.startByte();
+                var key = parseExpression(false, true);
+                var keyExtentEnd = previous.endByte();
+                if (key == null) {
+                    pushError("Expected expression as dictionary key.");
+                }
+                if (style == null) {
+                    switch (current.type()) {
+                        case COLON -> style = DictStyle.PYTHON_DICT;
+                        case EQUAL -> style = DictStyle.LUA_TABLE;
+                        default -> pushError("Expected \":\" or \"=\" after dictionary key.");
+                    }
+                    // Godot's style field defaults to PYTHON_DICT when nothing valid decided it.
+                    if (style == null) {
+                        style = DictStyle.PYTHON_DICT;
+                    }
+                }
+                var normalizedKey = key;
+                if (style == DictStyle.LUA_TABLE) {
+                    if (key instanceof IdentifierExpression(var name, _)) {
+                        normalizedKey = new LiteralExpression("string_name", "&\"" + name + "\"", key.range());
+                    } else if (key instanceof LiteralExpression(var kind, var sourceText, _)
+                            && "string".equals(kind)) {
+                        normalizedKey = new LiteralExpression("string_name", "&" + sourceText, key.range());
+                    } else if (key != null) {
+                        pushError("Expected identifier or string as Lua-style dictionary key (e.g \"{ key = value }\").");
+                    }
+                    if (!match(GdTokenType.EQUAL)) {
+                        if (match(GdTokenType.COLON)) {
+                            pushError("Expected \"=\" after dictionary key. Mixing dictionary styles is not allowed.");
+                            // Vendor consumes one extra token here ("Consume wrong separator
+                            // anyway", though `match` already consumed it); mirrored verbatim.
+                            if (!isAtEnd()) {
+                                advance();
+                            }
+                        } else {
+                            pushError("Expected \"=\" after dictionary key.");
+                        }
+                    }
+                } else {
+                    if (!match(GdTokenType.COLON)) {
+                        if (match(GdTokenType.EQUAL)) {
+                            pushError("Expected \":\" after dictionary key. Mixing dictionary styles is not allowed.");
+                            // Same vendor extra-consumption quirk as the Lua branch above.
+                            if (!isAtEnd()) {
+                                advance();
+                            }
+                        } else {
+                            pushError("Expected \":\" after dictionary key.");
+                        }
+                    }
+                }
+                var valueExtentStart = current.startByte();
+                var value = parseExpression(false);
+                if (value == null) {
+                    pushError("Expected expression as dictionary value.");
+                }
+                // Entry edges use the consumed spans (a grouping `(`/`)` around a key or value
+                // belongs to the entry, like the tree-sitter pair node's range).
+                if (normalizedKey != null && value != null) {
+                    entries.add(new DictEntry(normalizedKey, value,
+                            range(keyExtentStart, previous.endByte())));
+                } else if (normalizedKey != null) {
+                    entries.add(new DictEntry(normalizedKey, nullPlaceholder(),
+                            range(keyExtentStart, keyExtentEnd)));
+                } else if (value != null) {
+                    entries.add(new DictEntry(nullPlaceholder(), value,
+                            range(valueExtentStart, previous.endByte())));
+                }
+            } while (match(GdTokenType.COMMA) && !isAtEnd());
+        }
+        popMultiline();
+        consume(GdTokenType.BRACE_CLOSE, "Expected closing \"}\" after dictionary elements.");
+        return new DictionaryExpression(List.copyOf(entries), false, range(start, previous.endByte()));
+    }
+
+    /// Zero-width `null` literal standing in for a missing dictionary key/value, the AST analog
+    /// of Godot's dummy recovery `LiteralNode` (empty Variant).
+    private @NotNull LiteralExpression nullPlaceholder() {
+        return new LiteralExpression("null", "", range(current.startByte(), current.startByte()));
+    }
+
+    /// Path states of `parseGetNodeExpression` (vendor `parse_get_node`'s `PathState`).
+    private enum NodePathState {START, SLASH, PERCENT, NODE_NAME}
+
+    /// Port of `GDScriptParser::parse_get_node` (`$...` / `%...` shorthands). Path segments are
+    /// node names (Godot's `is_node_name()` set) or string literals; `/` is valid only at the
+    /// start or after a name, `%` only at the start or right after `/`. The AST node stores the
+    /// raw source slice (including the leading `$`/`%`), matching the tree-sitter path's
+    /// `GetNodeExpression.sourceText` contract.
+    private @Nullable Expression parseGetNodeExpression() {
+        var startToken = previous;
+        if (!isNodeName(current) && current.type() != GdTokenType.LITERAL
+                && current.type() != GdTokenType.SLASH && current.type() != GdTokenType.PERCENT) {
+            pushError("Expected node path as string or identifier after \"%s\"."
+                    .formatted(startToken.type().displayName()));
+            return null;
+        }
+        if (current.type() == GdTokenType.LITERAL && current.literalKind() != GdLiteralKind.STRING) {
+            pushError("Expected node path as string or identifier after \"%s\"."
+                    .formatted(startToken.type().displayName()));
+            return null;
+        }
+
+        var state = NodePathState.START;
+        if (startToken.type() == GdTokenType.DOLLAR) {
+            // An initial slash (absolute path) is handled by the loop's SLASH branch.
+            match(GdTokenType.SLASH);
+        }
+        do {
+            if (previous.type() == GdTokenType.PERCENT) {
+                if (state != NodePathState.START && state != NodePathState.SLASH) {
+                    pushError("\"%\" is only valid in the beginning of a node name (either after \"$\" or after \"/\")");
+                    return null;
+                }
+                state = NodePathState.PERCENT;
+            } else if (previous.type() == GdTokenType.SLASH) {
+                if (state != NodePathState.START && state != NodePathState.NODE_NAME) {
+                    pushError("\"/\" is only valid at the beginning of the path or after a node name.");
+                    return null;
+                }
+                state = NodePathState.SLASH;
+            }
+
+            if (match(GdTokenType.LITERAL)) {
+                if (previous.literalKind() != GdLiteralKind.STRING) {
+                    var after = switch (state) {
+                        case PERCENT -> "%";
+                        case SLASH -> "/";
+                        default -> "$";
+                    };
+                    pushError("Expected node path as string or identifier after \"%s\".".formatted(after));
+                    return null;
+                }
+                state = NodePathState.NODE_NAME;
+            } else if (isNodeName(current)) {
+                advance();
+                state = NodePathState.NODE_NAME;
+            } else if (!check(GdTokenType.SLASH) && !check(GdTokenType.PERCENT)) {
+                pushError("Unexpected \"%s\" in node path.".formatted(
+                        current.type() == GdTokenType.IDENTIFIER ? current.source()
+                                : current.type().displayName()));
+                return null;
+            }
+        } while (match(GdTokenType.SLASH) || match(GdTokenType.PERCENT));
+
+        return new GetNodeExpression(slice(startToken.startByte(), previous.endByte()),
+                range(startToken.startByte(), previous.endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_preload`: the path is a general expression (constant
+    /// folding and resource-existence checks belong to later Godot phases, cut here); one
+    /// trailing comma is allowed.
+    private @Nullable Expression parsePreloadExpression() {
+        var startToken = previous;
+        pushMultiline();
+        consume(GdTokenType.PARENTHESIS_OPEN, "Expected \"(\" after \"preload\".");
+        var path = parseExpression(false);
+        if (path == null) {
+            pushError("Expected resource path after \"(\".");
+        }
+        match(GdTokenType.COMMA); // Allow trailing comma.
+        popMultiline();
+        consume(GdTokenType.PARENTHESIS_CLOSE, "Expected \")\" after preload path.");
+        if (path == null) {
+            return null;
+        }
+        return new PreloadExpression(path, range(startToken.startByte(), previous.endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_await`: the operand parses at `PREC_AWAIT`, so call/
+    /// attribute/subscript suffixes bind into the awaited expression (`await timer.timeout`).
+    private @Nullable Expression parseAwaitExpression() {
+        var startToken = previous;
+        var operand = parsePrecedence(Precedence.AWAIT);
+        if (operand == null) {
+            pushError("Expected signal or coroutine after \"await\".");
+            return null;
+        }
+        return new AwaitExpression(operand, range(startToken.startByte(), previous.endByte()));
+    }
+
+    /// Port of the `SUPER` branch of `GDScriptParser::parse_call`, mapped to the AST contract's
+    /// pinned shapes: `super(...)` is a `CallExpression` on an `IdentifierExpression("super")`
+    /// callee, `super.method(...)` an `AttributeExpression` with a single call step. The method
+    /// name follows vendor `consume(IDENTIFIER)`, which accepts the whole `is_identifier()` set
+    /// (`match`/`when`/builtin constants, e.g. `super.match()`) but not the wider
+    /// `is_node_name()` set. Godot's "implicit super() outside a function" check needs
+    /// function-context tracking and is outside the ported parse-time check set (plan §5.6).
+    private @Nullable Expression parseSuperExpression() {
+        var superToken = previous;
+        var superIdentifier = new IdentifierExpression("super", tokenRange(superToken));
+        if (check(GdTokenType.PARENTHESIS_OPEN)) {
+            pushMultiline();
+            advance();
+            var arguments = parseCallArguments();
+            if (arguments == null) {
+                return null;
+            }
+            return new CallExpression(superIdentifier, arguments,
+                    range(superToken.startByte(), previous.endByte()));
+        }
+        consume(GdTokenType.PERIOD, "Expected \".\" or \"(\" after \"super\".");
+        if (!consume(GdTokenType.IDENTIFIER, "Expected function name after \".\".")) {
+            return null;
+        }
+        var nameToken = previous;
+        if (!check(GdTokenType.PARENTHESIS_OPEN)) {
+            pushError("Expected \"(\" after function name.");
+            return null;
+        }
+        pushMultiline();
+        advance();
+        var arguments = parseCallArguments();
+        if (arguments == null) {
+            return null;
+        }
+        var step = new AttributeCallStep(nameToken.source(), arguments,
+                range(nameToken.startByte(), previous.endByte()));
+        return new AttributeExpression(superIdentifier, List.of(step),
+                range(superToken.startByte(), previous.endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_unary_operator`: `+`/`-` at `PREC_SIGN`, `~` at
+    /// `PREC_BIT_NOT`, `not`/`!` at `PREC_LOGIC_NOT`.
     private @Nullable Expression parseUnaryOperator() {
         var operator = previous;
-        var operand = parsePrecedence(Precedence.SIGN);
+        var operandPrecedence = switch (operator.type()) {
+            case PLUS, MINUS -> Precedence.SIGN;
+            case TILDE -> Precedence.BIT_NOT;
+            case NOT, BANG -> Precedence.LOGIC_NOT;
+            default -> throw new IllegalStateException(
+                    "GDScript parser bug: unary operator rule entered on " + operator.type());
+        };
+        var operand = parsePrecedence(operandPrecedence);
         if (operand == null) {
             pushError("Expected expression after \"%s\" operator.".formatted(operator.type().displayName()));
             return null;
         }
+        // The right edge is the last consumed token, not the operand node's own end (a trailing
+        // grouping `)` belongs to the consumed span, matching the tree-sitter path's CST ranges).
         return new UnaryExpression(operator.source(), operand,
-                range(operator.startByte(), operand.range().endByte()));
+                range(operator.startByte(), previous.endByte()));
     }
 
     /// Port of `GDScriptParser::parse_binary_operator` (left-associative via precedence + 1 on the
     /// right operand, which also makes `**` left-associative like Godot).
-    private @Nullable Expression parseBinaryOperator(@Nullable Expression left, Precedence entryPrecedence) {
+    private @Nullable Expression parseBinaryOperator(@Nullable Expression left, Precedence entryPrecedence,
+                                                     boolean canAssign, int extentStart) {
         var operator = previous;
         var precedence = ruleFor(operator.type()).precedence();
         var right = parsePrecedence(Precedence.values()[precedence.ordinal() + 1]);
@@ -1440,7 +1801,122 @@ public final class GdScriptParser {
             return null;
         }
         return new BinaryExpression(operator.source(), left, right,
-                range(left.range().startByte(), right.range().endByte()));
+                range(extentStart, previous.endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_binary_not_in_operator`. Godot wraps the membership binary
+    /// in a logic-not unary node; the AST contract models the pair as a single
+    /// `BinaryExpression("not in")` (the tree-sitter path's pinned shape). When the `in` token is
+    /// missing, the vendor still parses the right-hand side as if it were present (the recovery
+    /// message then names "not"); mirrored here.
+    private @Nullable Expression parseNotInOperator(@Nullable Expression left, Precedence entryPrecedence,
+                                                    boolean canAssign, int extentStart) {
+        var matchedIn = match(GdTokenType.IN);
+        if (!matchedIn) {
+            pushError("Expected \"in\" after \"not\" in content-test operator.");
+        }
+        var right = parsePrecedence(Precedence.COMPARISON); // PREC_CONTENT_TEST + 1
+        if (right == null) {
+            pushError("Expected expression after \"%s\" operator.".formatted(matchedIn ? "in" : "not"));
+            return null;
+        }
+        if (left == null) {
+            return null;
+        }
+        return new BinaryExpression("not in", left, right,
+                range(extentStart, previous.endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_ternary_operator` (`true_value if condition else false_value`).
+    /// Both branches parse at `PREC_TERNARY` with assignment disallowed. A failed branch fails the
+    /// whole expression (the AST has no nullable expression components, unlike Godot's nodes),
+    /// but token consumption still follows the vendor order: condition, `else`, false branch.
+    private @Nullable Expression parseTernaryOperator(@Nullable Expression left, Precedence entryPrecedence,
+                                                      boolean canAssign, int extentStart) {
+        var condition = parsePrecedence(Precedence.TERNARY);
+        if (condition == null) {
+            pushError("Expected expression as ternary condition after \"if\".");
+        }
+        consume(GdTokenType.ELSE, "Expected \"else\" after ternary operator condition.");
+        var falseBranch = parsePrecedence(Precedence.TERNARY);
+        if (falseBranch == null) {
+            pushError("Expected expression after \"else\".");
+        }
+        if (left == null || condition == null || falseBranch == null) {
+            return null;
+        }
+        return new ConditionalExpression(condition, left, falseBranch,
+                range(extentStart, previous.endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_cast`: the right side is a type specifier (parsed by
+    /// `parse_type`, not a general expression). On a missing type Godot drops the cast and
+    /// returns the operand, mirrored here.
+    private @Nullable Expression parseCast(@Nullable Expression left, Precedence entryPrecedence,
+                                           boolean canAssign, int extentStart) {
+        var type = parseType(false);
+        if (type == null) {
+            pushError("Expected type specifier after \"as\".");
+            return left;
+        }
+        if (left == null) {
+            return null;
+        }
+        return new CastExpression(left, type, range(extentStart, type.range().endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_type_test`. Godot represents `is not` as a logic-not unary
+    /// wrapping the test node; the AST contract carries the `negated` flag on
+    /// `TypeTestExpression` instead (the tree-sitter path's pinned shape). On a missing type the
+    /// expression degrades to the left operand (Godot keeps a typeless test node, which the AST
+    /// cannot represent).
+    private @Nullable Expression parseTypeTest(@Nullable Expression left, Precedence entryPrecedence,
+                                               boolean canAssign, int extentStart) {
+        var negated = match(GdTokenType.NOT);
+        var type = parseType(false);
+        if (type == null) {
+            pushError("Expected type specifier after \"is%s\".".formatted(negated ? " not" : ""));
+            return left;
+        }
+        if (left == null) {
+            return null;
+        }
+        return new TypeTestExpression(left, type, negated,
+                range(extentStart, type.range().endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_assignment` for the whole `=`/`+=`/.../`^=` family. The
+    /// operator text comes from the token source (`"="` for plain assignment). The right-hand
+    /// side parses with assignment disallowed, so `a = b = 1` reports the nested-assignment
+    /// error exactly like Godot. The vendor's assignee node-type check (`SUBSCRIPT`/`IDENTIFIER`)
+    /// is a parse-time semantic check outside the ported set (plan §5.6) and is not enforced;
+    /// invalid targets produce an `AssignmentExpression` for the analyzer to reject.
+    private @Nullable Expression parseAssignment(@Nullable Expression left, Precedence entryPrecedence,
+                                                 boolean canAssign, int extentStart) {
+        var operator = previous;
+        if (!canAssign) {
+            pushError("Assignment is not allowed inside an expression.");
+            return parseExpression(false);
+        }
+        if (left == null) {
+            return parseExpression(false);
+        }
+        var right = parseExpression(false);
+        if (right == null) {
+            pushError("Expected an expression after \"=\".");
+            return null;
+        }
+        return new AssignmentExpression(operator.source(), left, right,
+                range(extentStart, previous.endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_invalid_token` for `?` (GDScript 2.x ternary syntax hint).
+    private @Nullable Expression parseInvalidToken(@Nullable Expression left, Precedence entryPrecedence,
+                                                   boolean canAssign, int extentStart) {
+        if (previous.type() == GdTokenType.QUESTION_MARK) {
+            pushError("Unexpected \"?\" in source. If you want a ternary operator, use \"truthy_value if true_condition else falsy_value\".");
+        }
+        return left;
     }
 
     /// Consumes one contiguous attribute/call/subscript suffix run (`obj.a.b(1).c[2]`) and folds
@@ -1463,8 +1939,13 @@ public final class GdScriptParser {
     /// Entered from the Pratt loop with `previous` holding the first suffix token (multiline
     /// already pushed when it was `(` or `[`); subsequent suffix tokens are consumed by this
     /// loop with that same order. `entryPrecedence` is the precedence of the enclosing
-    /// `parsePrecedence` call, used by the continuation check above.
-    private @Nullable Expression parseSuffixChain(@Nullable Expression left, Precedence entryPrecedence) {
+    /// `parsePrecedence` call, used by the continuation check above. `canAssign` is accepted for
+    /// `InfixRule` uniformity but ignored: indices and arguments always parse with assignment
+    /// disallowed, like the vendor call sites in `parse_call`/`parse_subscript`. `extentStart`
+    /// is the consumed-span start of the base expression (a grouping `(` can precede the base
+    /// node's own range) and stays the left edge of every node the chain produces.
+    private @Nullable Expression parseSuffixChain(@Nullable Expression left, Precedence entryPrecedence,
+                                                  boolean canAssign, int extentStart) {
         if (left == null) {
             return null;
         }
@@ -1500,15 +1981,15 @@ public final class GdScriptParser {
                         steps.add(new AttributeCallStep(name, arguments,
                                 range(stepRange.startByte(), end)));
                     } else {
-                        var callee = finishChain(result, chainBase, steps);
+                        var callee = finishChain(result, chainBase, steps, extentStart);
                         result = new CallExpression(callee, arguments,
-                                range(callee.range().startByte(), end));
+                                range(extentStart, end));
                         chainBase = null;
                         steps = null;
                     }
                 }
                 case BRACKET_OPEN -> {
-                    var index = parseExpression();
+                    var index = parseExpression(false);
                     if (index == null) {
                         pushError("Expected expression after \"[\".");
                     }
@@ -1525,9 +2006,9 @@ public final class GdScriptParser {
                         steps.add(new AttributeSubscriptStep(name, List.of(index),
                                 range(stepRange.startByte(), end)));
                     } else {
-                        var baseExpression = finishChain(result, chainBase, steps);
+                        var baseExpression = finishChain(result, chainBase, steps, extentStart);
                         result = new SubscriptExpression(baseExpression, List.of(index),
-                                range(baseExpression.range().startByte(), end));
+                                range(extentStart, end));
                         chainBase = null;
                         steps = null;
                     }
@@ -1543,7 +2024,7 @@ public final class GdScriptParser {
             var isSuffix = nextType == GdTokenType.PARENTHESIS_OPEN || nextType == GdTokenType.BRACKET_OPEN
                     || nextType == GdTokenType.PERIOD;
             if (!isSuffix || entryPrecedence.ordinal() > ruleFor(nextType).precedence().ordinal()) {
-                return finishChain(result, chainBase, steps);
+                return finishChain(result, chainBase, steps, extentStart);
             }
             if (nextType != GdTokenType.PERIOD) {
                 pushMultiline();
@@ -1552,9 +2033,10 @@ public final class GdScriptParser {
         }
     }
 
-    /// Freezes an open attribute chain (if any) into a single `AttributeExpression`.
+    /// Freezes an open attribute chain (if any) into a single `AttributeExpression` whose left
+    /// edge is the base's consumed-span start (`extentStart`, see `parseSuffixChain`).
     private @NotNull Expression finishChain(@NotNull Expression result, @Nullable Expression chainBase,
-                                            @Nullable List<AttributeStep> steps) {
+                                            @Nullable List<AttributeStep> steps, int extentStart) {
         if (steps == null) {
             return result;
         }
@@ -1562,7 +2044,7 @@ public final class GdScriptParser {
             throw new IllegalStateException("GDScript parser bug: attribute chain without a base.");
         }
         return new AttributeExpression(chainBase, List.copyOf(steps),
-                range(chainBase.range().startByte(), steps.getLast().range().endByte()));
+                range(extentStart, steps.getLast().range().endByte()));
     }
 
     /// Port of the argument loop of `GDScriptParser::parse_call` (non-`super` branch): assumes the
@@ -1576,7 +2058,7 @@ public final class GdScriptParser {
                 // Allow for trailing comma.
                 break;
             }
-            var argument = parseExpression();
+            var argument = parseExpression(false);
             if (argument == null) {
                 pushError("Expected expression as the function argument.");
                 failed = true;

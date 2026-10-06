@@ -120,4 +120,103 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("const A = a.b.c.d.e.f.g.h\n");
         assertCleanParity("const A = a.b(\n\t1\n).c\n");
     }
+
+    @Test
+    void containerLiteralParity() {
+        assertCleanParity("var a = [1, 2, 3]\n");
+        assertCleanParity("var a = []\n");
+        assertCleanParity("var a = [1, 2,]\n");
+        assertCleanParity("var a = [[1], [2]]\n");
+        assertCleanParity("var a = [\n\t1,\n\t2,\n]\n");
+        assertCleanParity("var d = {\"a\": 1, b: 2}\n");
+        assertCleanParity("var d = {}\n");
+        assertCleanParity("var d = {\"a\": 1,}\n");
+        // Lua-style keys normalize to synthesized StringName literals on both paths.
+        assertCleanParity("var d = {x = 1}\n");
+        assertCleanParity("var d = {\"name\" = 1}\n");
+        assertCleanParity("var d = {x = 1, y = 2}\n");
+        assertCleanParity("var d = {\n\t\"a\": 1,\n\tb: 2,\n}\n");
+    }
+
+    @Test
+    void dedicatedExpressionFormParity() {
+        assertCleanParity("var n = $Child\n");
+        assertCleanParity("var n = $\"a/b\"\n");
+        assertCleanParity("var n = $/root\n");
+        assertCleanParity("var n = $A/B\n");
+        assertCleanParity("var n = %Unique\n");
+        assertCleanParity("const P = preload(\"res://a.gd\")\n");
+        assertCleanParity("func f():\n\tawait foo()\n");
+        assertCleanParity("func f():\n\tawait get_tree().create_timer(1).timeout\n");
+        assertCleanParity("func f():\n\tsuper()\n");
+        assertCleanParity("func f():\n\tsuper.foo(1)\n");
+        assertCleanParity("var a = x as int\n");
+        assertCleanParity("var a = x as Array[int]\n");
+        assertCleanParity("var a = x is Node\n");
+        assertCleanParity("var a = x is not Node\n");
+        assertCleanParity("var a = 1 if c else 2\n");
+        assertCleanParity("var a = x not in y\n");
+        assertCleanParity("var a = not b\n");
+        assertCleanParity("var a = !b\n");
+        assertCleanParity("var a = ~x\n");
+    }
+
+    /// Grouping participates in enclosing-node ranges: the inner node keeps its own range while
+    /// enclosing nodes span the consumed parentheses (the range contract pinned here byte-exact).
+    @Test
+    void groupingRangeParity() {
+        assertCleanParity("const A = (1 + 2) * 3\n");
+        assertCleanParity("var a = ((1))\n");
+        assertCleanParity("var a = -(x)\n");
+        assertCleanParity("var a = (x) + (y)\n");
+        assertCleanParity("func f():\n\tawait (x)\n");
+        assertCleanParity("func f():\n\t(f)(1)\n");
+        assertCleanParity("var a = (x) if c else (y)\n");
+        assertCleanParity("var d = {(a): 1}\n");
+        assertCleanParity("var a = [(1), (2)]\n");
+    }
+
+    @Test
+    void assignmentParity() {
+        assertCleanParity("func f():\n\tx = 1\n");
+        assertCleanParity("func f():\n\tx += 1\n");
+        assertCleanParity("func f():\n\tx -= 1\n");
+        assertCleanParity("func f():\n\tx *= 2\n");
+        assertCleanParity("func f():\n\tx **= 2\n");
+        assertCleanParity("func f():\n\tx /= 2\n");
+        assertCleanParity("func f():\n\tx %= 2\n");
+        assertCleanParity("func f():\n\tx <<= 1\n");
+        assertCleanParity("func f():\n\tx >>= 1\n");
+        assertCleanParity("func f():\n\tx &= 1\n");
+        assertCleanParity("func f():\n\tx |= 1\n");
+        assertCleanParity("func f():\n\tx ^= 1\n");
+        assertCleanParity("func f():\n\ta.b = 1\n");
+        assertCleanParity("func f():\n\ta[0] = 1\n");
+        assertCleanParity("func f():\n\ta = b + c\n");
+        assertCleanParity("func f():\n\ta = b if c else d\n");
+    }
+
+    /// Representative two-operator cross-family combos from the precedence matrix. §5.8
+    /// divergence combos (`*` followed by `**`, unary sign before `**`, additive left of `as`)
+    /// are excluded here and pinned as Godot structures in `GdScriptParserTest`.
+    @Test
+    void operatorPrecedenceMatrixParity() {
+        assertCleanParity("var a = x + y * z\n");
+        assertCleanParity("var a = x * y + z\n");
+        assertCleanParity("var a = x ** y ** z\n");
+        assertCleanParity("var a = x ** y * z\n");
+        assertCleanParity("var a = x << y + z\n");
+        assertCleanParity("var a = x + y << z\n");
+        assertCleanParity("var a = x & y == z\n");
+        assertCleanParity("var a = x | y ^ z\n");
+        assertCleanParity("var a = x < y == z\n");
+        assertCleanParity("var a = x == y and z\n");
+        assertCleanParity("var a = x and y or z\n");
+        assertCleanParity("var a = x in y and z\n");
+        assertCleanParity("var a = -x * y\n");
+        assertCleanParity("var a = not x and y\n");
+        assertCleanParity("var a = 1 if c else 2 + 3\n");
+        assertCleanParity("var a = x + 1 if c else y - 2\n");
+        assertCleanParity("var a = x if c else y if d else z\n");
+    }
 }

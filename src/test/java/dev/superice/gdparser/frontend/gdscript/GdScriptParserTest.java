@@ -1,6 +1,8 @@
 package dev.superice.gdparser.frontend.gdscript;
 
 import dev.superice.gdparser.frontend.ast.AnnotationStatement;
+import dev.superice.gdparser.frontend.ast.ArrayExpression;
+import dev.superice.gdparser.frontend.ast.AssignmentExpression;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AstMappingResult;
@@ -8,25 +10,32 @@ import dev.superice.gdparser.frontend.ast.AttributeCallStep;
 import dev.superice.gdparser.frontend.ast.AttributeExpression;
 import dev.superice.gdparser.frontend.ast.AttributePropertyStep;
 import dev.superice.gdparser.frontend.ast.AttributeSubscriptStep;
+import dev.superice.gdparser.frontend.ast.AwaitExpression;
 import dev.superice.gdparser.frontend.ast.BinaryExpression;
+import dev.superice.gdparser.frontend.ast.CallExpression;
+import dev.superice.gdparser.frontend.ast.CastExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.ClassNameStatement;
+import dev.superice.gdparser.frontend.ast.ConditionalExpression;
 import dev.superice.gdparser.frontend.ast.ConstructorDeclaration;
 import dev.superice.gdparser.frontend.ast.DeclarationKind;
+import dev.superice.gdparser.frontend.ast.DictionaryExpression;
 import dev.superice.gdparser.frontend.ast.EnumDeclaration;
 import dev.superice.gdparser.frontend.ast.ExpressionStatement;
 import dev.superice.gdparser.frontend.ast.ExtendsStatement;
 import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
+import dev.superice.gdparser.frontend.ast.GetNodeExpression;
 import dev.superice.gdparser.frontend.ast.IdentifierExpression;
 import dev.superice.gdparser.frontend.ast.LiteralExpression;
 import dev.superice.gdparser.frontend.ast.PassStatement;
 import dev.superice.gdparser.frontend.ast.Point;
+import dev.superice.gdparser.frontend.ast.PreloadExpression;
 import dev.superice.gdparser.frontend.ast.Range;
 import dev.superice.gdparser.frontend.ast.SelfExpression;
 import dev.superice.gdparser.frontend.ast.SignalStatement;
 import dev.superice.gdparser.frontend.ast.SourceFile;
 import dev.superice.gdparser.frontend.ast.Statement;
-import dev.superice.gdparser.frontend.ast.TypeRef;
+import dev.superice.gdparser.frontend.ast.TypeTestExpression;
 import dev.superice.gdparser.frontend.ast.UnaryExpression;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import org.junit.jupiter.api.Test;
@@ -813,6 +822,509 @@ class GdScriptParserTest {
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var statement = assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst());
         assertEquals(11, statement.range().startByte());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 3 expression forms: grouping, arrays, dictionaries.
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void groupingShapeAndErrors() {
+        var ast = cleanAst("const A = (1 + 2) * 3\n");
+        var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var times = assertInstanceOf(BinaryExpression.class, constant.value());
+        assertEquals("*", times.operator());
+        // The grouping produces the inner expression itself (no wrapper node); the enclosing
+        // node's range still spans the consumed parentheses (tree-sitter-path range contract).
+        assertEquals("+", assertInstanceOf(BinaryExpression.class, times.left()).operator());
+        assertEquals(new Range(10, 21, new Point(0, 10), new Point(0, 21)), times.range());
+        assertEquals(new Range(11, 16, new Point(0, 11), new Point(0, 16)), times.left().range());
+
+        assertTrue(errorMessages(parse("var x = ()\n")).contains("Expected grouping expression."));
+        assertTrue(errorMessages(parse("var y = (1\n")).contains("Expected closing \")\" after grouping expression."));
+    }
+
+    @Test
+    void unclosedGroupingConstructsAtEofTerminate() {
+        // EOF directly after an unclosed grouping token: multiline push eats the trailing
+        // newline, the prefix fails at EOF — must report, pop multiline and terminate.
+        assertTrue(errorMessages(parse("var x = (\n")).contains("Expected grouping expression."));
+        assertTrue(errorMessages(parse("var x = {\n")).contains("Expected expression as dictionary key."));
+        assertTrue(errorMessages(parse("func f():\n\tfoo(\n"))
+                .contains("Expected expression as the function argument."));
+    }
+
+    @Test
+    void callArgumentRecovery() {
+        // An empty argument slot reports and recovers at the comma; a missing comma reports the
+        // closing parenthesis while keeping the successfully parsed arguments (vendor shape).
+        var empty = parse("func f():\n\tfoo(,)\n");
+        assertTrue(errorMessages(empty).contains("Expected expression as the function argument."));
+        var missingComma = parse("func f():\n\tfoo(1 2)\n");
+        assertTrue(errorMessages(missingComma).contains("Expected closing \")\" after call arguments."));
+        var function = assertInstanceOf(FunctionDeclaration.class, missingComma.ast().statements().getFirst());
+        var call = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst()).expression());
+        assertEquals(1, call.arguments().size());
+    }
+
+    @Test
+    void arrayLiteralShapes() {
+        var ast = cleanAst("const A = [1, 2, 3]\nconst B = []\nconst C = [[1], [2]]\n");
+        var a = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        assertEquals(3, a.elements().size());
+        assertFalse(a.openEnded());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, a.elements().getFirst()).sourceText());
+        assertEquals(new Range(10, 19, new Point(0, 10), new Point(0, 19)), a.range());
+        var b = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        assertEquals(0, b.elements().size());
+        var c = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(2)).value());
+        assertEquals(2, c.elements().size());
+        assertInstanceOf(ArrayExpression.class, c.elements().getFirst());
+    }
+
+    @Test
+    void arrayTrailingCommaAndMultiline() {
+        var ast = cleanAst("const A = [1, 2,]\nconst B = [\n\t1,\n\t2,\n]\n");
+        var a = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        assertEquals(2, a.elements().size());
+        var b = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        assertEquals(2, b.elements().size());
+    }
+
+    @Test
+    void arrayRecovery() {
+        // A failed element is reported and skipped; the surviving elements are kept (Godot
+        // inserts no placeholder).
+        var missing = parse("var x = [1, , 2]\n");
+        assertTrue(errorMessages(missing).contains("Expected expression as array element."));
+        var array = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, missing.ast().statements().getFirst()).value());
+        assertEquals(2, array.elements().size());
+
+        assertTrue(errorMessages(parse("var y = [1, 2\n"))
+                .contains("Expected closing \"]\" after array elements."));
+    }
+
+    @Test
+    void pythonDictionaryShape() {
+        var ast = cleanAst("const D = {\"a\": 1, b: 2}\n");
+        var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var dictionary = assertInstanceOf(DictionaryExpression.class, constant.value());
+        assertFalse(dictionary.openEnded());
+        assertEquals(2, dictionary.entries().size());
+        var first = dictionary.entries().getFirst();
+        assertEquals("a", assertInstanceOf(LiteralExpression.class, first.key()).sourceText().replace("\"", ""));
+        // An unquoted Python-style key stays a plain identifier expression.
+        assertInstanceOf(IdentifierExpression.class, dictionary.entries().get(1).key());
+        // Entry ranges span key start through value end; the dictionary spans the braces.
+        assertEquals(new Range(11, 17, new Point(0, 11), new Point(0, 17)), first.range());
+        assertEquals(new Range(10, 24, new Point(0, 10), new Point(0, 24)), dictionary.range());
+    }
+
+    @Test
+    void luaDictionaryKeyNormalization() {
+        var ast = cleanAst("const A = {x = 1}\nconst B = {\"name\" = 2}\n");
+        var a = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        var aKey = assertInstanceOf(LiteralExpression.class, a.entries().getFirst().key());
+        // Lua-style identifier keys normalize to synthesized StringName literals.
+        assertEquals("string_name", aKey.kind());
+        assertEquals("&\"x\"", aKey.sourceText());
+        var b = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        var bKey = assertInstanceOf(LiteralExpression.class, b.entries().getFirst().key());
+        assertEquals("string_name", bKey.kind());
+        assertEquals("&\"name\"", bKey.sourceText());
+    }
+
+    @Test
+    void mixedDictionaryStylesAreRejected() {
+        // Python style decided first; the `=` separator is rejected. The vendor consumes one
+        // extra token after the wrong separator, so the value is lost too (mirrored quirk).
+        var pythonFirst = parse("var d = {\"a\": 1, b = 2}\n");
+        var pythonErrors = errorMessages(pythonFirst);
+        assertTrue(pythonErrors.contains("Expected \":\" after dictionary key. Mixing dictionary styles is not allowed."));
+        assertTrue(pythonErrors.contains("Expected expression as dictionary value."));
+        var dict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, pythonFirst.ast().statements().getFirst()).value());
+        assertEquals(2, dict.entries().size());
+        var placeholder = assertInstanceOf(LiteralExpression.class, dict.entries().get(1).value());
+        assertEquals("null", placeholder.kind());
+
+        var luaFirst = parse("var e = {a = 1, \"b\": 2}\n");
+        assertTrue(errorMessages(luaFirst)
+                .contains("Expected \"=\" after dictionary key. Mixing dictionary styles is not allowed."));
+    }
+
+    @Test
+    void dictionaryRecovery() {
+        // A key-only entry reports the separator and value errors; the pair is kept with a
+        // zero-width null placeholder (Godot's dummy recovery literal).
+        var keyOnly = parse("var d = {name}\n");
+        var keyOnlyErrors = errorMessages(keyOnly);
+        assertTrue(keyOnlyErrors.contains("Expected \":\" or \"=\" after dictionary key."));
+        assertTrue(keyOnlyErrors.contains("Expected \":\" after dictionary key."));
+        assertTrue(keyOnlyErrors.contains("Expected expression as dictionary value."));
+        var keyOnlyDict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, keyOnly.ast().statements().getFirst()).value());
+        assertEquals(1, keyOnlyDict.entries().size());
+        assertInstanceOf(IdentifierExpression.class, keyOnlyDict.entries().getFirst().key());
+        assertEquals("null", assertInstanceOf(LiteralExpression.class,
+                keyOnlyDict.entries().getFirst().value()).kind());
+
+        var missingValue = parse("var e = {\"a\": }\n");
+        assertTrue(errorMessages(missingValue).contains("Expected expression as dictionary value."));
+        assertTrue(errorMessages(parse("var f = {\"a\": 1\n"))
+                .contains("Expected closing \"}\" after dictionary elements."));
+    }
+
+    @Test
+    void dictionaryMissingValueEntrySpansGroupedKey() {
+        // Recovery branch range: the entry spans the key's whole consumed span, including a
+        // grouping's closing parenthesis (review-driven range completion on an illegal source).
+        var result = parse("var d = {(a)}\n");
+        assertTrue(errorMessages(result).contains("Expected expression as dictionary value."));
+        var dict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value());
+        assertEquals(new Range(9, 12, new Point(0, 9), new Point(0, 12)), dict.entries().getFirst().range());
+    }
+
+    @Test
+    void dictionaryMissingSeparatorKeepsKeyAndValue() {
+        // `{1 2}`: the invalid separator leaves the style undecided-then-defaulted; Godot still
+        // parses the following token as the value and keeps the pair (vendor `decided_style`
+        // is set unconditionally, gdscript_parser.cpp:3285).
+        var result = parse("var d = {1 2}\n");
+        var errors = errorMessages(result);
+        assertTrue(errors.contains("Expected \":\" or \"=\" after dictionary key."));
+        assertTrue(errors.contains("Expected \":\" after dictionary key."));
+        var dict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value());
+        assertEquals(1, dict.entries().size());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, dict.entries().getFirst().key()).sourceText());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, dict.entries().getFirst().value()).sourceText());
+    }
+
+    @Test
+    void luaDictionaryRejectsNonNameKeys() {
+        var result = parse("var d = {1 = \"x\"}\n");
+        assertTrue(errorMessages(result)
+                .contains("Expected identifier or string as Lua-style dictionary key (e.g \"{ key = value }\")."));
+        // The pair is still kept (Godot appends it despite the key-type error).
+        var dict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value());
+        assertEquals(1, dict.entries().size());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 3 expression forms: get_node, preload, await, super.
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void getNodeShapes() {
+        var ast = cleanAst(
+                "var a = $Child\nvar b = $\"a/b\"\nvar c = $/root\nvar d = $A/B\nvar e = %Unique\n");
+        var expected = List.of("$Child", "$\"a/b\"", "$/root", "$A/B", "%Unique");
+        for (var i = 0; i < expected.size(); i++) {
+            var variable = assertInstanceOf(VariableDeclaration.class, ast.statements().get(i));
+            var getNode = assertInstanceOf(GetNodeExpression.class, variable.value());
+            // The raw source slice (including the leading `$`/`%`) is stored verbatim.
+            assertEquals(expected.get(i), getNode.sourceText());
+            assertEquals(variable.value().range().startByte(), getNode.range().startByte());
+        }
+    }
+
+    @Test
+    void getNodeGodotOnlyForms() {
+        // §5.7 (ii): legal in Godot, rejected by the tree-sitter path — no parity, Godot shapes.
+        var ast = cleanAst("var a = $%Child\nvar b = $Root/%Child\n");
+        assertEquals("$%Child", assertInstanceOf(GetNodeExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value()).sourceText());
+        assertEquals("$Root/%Child", assertInstanceOf(GetNodeExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()).sourceText());
+    }
+
+    @Test
+    void getNodeErrors() {
+        assertTrue(errorMessages(parse("var a = $1\n"))
+                .contains("Expected node path as string or identifier after \"$\"."));
+        assertTrue(errorMessages(parse("var b = $a/1\n"))
+                .contains("Expected node path as string or identifier after \"/\"."));
+        assertTrue(errorMessages(parse("var c = $a%b\n"))
+                .contains("\"%\" is only valid in the beginning of a node name (either after \"$\" or after \"/\")"));
+        assertTrue(errorMessages(parse("var d = $a//b\n"))
+                .contains("\"/\" is only valid at the beginning of the path or after a node name."));
+    }
+
+    @Test
+    void preloadShapes() {
+        var ast = cleanAst("const P = preload(\"res://a.gd\")\nconst Q = preload(path_var)\n");
+        var p = assertInstanceOf(PreloadExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        assertEquals("\"res://a.gd\"", assertInstanceOf(LiteralExpression.class, p.path()).sourceText());
+        assertEquals(new Range(10, 31, new Point(0, 10), new Point(0, 31)), p.range());
+        // The path is a general expression; constant/resource checks are cut (later Godot phases).
+        assertInstanceOf(IdentifierExpression.class,
+                assertInstanceOf(PreloadExpression.class,
+                        assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()).path());
+        // One trailing comma is allowed.
+        assertInstanceOf(PreloadExpression.class,
+                assertInstanceOf(VariableDeclaration.class, cleanAst("const R = preload(\"a\",)\n")
+                        .statements().getFirst()).value());
+    }
+
+    @Test
+    void preloadErrors() {
+        assertTrue(errorMessages(parse("var a = preload()\n")).contains("Expected resource path after \"(\"."));
+        assertTrue(errorMessages(parse("var b = preload\n")).contains("Expected \"(\" after \"preload\"."));
+        assertTrue(errorMessages(parse("var c = preload(\"a\"\n")).contains("Expected \")\" after preload path."));
+    }
+
+    @Test
+    void awaitShapes() {
+        var ast = cleanAst("func f():\n\tawait foo()\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var statement = assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst());
+        var await = assertInstanceOf(AwaitExpression.class, statement.expression());
+        assertInstanceOf(CallExpression.class, await.value());
+
+        // Suffixes bind into the awaited operand (PREC_AWAIT): `await timer.timeout`.
+        var chained = cleanAst("func f():\n\tawait get_tree().create_timer(1).timeout\n");
+        var chainedAwait = assertInstanceOf(AwaitExpression.class,
+                assertInstanceOf(ExpressionStatement.class,
+                        assertInstanceOf(FunctionDeclaration.class, onlyStatement(chained))
+                                .body().statements().getFirst()).expression());
+        assertInstanceOf(AttributeExpression.class, chainedAwait.value());
+    }
+
+    @Test
+    void awaitOperandStopsBelowAwaitPrecedence() {
+        // `+` (PREC_ADDITION_SUBTRACTION) is below PREC_AWAIT, so the binary wraps the await.
+        var ast = cleanAst("func f():\n\tawait 1 + 2\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var binary = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst()).expression());
+        assertEquals("+", binary.operator());
+        assertInstanceOf(AwaitExpression.class, binary.left());
+    }
+
+    @Test
+    void awaitMissingOperand() {
+        assertTrue(errorMessages(parse("func f():\n\tawait\n"))
+                .contains("Expected signal or coroutine after \"await\"."));
+    }
+
+    @Test
+    void superCallShapes() {
+        var ast = cleanAst("func f():\n\tsuper()\n\tsuper.foo(1)\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var implicit = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(ExpressionStatement.class, function.body().statements().get(0)).expression());
+        assertEquals("super", assertInstanceOf(IdentifierExpression.class, implicit.callee()).name());
+        assertEquals(0, implicit.arguments().size());
+        var explicit = assertInstanceOf(AttributeExpression.class,
+                assertInstanceOf(ExpressionStatement.class, function.body().statements().get(1)).expression());
+        assertEquals("super", assertInstanceOf(IdentifierExpression.class, explicit.base()).name());
+        assertEquals(1, explicit.steps().size());
+        var step = assertInstanceOf(AttributeCallStep.class, explicit.steps().getFirst());
+        assertEquals("foo", step.name());
+        assertEquals(1, step.arguments().size());
+    }
+
+    @Test
+    void superErrors() {
+        assertTrue(errorMessages(parse("func f():\n\tsuper\n"))
+                .contains("Expected \".\" or \"(\" after \"super\"."));
+        assertTrue(errorMessages(parse("func f():\n\tsuper.1\n"))
+                .contains("Expected function name after \".\"."));
+        assertTrue(errorMessages(parse("func f():\n\tsuper.foo\n"))
+                .contains("Expected \"(\" after function name."));
+        // Ordinary keywords outside the `is_identifier()` set are still rejected.
+        assertTrue(errorMessages(parse("func f():\n\tsuper.if\n"))
+                .contains("Expected function name after \".\"."));
+    }
+
+    @Test
+    void superMethodNameAcceptsIdentifierLikeTokens() {
+        // Vendor `consume(IDENTIFIER)` accepts the `is_identifier()` set (match/when/builtin
+        // constants), not just plain IDENTIFIER tokens.
+        var ast = cleanAst("func f():\n\tsuper.match()\n\tsuper.when()\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var names = List.of("match", "when");
+        for (var i = 0; i < names.size(); i++) {
+            var attribute = assertInstanceOf(AttributeExpression.class,
+                    assertInstanceOf(ExpressionStatement.class, function.body().statements().get(i)).expression());
+            assertEquals(names.get(i),
+                    assertInstanceOf(AttributeCallStep.class, attribute.steps().getFirst()).name());
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Phase 3 expression forms: as/is, ternary, not-in, unary family, assignments.
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void castShapes() {
+        var ast = cleanAst("const A = x as int\nconst B = y as Array[int]\n");
+        var cast = assertInstanceOf(CastExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        assertInstanceOf(IdentifierExpression.class, cast.value());
+        assertEquals("int", cast.targetType().sourceText());
+        assertEquals(cast.value().range().startByte(), cast.range().startByte());
+        assertEquals(cast.targetType().range().endByte(), cast.range().endByte());
+        assertEquals("Array[int]", assertInstanceOf(CastExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()).targetType().sourceText());
+    }
+
+    @Test
+    void castBindsWeakerThanAdditionLikeGodot() {
+        // Godot anchors `1 + 2 as int` as `(1 + 2) as int` (PREC_CAST below addition); the
+        // tree-sitter path groups `1 + (2 as int)` (registered §5.8 divergence, no parity).
+        var ast = cleanAst("const A = 1 + 2 as int\n");
+        var cast = assertInstanceOf(CastExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        assertEquals("+", assertInstanceOf(BinaryExpression.class, cast.value()).operator());
+        assertEquals("int", cast.targetType().sourceText());
+    }
+
+    @Test
+    void typeTestShapes() {
+        var ast = cleanAst("var a = x is Node\nvar b = y is not int\n");
+        var plain = assertInstanceOf(TypeTestExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        assertFalse(plain.negated());
+        assertEquals("Node", plain.targetType().sourceText());
+        var negated = assertInstanceOf(TypeTestExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        assertTrue(negated.negated());
+        assertEquals("int", negated.targetType().sourceText());
+    }
+
+    @Test
+    void castAndTypeTestMissingType() {
+        // A missing type reports and degrades the expression to the left operand.
+        var castResult = parse("var a = x as\n");
+        assertTrue(errorMessages(castResult).contains("Expected type specifier after \"as\"."));
+        assertInstanceOf(IdentifierExpression.class,
+                assertInstanceOf(VariableDeclaration.class, castResult.ast().statements().getFirst()).value());
+
+        assertTrue(errorMessages(parse("var b = x is\n")).contains("Expected type specifier after \"is\"."));
+        assertTrue(errorMessages(parse("var c = x is not\n")).contains("Expected type specifier after \"is not\"."));
+    }
+
+    @Test
+    void ternaryShape() {
+        var ast = cleanAst("const A = 1 if c else 2\n");
+        var ternary = assertInstanceOf(ConditionalExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        assertEquals("c", assertInstanceOf(IdentifierExpression.class, ternary.condition()).name());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, ternary.left()).sourceText());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, ternary.right()).sourceText());
+    }
+
+    @Test
+    void ternaryNestsOnFalseBranch() {
+        var ast = cleanAst("const A = 1 if a else 2 if b else 3\n");
+        var outer = assertInstanceOf(ConditionalExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        assertInstanceOf(LiteralExpression.class, outer.left());
+        var inner = assertInstanceOf(ConditionalExpression.class, outer.right());
+        assertEquals("b", assertInstanceOf(IdentifierExpression.class, inner.condition()).name());
+    }
+
+    @Test
+    void ternaryErrors() {
+        assertTrue(errorMessages(parse("var a = 1 if c\n"))
+                .contains("Expected \"else\" after ternary operator condition."));
+        assertTrue(errorMessages(parse("var b = 1 if else 2\n"))
+                .contains("Expected expression as ternary condition after \"if\"."));
+        assertTrue(errorMessages(parse("var c = 1 if c else\n")).contains("Expected expression after \"else\"."));
+    }
+
+    @Test
+    void notInShape() {
+        var ast = cleanAst("var a = x not in y\n");
+        var binary = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        assertEquals("not in", binary.operator());
+        assertEquals("x", assertInstanceOf(IdentifierExpression.class, binary.left()).name());
+        assertEquals("y", assertInstanceOf(IdentifierExpression.class, binary.right()).name());
+    }
+
+    @Test
+    void notInMissingIn() {
+        assertTrue(errorMessages(parse("var a = x not\n"))
+                .contains("Expected \"in\" after \"not\" in content-test operator."));
+    }
+
+    @Test
+    void unaryOperatorFamily() {
+        var ast = cleanAst("const A = not b\nconst B = !c\nconst C = ~d\n");
+        var operators = List.of("not", "!", "~");
+        for (var i = 0; i < operators.size(); i++) {
+            var constant = assertInstanceOf(VariableDeclaration.class, ast.statements().get(i));
+            var unary = assertInstanceOf(UnaryExpression.class, constant.value());
+            assertEquals(operators.get(i), unary.operator());
+            assertInstanceOf(IdentifierExpression.class, unary.operand());
+        }
+        assertTrue(errorMessages(parse("var x = not\n")).contains("Expected expression after \"not\" operator."));
+    }
+
+    @Test
+    void questionMarkReportsTernaryHint() {
+        assertTrue(errorMessages(parse("var a = x ? y : z\n")).contains(
+                "Unexpected \"?\" in source. If you want a ternary operator, use \"truthy_value if true_condition else falsy_value\"."));
+    }
+
+    @Test
+    void assignmentShapes() {
+        var ast = cleanAst("func f():\n\tx = 1\n\ty += 2\n\tz **= 3\n\ta.b = 4\n\tc[0] = 5\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var operators = List.of("=", "+=", "**=", "=", "=");
+        for (var i = 0; i < operators.size(); i++) {
+            var assignment = assertInstanceOf(AssignmentExpression.class,
+                    assertInstanceOf(ExpressionStatement.class, function.body().statements().get(i)).expression());
+            assertEquals(operators.get(i), assignment.operator());
+        }
+        // Attribute and subscription chains are valid targets.
+        assertInstanceOf(AttributeExpression.class,
+                assertInstanceOf(AssignmentExpression.class,
+                        assertInstanceOf(ExpressionStatement.class, function.body().statements().get(3))
+                                .expression()).left());
+    }
+
+    @Test
+    void chainedAssignmentReportsNestedDiagnostic() {
+        // Godot: the right-hand side parses with assignment disallowed.
+        var result = parse("func f():\n\ta = b = 1\n");
+        assertTrue(errorMessages(result).contains("Assignment is not allowed inside an expression."));
+    }
+
+    @Test
+    void assignmentRejectedInsideSubexpressions() {
+        // Variable initializers and call arguments are not assignment contexts (vendor flags).
+        assertTrue(errorMessages(parse("var a = b = 1\n"))
+                .contains("Assignment is not allowed inside an expression."));
+        assertTrue(errorMessages(parse("func f():\n\tfoo(x = 1)\n"))
+                .contains("Assignment is not allowed inside an expression."));
+    }
+
+    @Test
+    void assignmentTargetCheckIsDeferredByDesign() {
+        // The vendor's assignee node-type check is a parse-time semantic check outside the
+        // ported set (plan §5.6); the invalid target produces an AssignmentExpression for the
+        // analyzer to reject, with no parser diagnostic.
+        var ast = cleanAst("func f():\n\t1 = 2\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var assignment = assertInstanceOf(AssignmentExpression.class,
+                assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst()).expression());
+        assertInstanceOf(LiteralExpression.class, assignment.left());
     }
 
     // -----------------------------------------------------------------------------------------

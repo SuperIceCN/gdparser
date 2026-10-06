@@ -170,6 +170,7 @@ tree-sitter 数据流（`GdParserFacade -> CstAdapter -> CstToAstMapper`）保�
 
 - 语法错误消息语义对齐 Godot（可精简 `vformat` 细节）；3.x 移除关键字给出迁移提示，与 mapper 现有消息方向一致。
 - Godot 在 parse 阶段的「语义型」检查（重复参数名/重复成员名、静态函数中 `self`、构造器返回值、循环外 `break`/`continue`、默认参数顺序、pattern bind 冲突等）：首版**仅移植无歧义的纯语法判定**（重复参数名、默认参数顺序、`break`/`continue` 循环上下文、构造器 `return` 带值）；依赖符号表/类型的一类一律裁剪。每条移植的检查须配单测。
+- Phase 3 识别并**暂缓**的 parse 时检查（均属依赖节点类型/上下文的语义型判定，留给分析层；新 parser 产出结构、不报诊断）：赋值目标类型检查（`Only identifier, attribute access, and subscription access can be used as assignment target.`）、调用目标类型检查（`Cannot call on an expression. Use ".call()" if it's a Callable.`，故 `f(1)(2)`、`$Node(x)`、`PI()` 等新 parser 不报错）、隐式 `super()` 函数上下文检查（`Cannot use implicit "super" call outside of a function.`）。暂缓行为由 `assignmentTargetCheckIsDeferredByDesign` 等测试钉死。
 - tokenizer 错误（非法字符、未闭合字符串、缩进混用等）进入诊断列表，severity 为 ERROR，不中断扫描。
 
 ### 5.7 parity 范围定义
@@ -305,6 +306,19 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 - 表达式 parity 语料通过，含运算符优先级矩阵抽样（全部二元运算符两两组合 + 一元/幂/三元/赋值交互）；§5.8 分歧组合按 D3 断言 Godot 结构、不作 parity。
 - `Sample10_Operators.gd` 全文件双路径 parity 移至 Phase 4 验收（其含语句/注释，依赖 Phase 4 能力）。
 - 运行：`script/run-gradle-targeted-tests.sh --tests GdScriptParserTest,GdParserParityTest`。
+
+实施状态（2026-10-06 完成）：
+
+- 规则表：✅ Phase 3 切片全量移植——`not`/`!`/`~` 一元前缀（Godot 实际为统一 `parse_unary_operator`，本方一并合并）、`not in` 中缀（`parse_binary_not_in_operator`）、`if` 三元、`as`/`is [not]`、赋值全家族 12 token、`?` 迁移提示（`parse_invalid_token`）、`await`/`$`/`%`/`preload`/`super` 前缀、分组 `(`/`[`/`{` 前缀；`%` 前缀 get_node 与中缀取余并存（与 Godot 同表）。
+- canAssign/stopOnAssign 线程化：✅ `parse_expression(bool, bool)` 双标志按 vendor 调用点逐项对齐（仅表达式语句 `true`，变量/常量/枚举/默认参数/注解实参/下标/调用实参/赋值 RHS/二元 RHS/三元分支/await 操作数全 `false`）；`Assignment is not allowed inside an expression.` 在 `!canAssign` 时命中（链式 `a = b = 1`、初始化器与调用实参中的赋值均按此诊断，已钉死）。
+- 字面量容器：✅ 数组（尾逗号、跨行、缺元素报错跳过不占位）、字典（Python/Lua 双风格、首条目分隔符决定风格、混用报错、Lua key 归一化为 `string_name` 字面量 `&"name"`/`&`+原字符串文本、key-only/缺值以零宽 `null` 字面量占位——Godot dummy recovery `LiteralNode` 的 AST 对应、双侧皆缺则丢条目）；vendor 混用分隔符后多消费一个 token 的 quirk 已逐字镜像并以混用测试钉死。
+- 节点路径：✅ `$`/`%` 全状态机（名称/`"字符串"`、`/` 绝对与分段、`%` 仅段首或 `/` 后），§5.7 (ii) 形态 `$%Child`/`$Root/%Child` 按 Godot 产出；sourceText 存原始切片（含 `$`/`%` 前缀），与 mapper `text(node)` 契约一致。
+- 其余形态：✅ `preload`（路径为一般表达式、允许一个尾逗号）、`await`（操作数 `PREC_AWAIT`，后缀链纳入操作数）、`super`（`super()`→`CallExpression(Identifier "super")`、`super.m(...)`→单 call step 的 `AttributeExpression`，方法名走 `consume(IDENTIFIER)` 即 `is_identifier()` 集合——`super.match()` 合法、普通关键字拒绝，review-expert-c 复核确认）、`as`（右侧 `parse_type`，缺类型降级为左操作数）、`is`/`is not`（`negated` 标志承载，非 Godot 的外层一元包裹——AST 契约形状）、三元（`ConditionalExpression(condition, left=true, right=false)`，缺 `else`/缺分支按 vendor 消息）、赋值（op 文本取 token 源切片；`Expected an expression after "=".`）。
+- 分组与 range 契约：✅ 分组去包装（内部节点保自身 range）；**外围节点 range 覆盖实际消费 span**（含分组括号）——`parsePrecedence` 帧记录首 token 起点（`extentStart`）并传入 infix，右缘取最后消费 token 而非子节点 range；`GdParserParityTest.groupingRangeParity`（`(f)(1)`、`await (x)`、`{(a): 1}` 等）字节级钉死（review-expert-c 复核确认）。
+- multiline 移植：✅ `parsePrecedence` 入口对 `(`/`[`/`{` 前缀按 vendor 位置（消费前）push；各构造闭括号前 pop（分组失败也 pop，与 vendor 一致）；类型解析继续继承调用上下文。
+- 暂缓登记（§5.6）：赋值目标类型检查、调用目标类型检查（`Cannot call on an expression...`）、隐式 `super()` 上下文检查——均留分析层，已有钉死测试。
+- 审阅修复（review-expert-a/c 复核确认）：`super` 方法名判定改用 `consume(IDENTIFIER)`（原严格 token 类型检查错误拒绝 `match`/`when`/内置常量；vendor `check(IDENTIFIER)`→`is_identifier()` 实证）；分组 extent 线程化（外围节点 range 覆盖分组括号，见上条）；`parsePrecedence` 分组 push 后在 prefix 缺失路径补 pop（当前不可达，防规则表回归）；补 EOF 悬挂（`(\n`/`{\n`/`foo(\n`）、`f(,)`/`f(1 2)` 恢复、`{1 2}` 缺分隔符保留键值对（vendor `decided_style` 无条件置位，`gdscript_parser.cpp:3285`）、`super.if` 负例等回归用例。
+- 验收：✅ `GdScriptParserTest` 150 例（新增 33 例：容器/节点路径/preload/await/super/as-is/三元/not-in/一元家族/赋值正反两方）、`GdParserParityTest` 新增容器/专用形态/赋值/优先级矩阵抽样 4 组 parity 语料全部一次通过；18 个既有测试类回归全绿。
 
 ### Phase 4：语句、控制流与 trivia（P0）
 
