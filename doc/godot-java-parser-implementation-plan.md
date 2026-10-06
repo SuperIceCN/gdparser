@@ -213,6 +213,17 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 
 - `SourceTextIndexTest`（ASCII/中文/emoji/CRLF/tab、无末尾换行、末尾注释、末尾多行字符串）通过：`script/run-gradle-targeted-tests.sh --tests SourceTextIndexTest`。
 
+实施状态（2026-10-06 完成）：
+
+- 包骨架与 exports：✅ `frontend.gdscript` 已建立并加入 `module-info.java` exports。
+- `SourceTextIndex`：✅ 完成（行起始表、字节偏移↔行列、物理 EOF 锚定、越界拒绝）。
+- `GdTokenType`：✅ 完成，逐一对齐 Godot `Token::Type`（`TK_CONST/TK_IN/TK_VOID/TK_EOF` → `CONST/IN/VOID/EOF`，省略 `TK_MAX`），含 `token_names` 对照 displayName。
+- `GdToken`：✅ 完成（类型、源切片、`GdLiteralKind`、ERROR 消息载体、起止字节偏移、1-based 行列）。
+- parity 测试基类：✅ `GdParserParityTestSupport`（双路径驱动、序列化比较、fixture 发现）；新侧 `gdScriptSexp` 为占位骨架，待 Phase 2 接入 `GdScriptParser`。
+- AST 参照 dump：✅ 12 个语料快照存于 `src/test/resources/gdparser-parity/*.sexp`；§5.2/§5.4 钉死形状转写为 `GdParityReferenceTest` 结构断言。
+- fixtures 审计：✅ `GdFixtureParityAuditTest`（`**`×因子/一元、`as` 右操作数、`not in`、`$` 下 `%` 规则）；审计发现 Sample5.gd 含裸 `%name` 表达式——该形态两路径均支持，非 (ii) 分歧，审计规则已相应细化。
+- 验收：✅ `SourceTextIndexTest` 通过（`bash gradlew test --tests SourceTextIndexTest`；`script/run-gradle-targeted-tests.sh` 因 gradlew 无执行权限暂不可用，下同）。
+
 ### Phase 1：Tokenizer 移植（P0）
 
 任务：
@@ -228,6 +239,18 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 - `GdTokenizerTest` 通过，覆盖：缩进序列与混用报错、空行/纯注释行、续行、multiline 抑制、全部字面量形态、非法字符后继续扫描、CRLF、无末尾换行/末尾注释/末尾多行字符串的 EOF 坐标。
 - 对 13 个 fixtures 全量 tokenize 无 ERROR token、无异常。
 - 运行：`script/run-gradle-targeted-tests.sh --tests GdTokenizerTest`。
+
+实施状态（2026-10-06 完成）：
+
+- `scan()` 全分派：✅ 标识符/关键字（36 个关键字 + `INF`/`NAN`/`PI`/`TAU` 4 个内置常量）/注解、数字全形态、字符串全形态（raw/StringName/NodePath/三引号/转义/UTF-16 代理对校验）、运算符与标点、`VCS_CONFLICT_MARKER`/`BACKTICK`/`QUESTION_MARK`。
+- 缩进状态机：✅ indent 栈 + `pendingIndents` 有符号计数（不对齐 dedent 压回不 `++`）、pending newline、multiline 抑制、反斜杠续行（含续行后注释行跳过）、EOF 合成（含「消费最后字符触发 EOF 钩子」的行号双增 quirk 与最后 token end 坐标落非物理行 quirk，均以测试钉死）；合成 token 字节范围锚定物理 EOF。
+- 错误队列：✅ LIFO 弹出、ERROR token 优先返回、消息入 token、扫描继续。
+- 注释 trivia：✅ `GdComment`（文本含 `#`、字节范围、整行/行尾标记），不进 token 流。
+- 缩进快照 push/pop：✅ 对齐 `push/pop_expression_indented_block`；空栈 pop 抛 `IllegalStateException`（Godot 为静默 no-op，此处按内部 bug 处理）。
+- D1 不吸收符号：✅ `+`/`-` 恒为独立 token；`last_token`/`can_precede_bin_op` 随之裁剪。
+- 移植偏差记录：字符分类用 JDK `Character.isUnicodeIdentifierStart/isUnicodeIdentifierPart` + `_` 近似 Godot XID 表（并显式排除越界哨兵 0——JDK 将 NUL 等 identifier-ignorable 控制符判为标识符字符，否则 EOF 处死循环）；字面量不解码值（`GdLiteralKind` + 源切片承载，对齐 AST 契约）。
+- 审阅修复（review-expert-a/c 复核确认）：`scan()` 续行递归改循环（JVM 无尾调用消除，防栈溢出）；`ERROR` token 源切片置空（字节区间精确，防 O(n²) 内存，Godot 的 CoW String 无此问题）；无参构造器初始化空源不变量；未配对 UTF-16 代理项按 JDK UTF-8 替换规则计 1 字节（与 tree-sitter 路径字节流一致）；续行错误文案与 vendor 逐字符对齐；key-only pattern 诊断精确断言；补 tokenizer 级多行字符串 EOF 字节锚定、10k 连续续行、20k 错误密度、`\` 后非换行报错等边界用例。
+- 验收：✅ `GdTokenizerTest` 74 个用例通过（含 13 fixtures 动态遍历无 ERROR）；`SourceTextIndexTest` 通过；既有前端测试（CstToAstMapperTest、AstSexprSerdeTest 等 14 个测试类）回归通过。
 
 ### Phase 2：Parser 骨架与类体声明（P0）
 
