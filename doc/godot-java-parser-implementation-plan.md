@@ -180,6 +180,8 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 - **(ii) Godot 合法但旧路径报错/丢失的语法**：不作 AST parity 要求；新 parser 按 Godot 产出，或登记信息丢失。已实证登记：
   - `$%Child`、`$Root/%Child`（`%` 位于 `$` 后或 `/` 后）：Godot 合法，旧路径报 ERROR——新 parser 按 Godot 产出 `GetNodeExpression`。
   - key-only 字典 pattern（`{"name"}:`）：旧路径丢弃 key + WARNING——v1 对齐该行为并登记为 AST 表达力缺口（§5.2）。
+  - 脚本前缀/类体中的独立文档字符串（如 `"""doc"""\nclass_name X\n`、`var x = 1\n"""doc"""\nvar y = 2\n`）：Godot 将其消费为文档字符串、不产出节点；旧路径产出 `ExpressionStatement(LiteralExpression("string"))`——新 parser 按 Godot 落地（不产节点），parity 语料排除此类片段（Phase 2 探针实证，fixtures 不含此形态）。
+  - 嵌套类缩进体首行的 `extends`（`class Inner:\n\textends Base\n\tpass\n`）：Godot 将其设为类超类、不产出节点；旧路径在 body 内产出 `ExtendsStatement` 且 `extendsTarget = null`——新 parser 按 Godot 落地（`extendsTarget = "Base"`），parity 语料排除此类片段（Phase 2 探针实证，fixtures 不含此形态）。
 - **(iii) 运算符优先级分歧组合**：见 §5.8（D3 已确认与 Godot 锚定）；parity 矩阵对这些组合断言 Godot 结构、不作双路径一致要求。
 - **非法源**（独立验收，不参与 parity 分类）：不要求 AST 一致；要求新 parser (a) 不抛异常、可终止，(b) 产生 ≥1 条 ERROR 诊断且 range 有效，(c) synchronize 后的兄弟声明结构正确（如类体中一个坏函数之后的函数完整解析）。
 - 已知差异白名单：仅本条 (ii)(iii) 登记项；新增豁免须在 §5 中登记原因与样例。
@@ -269,6 +271,24 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 - `GdScriptParserTest` 声明层用例通过：`class_name`/`extends` 顺序与同行、嵌套类、static 限定、注解挂接、枚举值、信号参数、函数签名全形态、`_init` 构造器。
 - 声明级 parity 仅覆盖无体/空体的内联声明片段（`Sample*.gd` 全文件 parity 在 Phase 4 统一验收）。
 - 运行：`script/run-gradle-targeted-tests.sh --tests GdScriptParserTest,GdParserParityTest`。
+
+实施状态（2026-10-06 完成）：
+
+- token 流 cursor：✅ `advance`/`match`/`check`/`consume`/`isAtEnd`；ERROR token 在 cursor 层转诊断并跳过（对齐 Godot `advance` 内层循环，诊断 range 取错误 token 字节区间）。
+- panic/synchronize：✅ 同步集与 Godot 逐 token 一致（`if` 排除）、`push_error` 不抑制级联、三处接入点（program 前缀、类体循环、语句末尾）已接线。
+- `parse_program`：✅ 注解/文档字符串前缀、`class_name`/`extends` 任意顺序各至多一个、同行 `class_name X extends Y`、前缀结束进入类体、`Expected end of file.` 检查。
+- `parse_class_body`：✅ 成员分派全表、`static` 前缀、9 条 3.x 移除关键字迁移诊断（vendor 原文）、`Unexpected %s in class body.`（`get_debug_name` 对齐）；类体 `pass` → `PassStatement`（D4）。
+- `parse_suite`：✅ 单行/多行、分号串接、空语句跳过、`error_count++ > 100` 熔断（`Too many statement errors.`）、DEDENT/EOF 退出与 `Missing unindent`/`Expected newline after ";"` 消息。
+- 注解：✅ 语法解析（实参跨行 + 尾逗号；不验证名称/目标/个数）；产出 `AnnotationStatement` 按源序置于被注解声明之前；**同行注解计入声明 range**、换行注解独立（探针实证钉死）。
+- `TypeRef`：✅ 点链/`Array[E]`/`Dictionary[K, V]`/嵌套容器禁止（`Nested typed collections are not supported.`）/`void` 限制；multiline 继承调用上下文（自身不 push/pop，与 Godot 一致）。
+- 声明产出：✅ 变量/常量/信号/枚举/函数签名（默认参数、rest、static、`->` 返回类型、无冒号无体函数）/嵌套类全形态；属性 get/set 块（引用形态与内联套件）完整消费不产 AST；`_init` → `ConstructorDeclaration`；无体函数空 `Block` 的 range = 整个声明 range（对齐 mapper `mapBody(null, fallback)` 实证）；`:=`/`: =` 推断标记为非空 `TypeRef`（sourceText 保留内部空白）。
+- 最小表达式子集：✅ Pratt 骨架 + 完整 `PREC_*` 枚举（按 Godot 声明顺序）；字面量/标识符/`self`/内置常量（`PI` 等 → `IdentifierExpression`，§5.3）/一元 `+`/`-`/二元全家族/调用/属性/下标链折叠（§5.2 钉死形状）。
+- 裁剪记录（与本阶段范围一致）：枚举值/类成员重名检查、`_static_init` 特判、注解注册表验证、构造器 `return` 带值检查（随 return 语句归于后续阶段）；失败的一元/二元操作数使表达式整体失败（AST 无可空表达式组件，Godot 容忍 null child）。
+- range 契约落地：AST range 一律经 `SourceTextIndex` 由物理字节游标换算；多行套件 `Block` 从冒号后 NEWLINE 字节起、末语句止（探针实证）；同行注解纳入声明起点；`SourceFile` 空内容时坍缩为物理 EOF 零宽。
+- 新登记 §5.7 (ii) 分歧 2 项（脚本前缀/类体独立文档字符串消费、嵌套类体首行 `extends`），parity 语料相应排除；D3 分歧 `-2 ** 2` 以 Godot 结构断言钉死（不作 parity）。
+- 审阅修复（review-expert-a/c 两轮复核确认）：失败表达式语句在 EOF 处守卫 `advance()`（Godot 软失败语义，修复无尾换行坏语句抛 `IllegalStateException`）；移植 `Token::is_identifier()`（`match`/`when`/`PI`/`TAU`/`INF`/`NAN` 可作名字）与属性名的 `is_node_name()` 集合；下标失败路径补齐 `popMultiline` + 右括号消费（修复 multiline 泄漏污染后续声明）；accessor 套件注解隔离为「丢弃内层残留、恢复外层快照」，且 suite/类体退出时本层尾随注解排入本层序列（不泄漏到外层成员）；`static` 错误前缀不再污染 synchronize 恢复的兄弟声明（恢复路径精化，合法源行为不变）；同行 `class_name … extends` 纳入 `extends` 去重检查（反向顺序保持 vendor 语义不报，已钉死）；suite 熔断改为按「核心语句为 null」计数（带注解的失败声明与 Godot 一致）；`pushMultiline` 待丢弃 token 走错误上报扫描（vendor 裸 scan 会静默丢 ERROR token，与 §5.6 tokenizer 错误必入诊断冲突，有意偏差并注释）；property 跨行提示与 vendor 逐字节对齐；移除被 `is_identifier` 归一化覆盖的内置常量专用前缀规则；补 18 个审阅驱动回归用例；合法 parity 语料改用 `assertCleanParity`（AST 一致 + 双端零 ERROR 断言）。
+- 后缀链重构（性能债清偿）：后缀循环改为独占单个 `ArrayList<AttributeStep>`、链结束时一次性冻结 `AttributeExpression`（消除每步不可变列表复制的 O(n²)）；token 级消费顺序与 multiline push/pop 时序不变；三个后缀入口合并为 `parseSuffixChain`，参数解析与消息文本不变；续链含与 Godot `while (p <= rule.prec)` 等价的优先级截断检查（review-expert-a 复核确认，当前规则表切片内恒通过）；缺成员名恢复保持旧 per-infix 形状（报错留链、后续调用/下标仍折叠到前一 property step，review-expert-c 复核确认）；重构前补 8 个链形态/错误路径钉死（`f(1).x`、`f(1)(2)`、`a[0][1]`、`a.b(1)(2)`、长链、链内跨行调用、非 EOF 悬点降级），另补 3 个缺名恢复形状钉死，全部测试绿。
+- 验收：✅ `GdScriptParserTest` 117 例、`GdParserParityTest` 11 例（声明层 parity 语料，合法语料双端零 ERROR）通过；Phase 0/1 与既有前端测试（14 个测试类）全部回归通过；parity 基类 `gdScriptSexp` 已接入 `GdScriptParser`。
 
 ### Phase 3：表达式（P0）
 

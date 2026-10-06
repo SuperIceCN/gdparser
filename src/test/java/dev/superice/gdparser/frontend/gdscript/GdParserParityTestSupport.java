@@ -1,5 +1,6 @@
 package dev.superice.gdparser.frontend.gdscript;
 
+import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AstMappingResult;
 import dev.superice.gdparser.frontend.lowering.CstToAstMapper;
 import dev.superice.gdparser.frontend.serialize.AstSexprSerializer;
@@ -20,9 +21,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /// `AstSexprSerializer` to character-identical text (all ranges included). Registered
 /// divergence sets (operator-precedence divergences, Godot-only constructs) are NOT
 /// asserted through `assertParity` — they get dedicated Godot-structure assertions.
-///
-/// The new-parser side (`gdScriptSexp`) is a skeleton until the parser lands; the parity
-/// suite subclasses/plugs it in then.
 abstract class GdParserParityTestSupport {
 
     /// GDScript fixture corpus shared with the tree-sitter test suites.
@@ -42,15 +40,35 @@ abstract class GdParserParityTestSupport {
         return SERIALIZER.serialize(parseViaTreeSitter(source).ast());
     }
 
-    /// New-parser-side serialized AST. Placeholder until `GdScriptParser` exists; the
-    /// parser is driven directly here (not through a facade) per the migration plan.
+    /// Parses with the new Godot-port parser (driven directly, not through a facade, per the
+    /// migration plan).
+    protected static AstMappingResult parseViaGdScript(String source) {
+        return new GdScriptParser().parse(source);
+    }
+
+    /// New-parser-side serialized AST.
     protected static String gdScriptSexp(String source) {
-        throw new UnsupportedOperationException("GdScriptParser is not implemented yet");
+        return SERIALIZER.serialize(parseViaGdScript(source).ast());
     }
 
     /// Asserts character-identical serialized ASTs between the two paths.
     protected static void assertParity(String source) {
         assertEquals(treeSitterSexp(source), gdScriptSexp(source));
+    }
+
+    /// Parity plus the legal-corpus invariant: neither side may produce ERROR diagnostics.
+    /// (Snippets exercising pinned Godot quirks — e.g. the newline-only EOF synthesis — use
+    /// plain `assertParity` instead.)
+    protected static void assertCleanParity(String source) {
+        var reference = parseViaTreeSitter(source);
+        var actual = parseViaGdScript(source);
+        assertEquals(SERIALIZER.serialize(reference.ast()), SERIALIZER.serialize(actual.ast()));
+        for (var result : List.of(reference, actual)) {
+            var errors = result.diagnostics().stream()
+                    .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
+                    .toList();
+            assertEquals(List.of(), errors, () -> "unexpected ERROR diagnostics for legal corpus: " + errors);
+        }
     }
 
     /// Discovers the shared `.gd` fixtures (same discovery rule as the lowering tests).
