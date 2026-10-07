@@ -65,10 +65,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Deque;
-import java.util.List;
+import java.util.*;
 
 /// Recursive-descent + Pratt parser producing `frontend.ast` directly from a GDScript source.
 /// Port of `GDScriptParser` (`vendor/godot/gdscript_parser.h` / `gdscript_parser.cpp`), scoped to
@@ -162,6 +159,25 @@ public final class GdScriptParser {
     /// spans enclosing extents over that token, so the lambda records its body end here. Any
     /// token consumed afterwards (see `advance`) invalidates the override.
     private int trailingLambdaEndByte = -1;
+    /// Shared budget for every input-driven recursion entry (expressions via `parsePrecedence`,
+    /// suites, match patterns, nested classes). Godot has no explicit limit — its C++ stack
+    /// tolerates far deeper inputs — but on the JVM a pathological input such as 4096 nested
+    /// `(` overflows the stack before any diagnostic can be produced, violating the §5.7
+    /// recovery contract (illegal sources must yield diagnostics, never exceptions). 256 keeps
+    /// roughly an order of magnitude below the overflow point on a default JVM thread stack
+    /// while real-world nesting rarely exceeds a few dozen levels.
+    private static final int MAX_NESTING_DEPTH = 256;
+    private int nestingDepth;
+    /// Sticky companion of the depth budget: set when the budget trips, cleared by
+    /// `synchronize()` at the recovered boundary. While set, lambda body suites are not opened
+    /// and statement dispatch bails straight to synchronization — the unwinding frames of the
+    /// aborted construct must not let a body suite absorb following sibling lines (the depth
+    /// counter alone cannot express this: it re-admits nesting as the frames unwind).
+    private boolean nestingBudgetExceeded;
+    /// Line indentation of the construct that tripped the depth budget. While poisoned,
+    /// `synchronize()` consumes the whole aborted region — every deeper-indented line plus its
+    /// layout tokens — and stops at the first line dedenting back to this width.
+    private int poisonedLineIndent;
 
     public GdScriptParser() {
     }
@@ -191,6 +207,9 @@ public final class GdScriptParser {
         groupingCommentSpans.clear();
         deferredCommentStack.clear();
         trailingLambdaEndByte = -1;
+        nestingDepth = 0;
+        nestingBudgetExceeded = false;
+        poisonedLineIndent = 0;
         previous = new GdToken(GdTokenType.EMPTY, "", GdLiteralKind.NONE, null, 0, 0, 1, 1, 1, 1);
         current = scanSkippingErrors();
 
@@ -462,14 +481,51 @@ public final class GdScriptParser {
 
     /// Port of `GDScriptParser::synchronize`: same sync token set (`if` deliberately excluded
     /// because it can appear inside expressions); stops before the sync token without consuming.
+    /// While a depth rejection is being unwound (nestingBudgetExceeded), the scan instead
+    /// consumes the aborted construct's whole layout region: every deeper-indented line plus its
+    /// INDENT/DEDENT tokens (balance-counted — a DEDENT beyond that balance belongs to a parsed
+    /// enclosing suite), stopping at the first line that dedents back to the tripped line's
+    /// indentation. This keeps garbage layout from ending outer scopes early.
     private void synchronize() {
         panicMode = false;
+        var garbageIndents = 0;
         while (!isAtEnd()) {
+            if (nestingBudgetExceeded) {
+                if (current.type() == GdTokenType.INDENT) {
+                    garbageIndents++;
+                    advance();
+                    continue;
+                }
+                if (current.type() == GdTokenType.DEDENT) {
+                    if (garbageIndents > 0) {
+                        garbageIndents--;
+                        advance();
+                        continue;
+                    }
+                    break;
+                }
+                if (current.type() == GdTokenType.NEWLINE) {
+                    advance();
+                    continue;
+                }
+                // Line-start check: a layout token (NEWLINE/INDENT/DEDENT) always precedes the
+                // first content token of a physical line, so gate on any of them.
+                if ((previous.type() == GdTokenType.NEWLINE || previous.type() == GdTokenType.INDENT
+                        || previous.type() == GdTokenType.DEDENT)
+                        && lineIndentOf(current.startByte()) <= poisonedLineIndent) {
+                    break;
+                }
+                advance();
+                continue;
+            }
             if (previous.type() == GdTokenType.NEWLINE || previous.type() == GdTokenType.SEMICOLON) {
-                return;
+                break;
             }
             switch (current.type()) {
                 case CLASS, FUNC, STATIC, VAR, CONST, SIGNAL, FOR, WHILE, MATCH, RETURN, ANNOTATION -> {
+                    // Stop before the sync token without consuming it.
+                    nestingBudgetExceeded = false;
+                    panicMode = false;
                     return;
                 }
                 default -> {
@@ -478,6 +534,45 @@ public final class GdScriptParser {
             }
             advance();
         }
+        // Reached a statement/layout boundary (or EOF): the poisoned region ends here.
+        // panicMode is cleared on exit too: advance() may have re-raised it while reporting
+        // tokenizer errors inside the skipped region, and a second synchronize() round from
+        // the caller's tail hook would wrongly consume this boundary's DEDENT.
+        nestingBudgetExceeded = false;
+        panicMode = false;
+    }
+
+    /// Enters one input-driven nesting level. On budget exhaustion this reports once and
+    /// returns false; the caller must then unwind without recursing further (the remaining
+    /// tokens are left for the enclosing recovery paths, which consume them iteratively).
+    /// A true result must be paired with {@link #exitNestingLevel()} in a finally block.
+    private boolean enterNestingLevel() {
+        if (nestingDepth >= MAX_NESTING_DEPTH) {
+            pushError("Maximum nesting depth exceeded.");
+            nestingBudgetExceeded = true;
+            poisonedLineIndent = lineIndentOf(current.startByte());
+            return false;
+        }
+        nestingDepth++;
+        return true;
+    }
+
+    private void exitNestingLevel() {
+        nestingDepth--;
+    }
+
+    /// Indentation width of the line containing the given byte offset, in the tokenizer's
+    /// layout units (tab = 4, space = 1; see `GdTokenizer`'s indent accounting): the width of
+    /// the leading whitespace before the line's first non-whitespace character.
+    private int lineIndentOf(int byteOffset) {
+        var offset = index.lineStartByte(index.pointAt(byteOffset).row());
+        var width = 0;
+        while (offset < sourceBytes.length
+                && (sourceBytes[offset] == ' ' || sourceBytes[offset] == '\t')) {
+            width += sourceBytes[offset] == '\t' ? GdTokenizer.TAB_SIZE : 1;
+            offset++;
+        }
+        return width;
     }
 
     /// Port of `GDScriptParser::push_multiline(true)`, including the raw consumption of already
@@ -910,6 +1005,21 @@ public final class GdScriptParser {
     /// Port of `GDScriptParser::parse_class` (nested classes), including the optional superclass
     /// both after the name and as the first statement of an indented body.
     private @NotNull Statement parseNestedClass() {
+        // Depth guard: nested classes recurse via parseClassBody. The placeholder declaration
+        // keeps the member list well-formed; the skipped body is recovered by the outer loops.
+        if (!enterNestingLevel()) {
+            return new ClassDeclaration(null, null,
+                    new Block(List.of(), range(current.startByte(), current.startByte())),
+                    range(statementStartByte, current.startByte()));
+        }
+        try {
+            return parseNestedClassImpl();
+        } finally {
+            exitNestingLevel();
+        }
+    }
+
+    private @NotNull Statement parseNestedClassImpl() {
         var start = statementStartByte;
         String name = null;
         if (consume(GdTokenType.IDENTIFIER, "Expected identifier for the class name after \"class\".")) {
@@ -974,6 +1084,21 @@ public final class GdScriptParser {
     /// pending, the closing DEDENT becomes optional in that case, and `lambdaEnded` is raised when
     /// the suite finishes so the enclosing statement ends without a newline token.
     private @NotNull Block parseSuite(String context, boolean forLambda) {
+        // Depth guard: nested control-flow suites recurse via parseStatement. The rejected
+        // suite's tokens are not consumed here; the poisoned synchronize() pass that follows
+        // (triggered by the enclosing statement's panic-mode tail or the match loop head)
+        // consumes the whole region layout-aware.
+        if (!enterNestingLevel()) {
+            return new Block(List.of(), range(current.startByte(), current.startByte()));
+        }
+        try {
+            return parseSuiteImpl(context, forLambda);
+        } finally {
+            exitNestingLevel();
+        }
+    }
+
+    private @NotNull Block parseSuiteImpl(String context, boolean forLambda) {
         var multiline = match(GdTokenType.NEWLINE);
         int blockStart;
         var suiteIndent = -1;
@@ -1043,6 +1168,14 @@ public final class GdScriptParser {
     /// expression subset. Returns the flushed annotations plus the parsed statement; an empty list
     /// mirrors Godot's `nullptr` return (counted by the suite's circuit breaker).
     private @NotNull List<Statement> parseStatement() {
+        // A construct aborted on the nesting budget upstream poisons the current token region:
+        // skip straight to synchronization (which also lifts the poison flag) instead of
+        // letting partial constructs interpret the leftover tokens.
+        if (nestingBudgetExceeded) {
+            lastStatementWasNull = true;
+            synchronize();
+            return List.of();
+        }
         // Statement-level annotations are collected and attach to the next real statement; the
         // annotation-only result is empty like Godot's null return.
         if (current.type() == GdTokenType.ANNOTATION) {
@@ -1386,6 +1519,14 @@ public final class GdScriptParser {
             matchIndent = indentOf(current.startByte());
         }
         while (!check(GdTokenType.DEDENT) && !isAtEnd()) {
+            // A depth trip inside a branch leaves a poisoned region that ends at the branch
+            // indentation; consume it before interpreting the next line as a branch (the match
+            // level has no parseStatement tail hook of its own). The `continue` re-checks the
+            // loop guards: synchronization may have stopped at the match's own closing DEDENT.
+            if (nestingBudgetExceeded) {
+                synchronize();
+                continue;
+            }
             // The reference path drops comments at the match branch level (a col-0 comment
             // between branches even breaks its grammar — registered §5.7 (ii)).
             discardPendingComments();
@@ -1415,11 +1556,14 @@ public final class GdScriptParser {
         // Tail comments indented into the match body are branch-level and dropped with it, but
         // the match node still spans them (the reference path's extent covers them); less-
         // indented ones stay pending for the outer sequence (they are not match trivia).
+        // A trailing comment always belongs to its (match-internal) line — a rejected branch's
+        // suite never drains it — and must not block the cleanup of whole-line comments behind
+        // it; whole-line comments still need the indent check so outer-scope ones stay pending.
         if (matchIndent >= 0) {
             while (commentCursor < comments.size()
                     && comments.get(commentCursor).startByte() < current.startByte()
-                    && comments.get(commentCursor).wholeLine()
-                    && indentOf(comments.get(commentCursor)) >= matchIndent) {
+                    && (!comments.get(commentCursor).wholeLine()
+                    || indentOf(comments.get(commentCursor)) >= matchIndent)) {
                 end = Math.max(end, comments.get(commentCursor).endByte());
                 commentCursor++;
             }
@@ -1492,6 +1636,18 @@ public final class GdScriptParser {
     /// nested array/dictionary patterns get dedicated handling; anything else parses as a general
     /// expression (`false` — no assignments in patterns).
     private @Nullable MatchPattern parseMatchPattern() {
+        // Nested array/dictionary patterns recurse through here.
+        if (!enterNestingLevel()) {
+            return null;
+        }
+        try {
+            return parseMatchPatternImpl();
+        } finally {
+            exitNestingLevel();
+        }
+    }
+
+    private @Nullable MatchPattern parseMatchPatternImpl() {
         switch (current.type()) {
             case VAR -> {
                 var start = current.startByte();
@@ -1600,7 +1756,7 @@ public final class GdScriptParser {
                     pushError("The \"..\" pattern cannot be used as a value.");
                 } else if (key != null) {
                     entries.add(new DictEntry(key, sub.expression(),
-                            range(key.range().startByte(), sub.expression().range().endByte())));
+                            range(key.range().startByte(), Objects.requireNonNull(sub.expression()).range().endByte())));
                 }
             } else if (key != null) {
                 pushWarning("Key-only dictionary pattern drops the key (the AST cannot represent it).",
@@ -1683,6 +1839,19 @@ public final class GdScriptParser {
     }
 
     private @Nullable ParsedType parseTypeInternal(boolean allowVoid) {
+        // Container types recurse (`Array[...]`); the rejection of *nested* containers happens
+        // only after the recursive call returns, so the recursion itself needs the guard.
+        if (!enterNestingLevel()) {
+            return null;
+        }
+        try {
+            return parseTypeInternalImpl(allowVoid);
+        } finally {
+            exitNestingLevel();
+        }
+    }
+
+    private @Nullable ParsedType parseTypeInternalImpl(boolean allowVoid) {
         var typeStart = current.startByte();
         if (!match(GdTokenType.IDENTIFIER)) {
             if (match(GdTokenType.VOID)) {
@@ -2197,7 +2366,7 @@ public final class GdScriptParser {
     /// snapshotted so the body can track indentation, and spurious layout tokens after the body
     /// are raw-skipped without touching `previous`. Break/continue are disallowed inside, with
     /// save/restore like the vendor.
-    private @Nullable Expression parseLambdaExpression() {
+    private @NotNull Expression parseLambdaExpression() {
         // The expression-level prefix rule always produces a LambdaExpression.
         return (Expression) parseLambdaLike(false);
     }
@@ -2250,7 +2419,14 @@ public final class GdScriptParser {
 
         Block body;
         try {
-            body = parseSuite("lambda declaration", true);
+            if (nestingBudgetExceeded) {
+                // Depth-aborted signature: do not open a body suite over the enclosing
+                // statement region — it would absorb following sibling lines. Recovery happens
+                // at the outer statement boundary (panic-mode synchronize).
+                body = new Block(List.of(), range(current.startByte(), current.startByte()));
+            } else {
+                body = parseSuite("lambda declaration", true);
+            }
         } finally {
             pendingAnnotations.clear();
             pendingAnnotations.addAll(enclosingAnnotations);
@@ -2409,49 +2585,58 @@ public final class GdScriptParser {
     }
 
     private @Nullable Expression parsePrecedence(Precedence precedence, boolean canAssign, boolean stopOnAssign) {
-        // Switch multiline mode on for grouping tokens, before consuming them (vendor order:
-        // the flag must be active before the tokenizer scans the following token).
-        var pushedGrouping = current.type() == GdTokenType.PARENTHESIS_OPEN
-                || current.type() == GdTokenType.BRACE_OPEN || current.type() == GdTokenType.BRACKET_OPEN;
-        if (pushedGrouping) {
-            pushMultiline();
-        }
-        // Godot normalizes identifier-like tokens (match/when/builtin constants) to plain
-        // identifiers before consulting the rule table.
-        var rule = ruleFor(isIdentifier(current) ? GdTokenType.IDENTIFIER : current.type());
-        if (rule.prefix() == null) {
-            // Expected expression; the caller reports the proper context-specific error. All
-            // grouping tokens currently have prefix rules, so the pop below is unreachable —
-            // it guards the multiline balance against future rule-table regressions.
-            if (pushedGrouping) {
-                popMultiline();
-            }
+        // Every expression recursion funnels through here (grouping, containers, calls, lambda
+        // defaults, unary/ternary nesting), so this single guard bounds them all.
+        if (!enterNestingLevel()) {
             return null;
         }
-
-        // The first token of this frame starts the consumed span of every expression built here
-        // (infix folds keep that left edge, e.g. a grouping's `(` precedes the inner node's range).
-        var extentStart = current.startByte();
-        advance(); // Only consume the token if there's a valid rule.
-        var left = rule.prefix().parse();
-
-        while (precedence.ordinal() <= ruleFor(current.type()).precedence().ordinal()) {
-            var infixRule = ruleFor(current.type());
-            // Vendor's infix-loop head also stops on a pending lambda end: an operator following
-            // the lambda boundary belongs to the enclosing flow, not to this expression
-            // (e.g. `return func(): return 1` keeps the bare lambda as the return value).
-            if (left == null || infixRule.infix() == null || lambdaEnded
-                    || (stopOnAssign && current.type() == GdTokenType.EQUAL)) {
-                return left;
-            }
-            // Switch multiline mode on for infix grouping operators, before consuming the token.
-            if (current.type() == GdTokenType.PARENTHESIS_OPEN || current.type() == GdTokenType.BRACKET_OPEN) {
+        try {
+            // Switch multiline mode on for grouping tokens, before consuming them (vendor order:
+            // the flag must be active before the tokenizer scans the following token).
+            var pushedGrouping = current.type() == GdTokenType.PARENTHESIS_OPEN
+                    || current.type() == GdTokenType.BRACE_OPEN || current.type() == GdTokenType.BRACKET_OPEN;
+            if (pushedGrouping) {
                 pushMultiline();
             }
-            advance();
-            left = infixRule.infix().parse(left, precedence, canAssign, extentStart);
+            // Godot normalizes identifier-like tokens (match/when/builtin constants) to plain
+            // identifiers before consulting the rule table.
+            var rule = ruleFor(isIdentifier(current) ? GdTokenType.IDENTIFIER : current.type());
+            if (rule.prefix() == null) {
+                // Expected expression; the caller reports the proper context-specific error. All
+                // grouping tokens currently have prefix rules, so the pop below is unreachable —
+                // it guards the multiline balance against future rule-table regressions.
+                if (pushedGrouping) {
+                    popMultiline();
+                }
+                return null;
+            }
+
+            // The first token of this frame starts the consumed span of every expression built here
+            // (infix folds keep that left edge, e.g. a grouping's `(` precedes the inner node's range).
+            var extentStart = current.startByte();
+            advance(); // Only consume the token if there's a valid rule.
+            var left = rule.prefix().parse();
+
+            while (precedence.ordinal() <= ruleFor(current.type()).precedence().ordinal()) {
+                var infixRule = ruleFor(current.type());
+                // Vendor's infix-loop head also stops on a pending lambda end: an operator following
+                // the lambda boundary belongs to the enclosing flow, not to this expression
+                // (e.g. `return func(): return 1` keeps the bare lambda as the return value).
+                if (left == null || infixRule.infix() == null || lambdaEnded
+                        || (stopOnAssign && current.type() == GdTokenType.EQUAL)) {
+                    return left;
+                }
+                // Switch multiline mode on for infix grouping operators, before consuming the token.
+                if (current.type() == GdTokenType.PARENTHESIS_OPEN || current.type() == GdTokenType.BRACKET_OPEN) {
+                    pushMultiline();
+                }
+                advance();
+                left = infixRule.infix().parse(left, precedence, canAssign, extentStart);
+            }
+            return left;
+        } finally {
+            exitNestingLevel();
         }
-        return left;
     }
 
     private @NotNull Expression parseLiteralExpression() {

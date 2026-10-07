@@ -42,7 +42,8 @@ public final class GdTokenizer {
 
     /// Tab width used for indentation level counting, aligned with Godot's default
     /// (`tab_size = 4`); the editor-settings override only exists in TOOLS builds.
-    private static final int TAB_SIZE = 4;
+    /// Package-visible so the parser's poisoned-region indent gate uses the same unit.
+    static final int TAB_SIZE = 4;
 
     /// Godot keyword table (vendor/godot/gdscript_tokenizer.cpp `KEYWORDS` macro list).
     /// Keywords are ASCII-only with lengths between 2 and 10.
