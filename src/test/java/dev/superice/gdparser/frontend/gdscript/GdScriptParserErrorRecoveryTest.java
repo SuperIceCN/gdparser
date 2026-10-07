@@ -14,9 +14,9 @@ import dev.superice.gdparser.frontend.ast.LambdaExpression;
 import dev.superice.gdparser.frontend.ast.LiteralExpression;
 import dev.superice.gdparser.frontend.ast.MatchStatement;
 import dev.superice.gdparser.frontend.ast.Node;
+import dev.superice.gdparser.frontend.ast.Parameter;
 import dev.superice.gdparser.frontend.ast.PassStatement;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
-import dev.superice.gdparser.frontend.ast.Statement;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -33,9 +33,9 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// Phase 5 error corpus: panic-mode recovery (`synchronize()`), MISSING-class diagnostics,
+/// Error-recovery corpus: panic-mode recovery (`synchronize()`), expected-token diagnostics,
 /// unclosed constructs, EOF dangling points and the assignment-context family. Every case
-/// asserts the three §5.7 recovery properties: termination (class-level `@Timeout`), at least
+/// asserts the three recovery properties: termination (class-level `@Timeout`), at least
 /// one ERROR diagnostic with an in-bounds range, and correct sibling structure after recovery.
 ///
 /// Godot comparisons recorded on representative cases are derived from tracing
@@ -59,8 +59,8 @@ class GdScriptParserErrorRecoveryTest {
         return errorsOf(result).stream().map(AstDiagnostic::message).toList();
     }
 
-    /// §5.7 recovery gate: at least one ERROR diagnostic and every error range inside the source.
-    /// Ranges are UTF-8 byte offsets (§5.1), so the bound is the source's byte length, not its
+    /// Recovery gate: at least one ERROR diagnostic and every error range inside the source.
+    /// Ranges are UTF-8 byte offsets, so the bound is the source's byte length, not its
     /// UTF-16 `String.length()` — the two diverge on non-ASCII sources.
     private static AstMappingResult recoverableParse(String source) {
         var result = parse(source);
@@ -120,7 +120,7 @@ class GdScriptParserErrorRecoveryTest {
         var result = recoverableParse("var good_before = 1\n% ^ &\nvar good_after = 2\n");
         var statements = result.ast().statements();
         assertEquals(2, statements.size(), () -> "members: " + statements);
-        assertEquals("good_before", assertInstanceOf(VariableDeclaration.class, statements.get(0)).name());
+        assertEquals("good_before", assertInstanceOf(VariableDeclaration.class, statements.getFirst()).name());
         assertEquals("good_after", assertInstanceOf(VariableDeclaration.class, statements.get(1)).name());
     }
 
@@ -156,7 +156,7 @@ class GdScriptParserErrorRecoveryTest {
                 () -> errorMessages(result).toString());
         var statements = result.ast().statements();
         assertEquals(2, statements.size(), () -> "members: " + statements);
-        var x = assertInstanceOf(VariableDeclaration.class, statements.get(0));
+        var x = assertInstanceOf(VariableDeclaration.class, statements.getFirst());
         assertNull(x.value());
         var y = assertInstanceOf(VariableDeclaration.class, statements.get(1));
         assertInstanceOf(LiteralExpression.class, y.value());
@@ -169,7 +169,7 @@ class GdScriptParserErrorRecoveryTest {
                 () -> errorMessages(result).toString());
         var statements = result.ast().statements();
         assertEquals(2, statements.size(), () -> "members: " + statements);
-        var x = assertInstanceOf(VariableDeclaration.class, statements.get(0));
+        var x = assertInstanceOf(VariableDeclaration.class, statements.getFirst());
         // The failed operand collapses the whole expression (no half-built binary node).
         assertNull(x.value());
         assertEquals("y", assertInstanceOf(VariableDeclaration.class, statements.get(1)).name());
@@ -218,7 +218,7 @@ class GdScriptParserErrorRecoveryTest {
     void unclosedCallAtEofRecoversArguments() {
         var result = recoverableParse("var x = f(1, 2");
         var errors = errorMessages(result);
-        assertEquals(List.of("Expected closing \")\" after call arguments."), errors, () -> errors.toString());
+        assertEquals(List.of("Expected closing \")\" after call arguments."), errors, errors::toString);
         var error = errorsOf(result).getFirst();
         assertEquals(0, error.range().startPoint().row(), () -> error.range().toString());
         assertEquals(13, error.range().startPoint().column(), () -> error.range().toString());
@@ -260,7 +260,7 @@ class GdScriptParserErrorRecoveryTest {
         var result = recoverableParse("func f():\n\tnode.");
         var errors = errorMessages(result);
         assertEquals(List.of("Expected identifier after \".\" for attribute access."), errors,
-                () -> errors.toString());
+                errors::toString);
         var error = errorsOf(result).getFirst();
         assertEquals(1, error.range().startPoint().row(), () -> error.range().toString());
         assertEquals(5, error.range().startPoint().column(), () -> error.range().toString());
@@ -293,7 +293,7 @@ class GdScriptParserErrorRecoveryTest {
         var result = recoverableParse("func f():\n\ta = b = 1\n");
         var errors = errorMessages(result);
         assertEquals(List.of("Assignment is not allowed inside an expression."), errors,
-                () -> errors.toString());
+                errors::toString);
         var error = errorsOf(result).getFirst();
         assertEquals(1, error.range().startPoint().row(), () -> error.range().toString());
         assertEquals(7, error.range().startPoint().column(), () -> error.range().toString());
@@ -314,12 +314,12 @@ class GdScriptParserErrorRecoveryTest {
         var result = recoverableParse("func f():\n\tg(a = 1, 2)\n");
         var errors = errorMessages(result);
         assertEquals(List.of("Assignment is not allowed inside an expression."), errors,
-                () -> errors.toString());
+                errors::toString);
         var body = onlyFunction(result).body().statements();
         var statement = assertInstanceOf(ExpressionStatement.class, body.getFirst());
         var call = assertInstanceOf(CallExpression.class, statement.expression());
         assertEquals(2, call.arguments().size(), () -> "args: " + call.arguments());
-        assertEquals("1", assertInstanceOf(LiteralExpression.class, call.arguments().get(0)).sourceText());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, call.arguments().getFirst()).sourceText());
         assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
     }
 
@@ -331,7 +331,7 @@ class GdScriptParserErrorRecoveryTest {
         var result = recoverableParse("func f():\n\tvar x = y = 1\n");
         var errors = errorMessages(result);
         assertEquals(List.of("Assignment is not allowed inside an expression."), errors,
-                () -> errors.toString());
+                errors::toString);
         var body = onlyFunction(result).body().statements();
         var x = assertInstanceOf(VariableDeclaration.class, body.getFirst());
         assertEquals("1", assertInstanceOf(LiteralExpression.class, x.value()).sourceText());
@@ -349,7 +349,7 @@ class GdScriptParserErrorRecoveryTest {
     void classMissingColonKeepsBody() {
         var result = recoverableParse("class Foo\n\tpass\n");
         var errors = errorMessages(result);
-        assertEquals(List.of("Expected \":\" after class declaration."), errors, () -> errors.toString());
+        assertEquals(List.of("Expected \":\" after class declaration."), errors, errors::toString);
         var error = errorsOf(result).getFirst();
         assertEquals(0, error.range().startPoint().row(), () -> error.range().toString());
         assertEquals(6, error.range().startPoint().column(), () -> error.range().toString());
@@ -367,9 +367,9 @@ class GdScriptParserErrorRecoveryTest {
                 () -> errorMessages(result).toString());
         var statements = result.ast().statements();
         assertEquals(2, statements.size(), () -> "members: " + statements);
-        var classDeclaration = assertInstanceOf(ClassDeclaration.class, statements.get(0));
+        var classDeclaration = assertInstanceOf(ClassDeclaration.class, statements.getFirst());
         assertTrue(classDeclaration.body().statements().isEmpty(), () -> classDeclaration.body().toString());
-        // The unindented `pass` is not pulled into the class; it stays a top-level sibling (D4).
+        // The unindented `pass` is not pulled into the class; it stays a top-level sibling.
         assertInstanceOf(PassStatement.class, statements.get(1));
     }
 
@@ -380,7 +380,7 @@ class GdScriptParserErrorRecoveryTest {
                 () -> errorMessages(result).toString());
         var statements = result.ast().statements();
         assertEquals(2, statements.size(), () -> "members: " + statements);
-        var function = assertInstanceOf(FunctionDeclaration.class, statements.get(0));
+        var function = assertInstanceOf(FunctionDeclaration.class, statements.getFirst());
         assertTrue(function.body().statements().isEmpty(), () -> function.body().toString());
         assertInstanceOf(PassStatement.class, statements.get(1));
     }
@@ -394,10 +394,10 @@ class GdScriptParserErrorRecoveryTest {
         var result = recoverableParse("func f():\n\tmatch x:\n\treturn 1\n");
         var errors = errorMessages(result);
         assertEquals(List.of("Expected an indented block after \"match\" statement."), errors,
-                () -> errors.toString());
+                errors::toString);
         var body = onlyFunction(result).body().statements();
         assertEquals(2, body.size(), () -> "body: " + body);
-        var match = assertInstanceOf(MatchStatement.class, body.get(0));
+        var match = assertInstanceOf(MatchStatement.class, body.getFirst());
         assertEquals("x", assertInstanceOf(IdentifierExpression.class, match.value()).name());
         assertTrue(match.sections().isEmpty(), () -> match.sections().toString());
         assertInstanceOf(ReturnStatement.class, body.get(1));
@@ -419,12 +419,12 @@ class GdScriptParserErrorRecoveryTest {
         var function = assertInstanceOf(FunctionDeclaration.class, statements.getFirst());
         assertEquals("f", function.name());
         assertEquals(List.of("a", "b"),
-                function.parameters().stream().map(p -> p.name()).toList());
+                function.parameters().stream().map(Parameter::name).toList());
         assertTrue(function.body().statements().isEmpty(), () -> function.body().toString());
     }
 
     // -----------------------------------------------------------------------------------------
-    // Circuit breaker and progress guarantee (§2.2).
+    // Circuit breaker and progress guarantee.
     // -----------------------------------------------------------------------------------------
 
     /// Godot comparison: a suite's 102nd null statement trips `error_count++ > 100` and Godot
@@ -463,7 +463,7 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Indentation errors (tokenizer-level, §5.6: reported, scanning continues).
+    // Indentation errors (tokenizer-level: reported as diagnostics, scanning continues).
     // -----------------------------------------------------------------------------------------
 
     @Test
@@ -473,12 +473,12 @@ class GdScriptParserErrorRecoveryTest {
                 () -> errorMessages(result).toString());
         var body = onlyFunction(result).body().statements();
         assertEquals(2, body.size(), () -> "body: " + body);
-        assertInstanceOf(PassStatement.class, body.get(0));
+        assertInstanceOf(PassStatement.class, body.getFirst());
         assertInstanceOf(ReturnStatement.class, body.get(1));
     }
 
     // -----------------------------------------------------------------------------------------
-    // Nesting-depth budget (§5.7: no exceptions on illegal sources). Godot has no explicit
+    // Nesting-depth budget (illegal sources must never throw). Godot has no explicit
     // limit; the JVM stack needs one. Every input-driven recursion entry (expressions, suites,
     // match patterns, nested classes) shares one budget, so a compact pathological input fails
     // with a diagnostic instead of a StackOverflowError, and the leftover tokens are consumed
@@ -503,7 +503,7 @@ class GdScriptParserErrorRecoveryTest {
     void deeplyNestedSuitesReportErrorInsteadOfOverflowing() {
         var source = new StringBuilder("func f():\n");
         for (var i = 1; i <= 600; i++) {
-            source.append("\t".repeat(i)).append("if true:\n");
+            source.repeat("\t", i).append("if true:\n");
         }
         var result = recoverableParse(source.toString());
         assertTrue(errorMessages(result).contains("Maximum nesting depth exceeded."),
@@ -521,7 +521,7 @@ class GdScriptParserErrorRecoveryTest {
     void deeplyNestedClassesReportErrorInsteadOfOverflowing() {
         var source = new StringBuilder("class A:\n");
         for (var i = 1; i <= 600; i++) {
-            source.append("\t".repeat(i)).append("class B:\n");
+            source.repeat("\t", i).append("class B:\n");
         }
         var result = recoverableParse(source.toString());
         assertTrue(errorMessages(result).contains("Maximum nesting depth exceeded."),
@@ -570,9 +570,9 @@ class GdScriptParserErrorRecoveryTest {
         for (var depth : List.of(127, 128)) {
             var source = new StringBuilder("func f():\n");
             for (var i = 1; i <= depth; i++) {
-                source.append("\t".repeat(i)).append("var cb = func():\n");
+                source.repeat("\t", i).append("var cb = func():\n");
             }
-            source.append("\t".repeat(depth + 1)).append("pass\nvar after = 3\n");
+            source.repeat("\t", depth + 1).append("pass\nvar after = 3\n");
             var result = parse(source.toString());
             assertEquals(List.of("f", "after"), topLevelMemberNames(result), () -> "depth " + depth);
             if (depth >= 128) {
@@ -591,9 +591,9 @@ class GdScriptParserErrorRecoveryTest {
         for (var depth : List.of(100, 400)) {
             var source = new StringBuilder("var p:\n\tget:\n");
             for (var i = 2; i <= depth + 1; i++) {
-                source.append("\t".repeat(i)).append("if true:\n");
+                source.repeat("\t", i).append("if true:\n");
             }
-            source.append("\t".repeat(depth + 2)).append("pass\n@export\nvar after = 1\n");
+            source.repeat("\t", depth + 2).append("pass\n@export\nvar after = 1\n");
             var result = parse(source.toString());
             // Annotations are separate AnnotationStatement entries in the sequence (they do
             // not merge into the following declaration node).
@@ -652,7 +652,7 @@ class GdScriptParserErrorRecoveryTest {
         var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
         assertEquals(1, match.sections().size(), () -> match.sections().toString());
         var body = match.sections().getFirst().body().statements();
-        assertEquals(1, body.size(), () -> body.toString());
+        assertEquals(1, body.size(), body::toString);
         assertInstanceOf(ReturnStatement.class, body.getFirst());
     }
 
@@ -690,10 +690,10 @@ class GdScriptParserErrorRecoveryTest {
         for (var depth : List.of(127, 128)) {
             var source = new StringBuilder("func f():\n");
             for (var i = 1; i <= depth; i++) {
-                source.append("\t".repeat(i)).append("var cb = func():\n");
+                source.repeat("\t", i).append("var cb = func():\n");
             }
-            source.append("\t".repeat(depth + 1)).append("pass\n")
-                    .append("\t".repeat(depth)).append("var inner_after = 7\n")
+            source.repeat("\t", depth + 1).append("pass\n")
+                    .repeat("\t", depth).append("var inner_after = 7\n")
                     .append("var after = 2\n");
             var result = parse(source.toString());
             assertEquals(List.of("f", "after"), topLevelMemberNames(result), () -> "depth " + depth);
@@ -726,7 +726,7 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void multilinePoisonedPatternTerminatesWithDiagnostics() {
-        // Known limitation (plan Phase 5 record): a depth trip on a grouping continuation line
+        // Known limitation: a depth trip on a grouping continuation line
         // breaks sibling scope attribution — the aborted frames pop multiline mode before
         // consuming the grouping remainder, so the continuation's DEDENT becomes an orphan no
         // parsed frame owns. Godot has no depth limit and thus no such path. Only termination
@@ -763,7 +763,7 @@ class GdScriptParserErrorRecoveryTest {
                 .filter(CommentStatement.class::isInstance)
                 .map(s -> ((CommentStatement) s).text())
                 .toList();
-        assertEquals(List.of("# outer"), commentTexts, () -> commentTexts.toString());
+        assertEquals(List.of("# outer"), commentTexts, commentTexts::toString);
     }
 
     @Test
@@ -790,8 +790,8 @@ class GdScriptParserErrorRecoveryTest {
         assertTrue(errorMessages(result).contains("Expected expression after \"+\" operator."),
                 () -> errorMessages(result).toString());
         var error = errorsOf(result).getFirst();
-        // `中` is 3 UTF-8 bytes: the `+` sits at byte 14, and Point columns are byte columns
-        // (§5.1), so the diagnostic column is 14 rather than the char column 12.
+        // `中` is 3 UTF-8 bytes: the `+` sits at byte 14, and Point columns are byte columns,
+        // so the diagnostic column is 14 rather than the char column 12.
         assertEquals(14, error.range().startByte(), () -> error.range().toString());
         assertEquals(14, error.range().startPoint().column(), () -> error.range().toString());
     }
@@ -803,14 +803,14 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     // -----------------------------------------------------------------------------------------
-    // §5.6 deferred checks stay deferred: the analyzer-only diagnostics Godot emits at parse
+    // Deferred semantic checks stay deferred: the analyzer-only diagnostics Godot emits at parse
     // time must NOT appear here (pinned so a future port does not re-add them accidentally).
     // -----------------------------------------------------------------------------------------
 
     @Test
     void deferredSemanticChecksAreNotReported() {
         // Godot's parse-time target-type checks ("Cannot call on an expression.", assignment
-        // target restrictions) are analysis-layer work per plan §5.6.
+        // target restrictions) are analysis-layer work by design.
         var result = parse("func f():\n\tf(1)(2)\n\t1 + 2 = 3\n");
         var deferred = errorMessages(result).stream()
                 .filter(m -> m.contains("Cannot call on an expression")

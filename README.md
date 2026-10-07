@@ -1,34 +1,41 @@
 # gdparser
 
-A Java 25 GDScript parser pipeline built on Tree-sitter (`tree-sitter-ng`), with CST abstraction, typed AST lowering, diagnostics, and AST S-expression serde.
+A Java 25 GDScript parser. The primary path is a pure-Java port of Godot's official tokenizer and parser (no native dependencies), producing a parser-agnostic typed AST with diagnostics. The Tree-sitter (`tree-sitter-ng`) path is retained unchanged as the parity reference/fallback and for completion support.
 
 ## What This Repo Provides
 
-- Native loading of `tree-sitter-gdscript` with ABI compatibility checks
-- Parse facade from source text to CST root
-- Immutable CST view decoupled from raw Tree-sitter traversal
-- CST -> typed Java AST mapping with tolerant/strict modes
-- Stable diagnostics with source spans
-- AST <-> canonical S-expression serialization/deserialization
+- Pure-Java GDScript tokenizer + recursive-descent/Pratt parser faithful to Godot: explicit `NEWLINE`/`INDENT`/`DEDENT` semantics, panic-mode recovery with synchronization
+- Tolerant and strict parse modes with stable diagnostics on UTF-8 byte-offset spans
+- Raw token stream access for tooling and tests
+- Immutable, parser-agnostic typed AST with canonical S-expression serialization/deserialization
+- Dual-path parity testing: both parsers must produce byte-identical ASTs on the shared corpus
 - Fixture-based regression tests on real-world GDScript samples
 
 ## At a Glance
 
 ```text
-Source -> Parser -> CST -> AST -> (optional) S-expr
+Source -> GdTokenizer -> GdScriptParser -> AST -> (optional) S-expr
 ```
+
 ## Minimal Usage
 
 ```java
-var facade = GdParserFacade.withDefaultLanguage();
-var cstRoot = facade.parseCstRoot(source);
+var facade = new GdScriptParserFacade(); // stateless, safe to share across threads
 
-var mapper = new CstToAstMapper();
-var result = mapper.map(source, cstRoot); // tolerant mode
+var result = facade.parse(source);    // tolerant: AST + diagnostics, never throws
+var ast = facade.parseStrict(source); // strict: throws on the first ERROR diagnostic
+
+var tokens = facade.tokenize(source); // raw token stream (no parser multiline intervention)
 
 var serializer = new AstSexprSerializer();
 var sexpr = serializer.serialize(result.ast());
 ```
+
+## Documentation
+
+- `doc/godot-java-parser-implementation.md` — pure-Java parser contracts, parity rules, known limitations
+- `doc/architecture-overview.md` — repository-wide architecture and maintenance guide
+- `doc/tree-sitter-ng-gdscript-implementation-plan.md` — Tree-sitter path baseline
 
 ## License
 

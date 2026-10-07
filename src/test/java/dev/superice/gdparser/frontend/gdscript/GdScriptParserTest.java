@@ -51,6 +51,8 @@ import dev.superice.gdparser.frontend.ast.TypeTestExpression;
 import dev.superice.gdparser.frontend.ast.UnaryExpression;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import dev.superice.gdparser.frontend.ast.WhileStatement;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -85,6 +87,11 @@ class GdScriptParserTest {
                 .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
                 .map(AstDiagnostic::message)
                 .toList();
+    }
+
+    private static <T> @NotNull T requireNotNull(@Nullable T value) {
+        assertNotNull(value);
+        return value;
     }
 
     private static Statement onlyStatement(SourceFile ast) {
@@ -125,7 +132,7 @@ class GdScriptParserTest {
     @Test
     void extendsMayPrecedeClassName() {
         var ast = cleanAst("extends Node\nclass_name Foo\n");
-        assertInstanceOf(ExtendsStatement.class, ast.statements().get(0));
+        assertInstanceOf(ExtendsStatement.class, ast.statements().getFirst());
         assertInstanceOf(ClassNameStatement.class, ast.statements().get(1));
     }
 
@@ -168,40 +175,40 @@ class GdScriptParserTest {
     @Test
     void duplicateClassNameIsReported() {
         var errors = errorMessages(parse("class_name A\nclass_name B\n"));
-        assertTrue(errors.contains("\"class_name\" can only be used once."), () -> errors.toString());
+        assertTrue(errors.contains("\"class_name\" can only be used once."), errors::toString);
     }
 
     @Test
     void duplicateExtendsIsReported() {
         var errors = errorMessages(parse("extends A\nextends B\n"));
-        assertTrue(errors.contains("\"extends\" can only be used once."), () -> errors.toString());
+        assertTrue(errors.contains("\"extends\" can only be used once."), errors::toString);
     }
 
     @Test
     void classNameWithoutIdentifier() {
         var errors = errorMessages(parse("class_name\n"));
         assertTrue(errors.contains("Expected identifier for the global class name after \"class_name\"."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     @Test
     void extendsWithoutName() {
         var errors = errorMessages(parse("extends\n"));
-        assertTrue(errors.contains("Expected superclass name after \"extends\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected superclass name after \"extends\"."), errors::toString);
     }
 
     @Test
     void extendsWithNonStringLiteral() {
         var errors = errorMessages(parse("extends 123\n"));
         assertTrue(errors.contains("Only strings or identifiers can be used after \"extends\", found \"int\" instead."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     @Test
     void trailingTokenAfterClassName() {
         var errors = errorMessages(parse("class_name X 5\n"));
         assertTrue(errors.contains("Expected end of statement after class_name statement, found \"Literal\" instead."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -218,7 +225,7 @@ class GdScriptParserTest {
     void classBodyDocstringIsConsumedWithoutNode() {
         var ast = cleanAst("var x = 1\n\"\"\"doc\"\"\"\nvar y = 2\n");
         assertEquals(2, ast.statements().size());
-        assertInstanceOf(VariableDeclaration.class, ast.statements().get(0));
+        assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
         assertInstanceOf(VariableDeclaration.class, ast.statements().get(1));
     }
 
@@ -231,7 +238,7 @@ class GdScriptParserTest {
     @Test
     void standaloneStringRequiresNewline() {
         var errors = errorMessages(parse("\"\"\"a\"\"\" 5\n"));
-        assertTrue(errors.contains("Expected newline after comment string."), () -> errors.toString());
+        assertTrue(errors.contains("Expected newline after comment string."), errors::toString);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -273,19 +280,19 @@ class GdScriptParserTest {
     void nestedClassRejectsSecondExtends() {
         var errors = errorMessages(parse("class Inner extends A:\n\textends B\n\tpass\n"));
         assertTrue(errors.contains("Cannot use \"extends\" more than once in the same class."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     @Test
     void nestedClassMissingColon() {
         var errors = errorMessages(parse("class Inner\n\tpass\n"));
-        assertTrue(errors.contains("Expected \":\" after class declaration."), () -> errors.toString());
+        assertTrue(errors.contains("Expected \":\" after class declaration."), errors::toString);
     }
 
     @Test
     void nestedClassMissingIndentedBlock() {
         var errors = errorMessages(parse("class Inner:\nvar x = 1\n"));
-        assertTrue(errors.contains("Expected indented block after class declaration."), () -> errors.toString());
+        assertTrue(errors.contains("Expected indented block after class declaration."), errors::toString);
     }
 
     @Test
@@ -302,7 +309,7 @@ class GdScriptParserTest {
     @Test
     void variableForms() {
         var ast = cleanAst("var a\nvar b = 1\nvar c: int\nvar d: int = 2\n");
-        var a = assertInstanceOf(VariableDeclaration.class, ast.statements().get(0));
+        var a = assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
         assertEquals(DeclarationKind.VAR, a.kind());
         assertNull(a.type());
         assertNull(a.value());
@@ -310,20 +317,20 @@ class GdScriptParserTest {
         assertEquals("variable_statement", a.sourceNodeType());
 
         var d = assertInstanceOf(VariableDeclaration.class, ast.statements().get(3));
-        assertEquals("int", d.type().sourceText());
+        assertEquals("int", requireNotNull(d.type()).sourceText());
         assertInstanceOf(LiteralExpression.class, d.value());
     }
 
     @Test
     void inferredTypeMarkerShapes() {
         var ast = cleanAst("var x := 1\nvar y : = 2\n");
-        var x = assertInstanceOf(VariableDeclaration.class, ast.statements().get(0));
-        assertEquals(":=", x.type().sourceText());
+        var x = assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
+        assertEquals(":=", requireNotNull(x.type()).sourceText());
         assertEquals(new Range(6, 8, new Point(0, 6), new Point(0, 8)), x.type().range());
 
         var y = assertInstanceOf(VariableDeclaration.class, ast.statements().get(1));
         // The spaced form preserves the inner whitespace in both source text and range.
-        assertEquals(": =", y.type().sourceText());
+        assertEquals(": =", requireNotNull(y.type()).sourceText());
         assertEquals(17, y.type().range().startByte());
         assertEquals(20, y.type().range().endByte());
     }
@@ -339,13 +346,13 @@ class GdScriptParserTest {
     @Test
     void staticWithoutFuncOrVarIsReported() {
         var errors = errorMessages(parse("static const A = 1\n"));
-        assertTrue(errors.contains("Expected \"func\" or \"var\" after \"static\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected \"func\" or \"var\" after \"static\"."), errors::toString);
     }
 
     @Test
     void constRequiresInitializer() {
         var errors = errorMessages(parse("const A\n"));
-        assertTrue(errors.contains("Expected initializer after constant name."), () -> errors.toString());
+        assertTrue(errors.contains("Expected initializer after constant name."), errors::toString);
     }
 
     @Test
@@ -353,28 +360,28 @@ class GdScriptParserTest {
         var ast = cleanAst("const A := 1\n");
         var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
         assertEquals(DeclarationKind.CONST, constant.kind());
-        assertEquals(":=", constant.type().sourceText());
+        assertEquals(":=", requireNotNull(constant.type()).sourceText());
         assertEquals("const_statement", constant.sourceNodeType());
     }
 
     @Test
     void variableMissingName() {
         var errors = errorMessages(parse("var = 1\n"));
-        assertTrue(errors.contains("Expected variable name after \"var\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected variable name after \"var\"."), errors::toString);
     }
 
     @Test
     void variableMissingInitializerExpression() {
         var errors = errorMessages(parse("var x = \n"));
         assertTrue(errors.contains("Expected expression for variable initial value after \"=\"."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     @Test
     void localVariableWithColonNewlineIsRejected() {
         // Local variables cannot have property blocks, so a newline right after `:` is an error.
         var errors = errorMessages(parse("func f():\n\tvar x:\n"));
-        assertTrue(errors.contains("Expected type after \":\""), () -> errors.toString());
+        assertTrue(errors.contains("Expected type after \":\""), errors::toString);
     }
 
     @Test
@@ -394,8 +401,8 @@ class GdScriptParserTest {
     @Test
     void propertyReferenceFormIsConsumed() {
         var ast = cleanAst("var x: int: get = a, set = b\nvar y = 2\n");
-        var x = assertInstanceOf(VariableDeclaration.class, ast.statements().get(0));
-        assertEquals("int", x.type().sourceText());
+        var x = assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
+        assertEquals("int", requireNotNull(x.type()).sourceText());
         assertNull(x.value());
         // The declaration range covers the whole property tail, but no accessor nodes exist.
         assertEquals(28, x.range().endByte());
@@ -405,8 +412,8 @@ class GdScriptParserTest {
     @Test
     void propertyInlineBlockFormIsConsumed() {
         var ast = cleanAst("var x: int:\n\tget:\n\t\tpass\n\tset(value):\n\t\tpass\nvar y = 2\n");
-        var x = assertInstanceOf(VariableDeclaration.class, ast.statements().get(0));
-        assertEquals("int", x.type().sourceText());
+        var x = assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
+        assertEquals("int", requireNotNull(x.type()).sourceText());
         assertNull(x.value());
         assertInstanceOf(VariableDeclaration.class, ast.statements().get(1));
     }
@@ -414,14 +421,14 @@ class GdScriptParserTest {
     @Test
     void propertyDuplicateGetterIsReported() {
         var errors = errorMessages(parse("var x: int: get = a, get = b\n"));
-        assertTrue(errors.contains("Properties can only have one getter."), () -> errors.toString());
+        assertTrue(errors.contains("Properties can only have one getter."), errors::toString);
     }
 
     @Test
     void propertyUnknownAccessorIsReported() {
         var errors = errorMessages(parse("var x: int: foo = a\n"));
         assertTrue(errors.contains("Expected \"get\" or \"set\" for property declaration."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -431,14 +438,14 @@ class GdScriptParserTest {
     @Test
     void signalForms() {
         var ast = cleanAst("signal bare\nsignal with_params(a, b: int)\n");
-        var bare = assertInstanceOf(SignalStatement.class, ast.statements().get(0));
+        var bare = assertInstanceOf(SignalStatement.class, ast.statements().getFirst());
         assertEquals("bare", bare.name());
         assertTrue(bare.parameters().isEmpty());
 
         var withParams = assertInstanceOf(SignalStatement.class, ast.statements().get(1));
         assertEquals(2, withParams.parameters().size());
-        assertEquals("a", withParams.parameters().get(0).name());
-        assertEquals("int", withParams.parameters().get(1).type().sourceText());
+        assertEquals("a", withParams.parameters().getFirst().name());
+        assertEquals("int", requireNotNull(withParams.parameters().get(1).type()).sourceText());
         assertEquals(new Range(0, 11, new Point(0, 0), new Point(0, 11)), bare.range());
     }
 
@@ -462,7 +469,7 @@ class GdScriptParserTest {
     @Test
     void signalMissingName() {
         var errors = errorMessages(parse("signal (a)\n"));
-        assertTrue(errors.contains("Expected signal name after \"signal\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected signal name after \"signal\"."), errors::toString);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -472,13 +479,13 @@ class GdScriptParserTest {
     @Test
     void enumForms() {
         var ast = cleanAst("enum {A, B = 2, C}\nenum Named {D}\n");
-        var anon = assertInstanceOf(EnumDeclaration.class, ast.statements().get(0));
+        var anon = assertInstanceOf(EnumDeclaration.class, ast.statements().getFirst());
         assertNull(anon.name());
         assertEquals(3, anon.members().size());
-        assertEquals("A", anon.members().get(0).name());
-        assertNull(anon.members().get(0).value());
+        assertEquals("A", anon.members().getFirst().name());
+        assertNull(anon.members().getFirst().value());
         assertInstanceOf(LiteralExpression.class, anon.members().get(1).value());
-        assertEquals(6, anon.members().get(0).range().startByte());
+        assertEquals(6, anon.members().getFirst().range().startByte());
 
         var named = assertInstanceOf(EnumDeclaration.class, ast.statements().get(1));
         assertEquals("Named", named.name());
@@ -487,25 +494,25 @@ class GdScriptParserTest {
     @Test
     void enumMissingBrace() {
         var errors = errorMessages(parse("enum A\n"));
-        assertTrue(errors.contains("Expected \"{\" after enum name."), () -> errors.toString());
+        assertTrue(errors.contains("Expected \"{\" after enum name."), errors::toString);
     }
 
     @Test
     void enumNonIdentifierKey() {
         var errors = errorMessages(parse("enum {1}\n"));
-        assertTrue(errors.contains("Expected identifier for enum key."), () -> errors.toString());
+        assertTrue(errors.contains("Expected identifier for enum key."), errors::toString);
     }
 
     @Test
     void enumMissingValueExpression() {
         var errors = errorMessages(parse("enum {A = }\n"));
-        assertTrue(errors.contains("Expected expression value after \"=\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected expression value after \"=\"."), errors::toString);
     }
 
     @Test
     void enumUnclosedTerminates() {
         var errors = errorMessages(parse("enum {A\n"));
-        assertTrue(errors.contains("Expected closing \"}\" for enum."), () -> errors.toString());
+        assertTrue(errors.contains("Expected closing \"}\" for enum."), errors::toString);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -519,11 +526,11 @@ class GdScriptParserTest {
         assertEquals("f", function.name());
         assertFalse(function.isStatic());
         assertEquals(4, function.parameters().size());
-        assertEquals("int", function.parameters().get(1).type().sourceText());
+        assertEquals("int", requireNotNull(function.parameters().get(1).type()).sourceText());
         assertInstanceOf(LiteralExpression.class, function.parameters().get(2).defaultValue());
-        assertEquals("x", assertInstanceOf(LiteralExpression.class,
-                function.parameters().get(3).defaultValue()).sourceText().replace("\"", ""));
-        assertEquals("String", function.returnType().sourceText());
+        assertEquals("x", requireNotNull(assertInstanceOf(LiteralExpression.class,
+                function.parameters().get(3).defaultValue())).sourceText().replace("\"", ""));
+        assertEquals("String", requireNotNull(function.returnType()).sourceText());
     }
 
     @Test
@@ -543,8 +550,9 @@ class GdScriptParserTest {
         var ast = cleanAst("func f()\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         assertTrue(function.body().statements().isEmpty());
-        assertEquals(new Range(0, 8, new Point(0, 0), new Point(0, 8)), function.body().range());
-        assertEquals(new Range(0, 8, new Point(0, 0), new Point(0, 8)), function.range());
+        var declarationRange = new Range(0, 8, new Point(0, 0), new Point(0, 8));
+        assertEquals(declarationRange, function.body().range());
+        assertEquals(declarationRange, function.range());
     }
 
     @Test
@@ -562,8 +570,8 @@ class GdScriptParserTest {
         assertNull(constructor.returnType());
 
         var typed = cleanAst("func _init() -> void: pass\n");
-        assertEquals("void", assertInstanceOf(ConstructorDeclaration.class, onlyStatement(typed))
-                .returnType().sourceText());
+        assertEquals("void", requireNotNull(assertInstanceOf(ConstructorDeclaration.class, onlyStatement(typed))
+                .returnType()).sourceText());
     }
 
     @Test
@@ -576,51 +584,51 @@ class GdScriptParserTest {
     @Test
     void functionMissingName() {
         var errors = errorMessages(parse("func (): pass\n"));
-        assertTrue(errors.contains("Expected function name after \"func\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected function name after \"func\"."), errors::toString);
     }
 
     @Test
     void functionMissingOpeningParen() {
         var errors = errorMessages(parse("func f: pass\n"));
-        assertTrue(errors.contains("Expected opening \"(\" after function name."), () -> errors.toString());
+        assertTrue(errors.contains("Expected opening \"(\" after function name."), errors::toString);
     }
 
     @Test
     void functionParameterAfterRestIsReported() {
         var errors = errorMessages(parse("func f(...a, b): pass\n"));
-        assertTrue(errors.contains("Cannot have parameters after the rest parameter."), () -> errors.toString());
+        assertTrue(errors.contains("Cannot have parameters after the rest parameter."), errors::toString);
     }
 
     @Test
     void restParameterCannotHaveDefaultValue() {
         var errors = errorMessages(parse("func f(...a = 1): pass\n"));
-        assertTrue(errors.contains("The rest parameter cannot have a default value."), () -> errors.toString());
+        assertTrue(errors.contains("The rest parameter cannot have a default value."), errors::toString);
     }
 
     @Test
     void mandatoryParameterAfterOptionalIsReported() {
         var errors = errorMessages(parse("func f(a = 1, b): pass\n"));
         assertTrue(errors.contains("Cannot have mandatory parameters after optional parameters."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     @Test
     void duplicateParameterIsReported() {
         var errors = errorMessages(parse("func f(a, a): pass\n"));
         assertTrue(errors.contains("Parameter with name \"a\" was already declared for this function."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     @Test
     void functionMissingReturnType() {
         var errors = errorMessages(parse("func f() ->: pass\n"));
-        assertTrue(errors.contains("Expected return type or \"void\" after \"->\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected return type or \"void\" after \"->\"."), errors::toString);
     }
 
     @Test
     void functionMissingIndentedBlock() {
         var errors = errorMessages(parse("func f():\nvar x = 1\n"));
-        assertTrue(errors.contains("Expected indented block after function declaration."), () -> errors.toString());
+        assertTrue(errors.contains("Expected indented block after function declaration."), errors::toString);
     }
 
     @Test
@@ -628,7 +636,7 @@ class GdScriptParserTest {
         var ast = cleanAst("func f():\n\tvar x = 1\n\tpass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         assertEquals(2, function.body().statements().size());
-        assertInstanceOf(VariableDeclaration.class, function.body().statements().get(0));
+        assertInstanceOf(VariableDeclaration.class, function.body().statements().getFirst());
         assertInstanceOf(PassStatement.class, function.body().statements().get(1));
         // Block spans from the newline after the colon to the last statement end.
         assertEquals(9, function.body().range().startByte());
@@ -652,7 +660,7 @@ class GdScriptParserTest {
     void annotationShapesAndAttachment() {
         var ast = cleanAst("@export var x = 1\n");
         assertEquals(2, ast.statements().size());
-        var annotation = assertInstanceOf(AnnotationStatement.class, ast.statements().get(0));
+        var annotation = assertInstanceOf(AnnotationStatement.class, ast.statements().getFirst());
         assertEquals("export", annotation.name());
         assertTrue(annotation.arguments().isEmpty());
         assertEquals(new Range(0, 7, new Point(0, 0), new Point(0, 7)), annotation.range());
@@ -679,7 +687,7 @@ class GdScriptParserTest {
     @Test
     void annotationArguments() {
         var ast = cleanAst("@rpc(\"any_peer\", \"call_local\",)\nfunc f(): pass\n");
-        var annotation = assertInstanceOf(AnnotationStatement.class, ast.statements().get(0));
+        var annotation = assertInstanceOf(AnnotationStatement.class, ast.statements().getFirst());
         assertEquals("rpc", annotation.name());
         assertEquals(2, annotation.arguments().size());
         assertEquals(31, annotation.range().endByte());
@@ -688,7 +696,7 @@ class GdScriptParserTest {
     @Test
     void scriptLevelAnnotationPrecedesClassName() {
         var ast = cleanAst("@tool\nclass_name Foo\n");
-        assertInstanceOf(AnnotationStatement.class, ast.statements().get(0));
+        assertInstanceOf(AnnotationStatement.class, ast.statements().getFirst());
         assertInstanceOf(ClassNameStatement.class, ast.statements().get(1));
     }
 
@@ -703,7 +711,7 @@ class GdScriptParserTest {
     @Test
     void emptyAnnotationArgumentIsReported() {
         var errors = errorMessages(parse("@a(,)\nvar x = 1\n"));
-        assertTrue(errors.contains("Expected expression as the annotation argument."), () -> errors.toString());
+        assertTrue(errors.contains("Expected expression as the annotation argument."), errors::toString);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -713,46 +721,46 @@ class GdScriptParserTest {
     @Test
     void typeRefShapes() {
         var ast = cleanAst("var a: Array[int]\nvar b: Dictionary[String, int]\nvar c: Foo.Bar\n");
-        var a = assertInstanceOf(VariableDeclaration.class, ast.statements().get(0));
-        assertEquals("Array[int]", a.type().sourceText());
+        var a = assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
+        assertEquals("Array[int]", requireNotNull(a.type()).sourceText());
         assertEquals(new Range(7, 17, new Point(0, 7), new Point(0, 17)), a.type().range());
 
         var b = assertInstanceOf(VariableDeclaration.class, ast.statements().get(1));
         // Container type text keeps internal whitespace.
-        assertEquals("Dictionary[String, int]", b.type().sourceText());
+        assertEquals("Dictionary[String, int]", requireNotNull(b.type()).sourceText());
 
-        assertEquals("Foo.Bar", assertInstanceOf(VariableDeclaration.class, ast.statements().get(2))
-                .type().sourceText());
+        assertEquals("Foo.Bar", requireNotNull(assertInstanceOf(VariableDeclaration.class, ast.statements().get(2))
+                .type()).sourceText());
     }
 
     @Test
     void nestedContainerTypesAreRejected() {
         var errors = errorMessages(parse("var x: Array[Array[int]]\n"));
-        assertTrue(errors.contains("Nested typed collections are not supported."), () -> errors.toString());
+        assertTrue(errors.contains("Nested typed collections are not supported."), errors::toString);
     }
 
     @Test
     void missingContainerElementType() {
         var errors = errorMessages(parse("var x: Array[]\n"));
-        assertTrue(errors.contains("Expected type for collection after \"[\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected type for collection after \"[\"."), errors::toString);
     }
 
     @Test
     void missingContainerCloseBracket() {
         var errors = errorMessages(parse("var x: Array[int\n"));
-        assertTrue(errors.contains("Expected closing \"]\" after collection type."), () -> errors.toString());
+        assertTrue(errors.contains("Expected closing \"]\" after collection type."), errors::toString);
     }
 
     @Test
     void missingInnerTypeAfterPeriod() {
         var errors = errorMessages(parse("var x: Foo.\n"));
-        assertTrue(errors.contains("Expected inner type name after \".\"."), () -> errors.toString());
+        assertTrue(errors.contains("Expected inner type name after \".\"."), errors::toString);
     }
 
     @Test
     void voidIsNotAVariableType() {
         var errors = errorMessages(parse("var x: void\n"));
-        assertTrue(errors.contains("\"void\" is only allowed for a function return type."), () -> errors.toString());
+        assertTrue(errors.contains("\"void\" is only allowed for a function return type."), errors::toString);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -809,7 +817,7 @@ class GdScriptParserTest {
         var attribute = assertInstanceOf(AttributeExpression.class, constant.value());
         assertEquals("obj", assertInstanceOf(IdentifierExpression.class, attribute.base()).name());
         assertEquals(3, attribute.steps().size());
-        assertInstanceOf(AttributePropertyStep.class, attribute.steps().get(0));
+        assertInstanceOf(AttributePropertyStep.class, attribute.steps().getFirst());
         assertInstanceOf(AttributeCallStep.class, attribute.steps().get(1));
         assertInstanceOf(AttributeSubscriptStep.class, attribute.steps().get(2));
     }
@@ -839,7 +847,7 @@ class GdScriptParserTest {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Phase 3 expression forms: grouping, arrays, dictionaries.
+    // Expression forms: grouping, arrays, dictionaries.
     // -----------------------------------------------------------------------------------------
 
     @Test
@@ -885,17 +893,17 @@ class GdScriptParserTest {
     @Test
     void arrayLiteralShapes() {
         var ast = cleanAst("const A = [1, 2, 3]\nconst B = []\nconst C = [[1], [2]]\n");
-        var a = assertInstanceOf(ArrayExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        var a = requireNotNull(assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value()));
         assertEquals(3, a.elements().size());
         assertFalse(a.openEnded());
         assertEquals("1", assertInstanceOf(LiteralExpression.class, a.elements().getFirst()).sourceText());
         assertEquals(new Range(10, 19, new Point(0, 10), new Point(0, 19)), a.range());
-        var b = assertInstanceOf(ArrayExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        var b = requireNotNull(assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()));
         assertEquals(0, b.elements().size());
-        var c = assertInstanceOf(ArrayExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(2)).value());
+        var c = requireNotNull(assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(2)).value()));
         assertEquals(2, c.elements().size());
         assertInstanceOf(ArrayExpression.class, c.elements().getFirst());
     }
@@ -903,11 +911,11 @@ class GdScriptParserTest {
     @Test
     void arrayTrailingCommaAndMultiline() {
         var ast = cleanAst("const A = [1, 2,]\nconst B = [\n\t1,\n\t2,\n]\n");
-        var a = assertInstanceOf(ArrayExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        var a = requireNotNull(assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value()));
         assertEquals(2, a.elements().size());
-        var b = assertInstanceOf(ArrayExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        var b = requireNotNull(assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()));
         assertEquals(2, b.elements().size());
     }
 
@@ -945,13 +953,13 @@ class GdScriptParserTest {
     void luaDictionaryKeyNormalization() {
         var ast = cleanAst("const A = {x = 1}\nconst B = {\"name\" = 2}\n");
         var a = assertInstanceOf(DictionaryExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+                assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value());
         var aKey = assertInstanceOf(LiteralExpression.class, a.entries().getFirst().key());
         // Lua-style identifier keys normalize to synthesized StringName literals.
         assertEquals("string_name", aKey.kind());
         assertEquals("&\"x\"", aKey.sourceText());
-        var b = assertInstanceOf(DictionaryExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        var b = requireNotNull(assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()));
         var bKey = assertInstanceOf(LiteralExpression.class, b.entries().getFirst().key());
         assertEquals("string_name", bKey.kind());
         assertEquals("&\"name\"", bKey.sourceText());
@@ -1037,7 +1045,7 @@ class GdScriptParserTest {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Phase 3 expression forms: get_node, preload, await, super.
+    // Expression forms: get_node, preload, await, super.
     // -----------------------------------------------------------------------------------------
 
     @Test
@@ -1056,12 +1064,12 @@ class GdScriptParserTest {
 
     @Test
     void getNodeGodotOnlyForms() {
-        // §5.7 (ii): legal in Godot, rejected by the tree-sitter path — no parity, Godot shapes.
+        // A registered divergence: legal in Godot, rejected by the tree-sitter path — no parity, Godot shapes.
         var ast = cleanAst("var a = $%Child\nvar b = $Root/%Child\n");
-        assertEquals("$%Child", assertInstanceOf(GetNodeExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value()).sourceText());
-        assertEquals("$Root/%Child", assertInstanceOf(GetNodeExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()).sourceText());
+        assertEquals("$%Child", requireNotNull(assertInstanceOf(GetNodeExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value())).sourceText());
+        assertEquals("$Root/%Child", requireNotNull(assertInstanceOf(GetNodeExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value())).sourceText());
     }
 
     @Test
@@ -1080,13 +1088,13 @@ class GdScriptParserTest {
     void preloadShapes() {
         var ast = cleanAst("const P = preload(\"res://a.gd\")\nconst Q = preload(path_var)\n");
         var p = assertInstanceOf(PreloadExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+                assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value());
         assertEquals("\"res://a.gd\"", assertInstanceOf(LiteralExpression.class, p.path()).sourceText());
         assertEquals(new Range(10, 31, new Point(0, 10), new Point(0, 31)), p.range());
         // The path is a general expression; constant/resource checks are cut (later Godot phases).
         assertInstanceOf(IdentifierExpression.class,
-                assertInstanceOf(PreloadExpression.class,
-                        assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()).path());
+                requireNotNull(assertInstanceOf(PreloadExpression.class,
+                        assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value())).path());
         // One trailing comma is allowed.
         assertInstanceOf(PreloadExpression.class,
                 assertInstanceOf(VariableDeclaration.class, cleanAst("const R = preload(\"a\",)\n")
@@ -1139,7 +1147,7 @@ class GdScriptParserTest {
         var ast = cleanAst("func f():\n\tsuper()\n\tsuper.foo(1)\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var implicit = assertInstanceOf(CallExpression.class,
-                assertInstanceOf(ExpressionStatement.class, function.body().statements().get(0)).expression());
+                assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst()).expression());
         assertEquals("super", assertInstanceOf(IdentifierExpression.class, implicit.callee()).name());
         assertEquals(0, implicit.arguments().size());
         var explicit = assertInstanceOf(AttributeExpression.class,
@@ -1180,42 +1188,43 @@ class GdScriptParserTest {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Phase 3 expression forms: as/is, ternary, not-in, unary family, assignments.
+    // Expression forms: as/is, ternary, not-in, unary family, assignments.
     // -----------------------------------------------------------------------------------------
 
     @Test
     void castShapes() {
         var ast = cleanAst("const A = x as int\nconst B = y as Array[int]\n");
-        var cast = assertInstanceOf(CastExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        var cast = requireNotNull(assertInstanceOf(CastExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value()));
         assertInstanceOf(IdentifierExpression.class, cast.value());
         assertEquals("int", cast.targetType().sourceText());
         assertEquals(cast.value().range().startByte(), cast.range().startByte());
         assertEquals(cast.targetType().range().endByte(), cast.range().endByte());
-        assertEquals("Array[int]", assertInstanceOf(CastExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()).targetType().sourceText());
+        assertEquals("Array[int]", requireNotNull(assertInstanceOf(CastExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()))
+                .targetType().sourceText());
     }
 
     @Test
     void castBindsWeakerThanAdditionLikeGodot() {
         // Godot anchors `1 + 2 as int` as `(1 + 2) as int` (PREC_CAST below addition); the
-        // tree-sitter path groups `1 + (2 as int)` (registered §5.8 divergence, no parity).
+        // tree-sitter path groups `1 + (2 as int)` (a registered precedence divergence, no parity).
         var ast = cleanAst("const A = 1 + 2 as int\n");
-        var cast = assertInstanceOf(CastExpression.class,
-                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
-        assertEquals("+", assertInstanceOf(BinaryExpression.class, cast.value()).operator());
+        var cast = requireNotNull(assertInstanceOf(CastExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value()));
+        assertEquals("+", requireNotNull(assertInstanceOf(BinaryExpression.class, cast.value())).operator());
         assertEquals("int", cast.targetType().sourceText());
     }
 
     @Test
     void typeTestShapes() {
         var ast = cleanAst("var a = x is Node\nvar b = y is not int\n");
-        var plain = assertInstanceOf(TypeTestExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        var plain = requireNotNull(assertInstanceOf(TypeTestExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value()));
         assertFalse(plain.negated());
         assertEquals("Node", plain.targetType().sourceText());
-        var negated = assertInstanceOf(TypeTestExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        var negated = requireNotNull(assertInstanceOf(TypeTestExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()));
         assertTrue(negated.negated());
         assertEquals("int", negated.targetType().sourceText());
     }
@@ -1235,8 +1244,8 @@ class GdScriptParserTest {
     @Test
     void ternaryShape() {
         var ast = cleanAst("const A = 1 if c else 2\n");
-        var ternary = assertInstanceOf(ConditionalExpression.class,
-                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        var ternary = requireNotNull(assertInstanceOf(ConditionalExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value()));
         assertEquals("c", assertInstanceOf(IdentifierExpression.class, ternary.condition()).name());
         assertEquals("1", assertInstanceOf(LiteralExpression.class, ternary.left()).sourceText());
         assertEquals("2", assertInstanceOf(LiteralExpression.class, ternary.right()).sourceText());
@@ -1245,8 +1254,8 @@ class GdScriptParserTest {
     @Test
     void ternaryNestsOnFalseBranch() {
         var ast = cleanAst("const A = 1 if a else 2 if b else 3\n");
-        var outer = assertInstanceOf(ConditionalExpression.class,
-                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        var outer = requireNotNull(assertInstanceOf(ConditionalExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value()));
         assertInstanceOf(LiteralExpression.class, outer.left());
         var inner = assertInstanceOf(ConditionalExpression.class, outer.right());
         assertEquals("b", assertInstanceOf(IdentifierExpression.class, inner.condition()).name());
@@ -1264,8 +1273,8 @@ class GdScriptParserTest {
     @Test
     void notInShape() {
         var ast = cleanAst("var a = x not in y\n");
-        var binary = assertInstanceOf(BinaryExpression.class,
-                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        var binary = requireNotNull(assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value()));
         assertEquals("not in", binary.operator());
         assertEquals("x", assertInstanceOf(IdentifierExpression.class, binary.left()).name());
         assertEquals("y", assertInstanceOf(IdentifierExpression.class, binary.right()).name());
@@ -1332,8 +1341,8 @@ class GdScriptParserTest {
     @Test
     void assignmentTargetCheckIsDeferredByDesign() {
         // The vendor's assignee node-type check is a parse-time semantic check outside the
-        // ported set (plan §5.6); the invalid target produces an AssignmentExpression for the
-        // analyzer to reject, with no parser diagnostic.
+        // ported set (left to the analysis layer); the invalid target produces an
+        // AssignmentExpression for the analyzer to reject, with no parser diagnostic.
         var ast = cleanAst("func f():\n\t1 = 2\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var assignment = assertInstanceOf(AssignmentExpression.class,
@@ -1409,7 +1418,7 @@ class GdScriptParserTest {
         var ast = cleanAst("func f():\n\t@warning_ignore(\"unused_variable\")\n\tvar x = 1\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         assertEquals(2, function.body().statements().size());
-        var annotation = assertInstanceOf(AnnotationStatement.class, function.body().statements().get(0));
+        var annotation = assertInstanceOf(AnnotationStatement.class, function.body().statements().getFirst());
         assertEquals("warning_ignore", annotation.name());
         assertInstanceOf(VariableDeclaration.class, function.body().statements().get(1));
     }
@@ -1434,13 +1443,13 @@ class GdScriptParserTest {
     @Test
     void unexpectedTokenInClassBody() {
         var errors = errorMessages(parse("123\n"));
-        assertTrue(errors.contains("Unexpected \"Literal\" in class body."), () -> errors.toString());
+        assertTrue(errors.contains("Unexpected \"Literal\" in class body."), errors::toString);
     }
 
     @Test
     void unexpectedIdentifierInClassBody() {
         var errors = errorMessages(parse("foo\n"));
-        assertTrue(errors.contains("Unexpected identifier \"foo\" in class body."), () -> errors.toString());
+        assertTrue(errors.contains("Unexpected identifier \"foo\" in class body."), errors::toString);
     }
 
     @Test
@@ -1458,7 +1467,7 @@ class GdScriptParserTest {
     @Test
     void matchAndWhenAreUsableAsNames() {
         var ast = cleanAst("func match(): pass\nvar when = 1\nsignal s(match)\n");
-        assertEquals("match", assertInstanceOf(FunctionDeclaration.class, ast.statements().get(0)).name());
+        assertEquals("match", assertInstanceOf(FunctionDeclaration.class, ast.statements().getFirst()).name());
         assertEquals("when", assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).name());
         assertEquals("match", assertInstanceOf(SignalStatement.class, ast.statements().get(2))
                 .parameters().getFirst().name());
@@ -1467,20 +1476,20 @@ class GdScriptParserTest {
     @Test
     void builtinConstantsAreUsableAsNames() {
         var ast = cleanAst("var PI = 1\nconst A = Vector2.INF\n");
-        assertEquals("PI", assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).name());
-        var attribute = assertInstanceOf(AttributeExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        assertEquals("PI", assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).name());
+        var attribute = requireNotNull(assertInstanceOf(AttributeExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()));
         assertEquals("INF", assertInstanceOf(AttributePropertyStep.class, attribute.steps().getFirst()).name());
     }
 
     @Test
     void keywordsAreUsableAsAttributeNames() {
         var ast = cleanAst("var ok = \"abc\".match(\"a*\")\nvar cls = obj.class\n");
-        var call = assertInstanceOf(AttributeExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(0)).value());
+        var call = requireNotNull(assertInstanceOf(AttributeExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value()));
         assertInstanceOf(AttributeCallStep.class, call.steps().getFirst());
-        var property = assertInstanceOf(AttributeExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value());
+        var property = requireNotNull(assertInstanceOf(AttributeExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ast.statements().get(1)).value()));
         assertEquals("class", assertInstanceOf(AttributePropertyStep.class, property.steps().getFirst()).name());
     }
 
@@ -1517,7 +1526,7 @@ class GdScriptParserTest {
         // The accessor suite's content is discarded entirely; its dangling annotation must not
         // leak onto the next outer member.
         assertEquals(2, ast.statements().size());
-        assertInstanceOf(VariableDeclaration.class, ast.statements().get(0));
+        assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
         var y = assertInstanceOf(VariableDeclaration.class, ast.statements().get(1));
         assertEquals("y", y.name());
     }
@@ -1533,7 +1542,7 @@ class GdScriptParserTest {
     @Test
     void sameLineExtendsCountsTowardDuplicateCheck() {
         var errors = errorMessages(parse("class_name C extends A\nextends B\n"));
-        assertTrue(errors.contains("\"extends\" can only be used once."), () -> errors.toString());
+        assertTrue(errors.contains("\"extends\" can only be used once."), errors::toString);
     }
 
     @Test
@@ -1553,7 +1562,7 @@ class GdScriptParserTest {
         var ast = cleanAst("func f():\n\tpass\n\t@x\nvar outside = 1\n");
         // The annotation dangles at the end of f's suite; it must stay in that scope instead of
         // escaping onto the next outer member.
-        var function = assertInstanceOf(FunctionDeclaration.class, ast.statements().get(0));
+        var function = assertInstanceOf(FunctionDeclaration.class, ast.statements().getFirst());
         assertEquals(2, function.body().statements().size());
         assertInstanceOf(AnnotationStatement.class, function.body().statements().get(1));
         assertEquals(2, ast.statements().size());
@@ -1585,7 +1594,7 @@ class GdScriptParserTest {
     @Test
     void signalRejectsRestParameter() {
         var errors = errorMessages(parse("signal s(...a)\n"));
-        assertTrue(errors.contains("Expected signal parameter name."), () -> errors.toString());
+        assertTrue(errors.contains("Expected signal parameter name."), errors::toString);
     }
 
     @Test
@@ -1602,7 +1611,7 @@ class GdScriptParserTest {
     void danglingAttributeDotAtEofDoesNotThrow() {
         var errors = errorMessages(parse("var x = a."));
         assertTrue(errors.contains("Expected identifier after \".\" for attribute access."),
-                () -> errors.toString());
+                errors::toString);
     }
 
     @Test
@@ -1610,7 +1619,7 @@ class GdScriptParserTest {
         var result = parse("var x = a.\nvar y = 2\n");
         assertTrue(errorMessages(result).contains("Expected identifier after \".\" for attribute access."));
         // The failed member access degrades to the base expression and the sibling parses.
-        var x = assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(0));
+        var x = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
         assertEquals("a", assertInstanceOf(IdentifierExpression.class, x.value()).name());
         assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1));
     }
@@ -1622,7 +1631,7 @@ class GdScriptParserTest {
         var result = parse("var x = a.b.(1)\nvar y = a.b.[0]\nvar z = a.b. .c\n");
         assertEquals(3, errorMessages(result).size());
 
-        var x = assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(0));
+        var x = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
         var xChain = assertInstanceOf(AttributeExpression.class, x.value());
         assertEquals("a", assertInstanceOf(IdentifierExpression.class, xChain.base()).name());
         assertEquals(1, xChain.steps().size());
@@ -1637,7 +1646,7 @@ class GdScriptParserTest {
         var zChain = assertInstanceOf(AttributeExpression.class, z.value());
         assertEquals("a", assertInstanceOf(IdentifierExpression.class, zChain.base()).name());
         assertEquals(2, zChain.steps().size());
-        assertEquals("b", assertInstanceOf(AttributePropertyStep.class, zChain.steps().get(0)).name());
+        assertEquals("b", assertInstanceOf(AttributePropertyStep.class, zChain.steps().getFirst()).name());
         assertEquals("c", assertInstanceOf(AttributePropertyStep.class, zChain.steps().get(1)).name());
     }
 
@@ -1659,7 +1668,7 @@ class GdScriptParserTest {
         var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
         var chain = assertInstanceOf(AttributeExpression.class, constant.value());
         assertEquals(2, chain.steps().size());
-        assertInstanceOf(AttributeCallStep.class, chain.steps().get(0));
+        assertInstanceOf(AttributeCallStep.class, chain.steps().getFirst());
         assertEquals("c", assertInstanceOf(AttributePropertyStep.class, chain.steps().get(1)).name());
     }
 
@@ -1674,7 +1683,7 @@ class GdScriptParserTest {
     @Test
     void multibyteSourceSlicesAndCrlfRanges() {
         var ast = cleanAst("extends \"res://场景.gd\"\nvar 数据 = 1\r\n");
-        var extendsStatement = assertInstanceOf(ExtendsStatement.class, ast.statements().get(0));
+        var extendsStatement = assertInstanceOf(ExtendsStatement.class, ast.statements().getFirst());
         // UTF-8 slices must keep the multi-byte path intact.
         assertEquals("\"res://场景.gd\"", extendsStatement.target());
 
@@ -1713,7 +1722,7 @@ class GdScriptParserTest {
     void ifWithSingleLineSuite() {
         var ast = cleanAst("func f():\n\tif x: return 1\n\tpass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
-        var ifStatement = assertInstanceOf(IfStatement.class, function.body().statements().get(0));
+        var ifStatement = assertInstanceOf(IfStatement.class, function.body().statements().getFirst());
         // A single-line body block spans exactly its statement.
         assertEquals(new Range(17, 25, new Point(1, 7), new Point(1, 15)), ifStatement.body().range());
         assertEquals(new Range(11, 25, new Point(1, 1), new Point(1, 15)), ifStatement.range());
@@ -1740,7 +1749,7 @@ class GdScriptParserTest {
         var whileStatement = assertInstanceOf(WhileStatement.class, function.body().statements().getFirst());
         assertEquals(new Range(11, 42, new Point(1, 1), new Point(3, 10)), whileStatement.range());
         assertEquals(new Range(23, 42, new Point(1, 13), new Point(3, 10)), whileStatement.body().range());
-        assertInstanceOf(BreakStatement.class, whileStatement.body().statements().get(0));
+        assertInstanceOf(BreakStatement.class, whileStatement.body().statements().getFirst());
         assertInstanceOf(ContinueStatement.class, whileStatement.body().statements().get(1));
     }
 
@@ -1774,7 +1783,7 @@ class GdScriptParserTest {
         var ast = cleanAst("func f():\n\tfor i in range(3):\n\t\tpass\n\tfor j: int in arr:\n\t\tpass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
 
-        var plain = assertInstanceOf(ForStatement.class, function.body().statements().get(0));
+        var plain = assertInstanceOf(ForStatement.class, function.body().statements().getFirst());
         assertEquals("i", plain.iterator());
         assertNull(plain.iteratorType());
         assertInstanceOf(CallExpression.class, plain.iterable());
@@ -1799,7 +1808,7 @@ class GdScriptParserTest {
     @Test
     void returnBareAndValued() {
         var ast = cleanAst("func f():\n\treturn\nfunc g():\n\treturn 1\n");
-        var f = assertInstanceOf(FunctionDeclaration.class, ast.statements().get(0));
+        var f = assertInstanceOf(FunctionDeclaration.class, ast.statements().getFirst());
         var bare = assertInstanceOf(ReturnStatement.class, f.body().statements().getFirst());
         assertNull(bare.value());
         assertEquals(new Range(11, 17, new Point(1, 1), new Point(1, 7)), bare.range());
@@ -1840,7 +1849,7 @@ class GdScriptParserTest {
     void assertFormsWithoutMessageAndWithTrailingComma() {
         var ast = cleanAst("func f():\n\tassert(x)\n\tassert(y,)\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
-        var plain = assertInstanceOf(AssertStatement.class, function.body().statements().get(0));
+        var plain = assertInstanceOf(AssertStatement.class, function.body().statements().getFirst());
         assertNull(plain.message());
         var trailing = assertInstanceOf(AssertStatement.class, function.body().statements().get(1));
         assertNull(trailing.message());
@@ -1878,7 +1887,7 @@ class GdScriptParserTest {
         assertEquals("v", assertInstanceOf(IdentifierExpression.class, match.value()).name());
         assertEquals(3, match.sections().size());
 
-        var literal = match.sections().get(0);
+        var literal = match.sections().getFirst();
         assertEquals(new Range(23, 33, new Point(2, 2), new Point(3, 7)), literal.range());
         assertEquals(new Range(23, 24, new Point(2, 2), new Point(2, 3)),
                 assertInstanceOf(LiteralExpression.class, literal.patterns().getFirst()).range());
@@ -1903,7 +1912,7 @@ class GdScriptParserTest {
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
 
-        var multi = match.sections().get(0);
+        var multi = match.sections().getFirst();
         assertEquals(2, multi.patterns().size());
         assertEquals(new Range(23, 36, new Point(2, 2), new Point(3, 7)), multi.range());
 
@@ -1919,7 +1928,7 @@ class GdScriptParserTest {
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
 
-        var closed = assertInstanceOf(ArrayExpression.class, match.sections().get(0).patterns().getFirst());
+        var closed = assertInstanceOf(ArrayExpression.class, match.sections().getFirst().patterns().getFirst());
         assertFalse(closed.openEnded());
         assertEquals(2, closed.elements().size());
         assertEquals(new Range(23, 29, new Point(2, 2), new Point(2, 8)), closed.range());
@@ -1928,7 +1937,7 @@ class GdScriptParserTest {
         assertTrue(open.openEnded());
         // The `..` marker sets openEnded instead of adding an element.
         assertEquals(2, open.elements().size());
-        assertEquals("_", assertInstanceOf(IdentifierExpression.class, open.elements().get(0)).name());
+        assertEquals("_", assertInstanceOf(IdentifierExpression.class, open.elements().getFirst()).name());
         assertInstanceOf(PatternBindingExpression.class, open.elements().get(1));
         assertEquals(new Range(41, 55, new Point(4, 2), new Point(4, 16)), open.range());
     }
@@ -1941,7 +1950,7 @@ class GdScriptParserTest {
         var dictionary = assertInstanceOf(DictionaryExpression.class, match.sections().getFirst().patterns().getFirst());
         assertTrue(dictionary.openEnded());
         assertEquals(2, dictionary.entries().size());
-        var first = dictionary.entries().get(0);
+        var first = dictionary.entries().getFirst();
         assertEquals(new Range(24, 30, new Point(2, 3), new Point(2, 9)), first.range());
         assertInstanceOf(LiteralExpression.class, first.value());
         var second = dictionary.entries().get(1);
@@ -1955,8 +1964,8 @@ class GdScriptParserTest {
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
 
-        var nested = assertInstanceOf(ArrayExpression.class, match.sections().get(0).patterns().getFirst());
-        var dict = assertInstanceOf(DictionaryExpression.class, nested.elements().get(0));
+        var nested = assertInstanceOf(ArrayExpression.class, match.sections().getFirst().patterns().getFirst());
+        var dict = assertInstanceOf(DictionaryExpression.class, nested.elements().getFirst());
         assertEquals("_", assertInstanceOf(IdentifierExpression.class, dict.entries().getFirst().value()).name());
         var restOnly = assertInstanceOf(ArrayExpression.class, nested.elements().get(1));
         assertTrue(restOnly.openEnded());
@@ -1990,7 +1999,7 @@ class GdScriptParserTest {
     @Test
     void matchPassBranchIsConsumedWithoutNode() {
         // Godot consumes a branch-level `pass` without producing a node; the reference path
-        // rejects it (registered §5.7 (ii) divergence).
+        // rejects it (a registered parity divergence).
         var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t1:\n\t\t\tpass\n\t\tpass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
@@ -2086,10 +2095,10 @@ class GdScriptParserTest {
         assertEquals(new Range(8, 39, new Point(0, 8), new Point(1, 9)), lambda.range());
 
         var withDefaults = cleanAst("var g = func(a: int, b = 1): return a + b\n");
-        var defaulted = assertInstanceOf(LambdaExpression.class,
-                assertInstanceOf(VariableDeclaration.class, onlyStatement(withDefaults)).value());
+        var defaulted = requireNotNull(assertInstanceOf(LambdaExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(withDefaults)).value()));
         assertEquals(2, defaulted.parameters().size());
-        assertNotNull(defaulted.parameters().get(0).type());
+        assertNotNull(defaulted.parameters().getFirst().type());
         assertNotNull(defaulted.parameters().get(1).defaultValue());
     }
 
@@ -2101,7 +2110,7 @@ class GdScriptParserTest {
         var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
         var call = assertInstanceOf(CallExpression.class, declaration.value());
         assertEquals(2, call.arguments().size());
-        assertInstanceOf(LambdaExpression.class, call.arguments().get(0));
+        assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
     }
 
     @Test
@@ -2112,7 +2121,7 @@ class GdScriptParserTest {
         var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
         var call = assertInstanceOf(CallExpression.class, declaration.value());
         assertEquals(2, call.arguments().size());
-        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().get(0));
+        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
         assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
     }
 
@@ -2122,7 +2131,7 @@ class GdScriptParserTest {
         // (named or `<anonymous>`), not a lambda in an expression statement.
         var ast = cleanAst("func f():\n\tfunc(): pass\n\tpass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
-        var anonymous = assertInstanceOf(FunctionDeclaration.class, function.body().statements().get(0));
+        var anonymous = assertInstanceOf(FunctionDeclaration.class, function.body().statements().getFirst());
         assertEquals("<anonymous>", anonymous.name());
         assertNull(anonymous.returnType());
         assertEquals(new Range(11, 23, new Point(1, 1), new Point(1, 13)), anonymous.range());
@@ -2138,19 +2147,19 @@ class GdScriptParserTest {
         var typedFn = assertInstanceOf(FunctionDeclaration.class,
                 assertInstanceOf(FunctionDeclaration.class, onlyStatement(typed)).body().statements().getFirst());
         assertEquals("<anonymous>", typedFn.name());
-        assertEquals("int", typedFn.returnType().sourceText());
+        assertEquals("int", requireNotNull(typedFn.returnType()).sourceText());
     }
 
     @Test
     void classBodyAnonymousFunctionIsRejected() {
         // Godot requires a name on class-body functions; the reference path accepts anonymous
-        // ones (registered §5.7 (ii) divergence).
+        // ones (a registered parity divergence).
         var result = parse("func(): pass\n");
         assertTrue(errorMessages(result).contains("Expected function name after \"func\"."));
     }
 
     // -----------------------------------------------------------------------------------------
-    // Comment and region-directive attribution (§5.4 rules pinned from the reference path).
+    // Comment and region-directive attribution (rules pinned from the reference path).
     // -----------------------------------------------------------------------------------------
 
     @Test
@@ -2158,7 +2167,7 @@ class GdScriptParserTest {
         var ast = cleanAst("#region 初始化\nvar x = 1 # 尾注释\n# 整行注释\nfunc f():\n\tpass # 尾\n#endregion\n");
         var statements = ast.statements();
 
-        var regionStart = assertInstanceOf(RegionDirectiveStatement.class, statements.get(0));
+        var regionStart = assertInstanceOf(RegionDirectiveStatement.class, statements.getFirst());
         assertEquals("start", regionStart.directive());
         assertEquals("初始化", regionStart.label());
 
@@ -2170,7 +2179,7 @@ class GdScriptParserTest {
 
         var function = assertInstanceOf(FunctionDeclaration.class, statements.get(4));
         var body = function.body().statements();
-        assertInstanceOf(PassStatement.class, body.get(0));
+        assertInstanceOf(PassStatement.class, body.getFirst());
         var trailing = assertInstanceOf(CommentStatement.class, body.get(1));
         assertEquals("# 尾", trailing.text());
         // Columns are byte-based on both paths (`# 尾` is 5 UTF-8 bytes).
@@ -2187,7 +2196,7 @@ class GdScriptParserTest {
         // a plain comment; `#endregion` always has a null label, even with trailing text.
         var ast = cleanAst("#regionfoo\nvar x = 1\n#endregion done\n# region\n#region\nvar y = 1\n");
         var statements = ast.statements();
-        var foo = assertInstanceOf(RegionDirectiveStatement.class, statements.get(0));
+        var foo = assertInstanceOf(RegionDirectiveStatement.class, statements.getFirst());
         assertEquals("start", foo.directive());
         assertEquals("foo", foo.label());
         var end = assertInstanceOf(RegionDirectiveStatement.class, statements.get(2));
@@ -2204,7 +2213,7 @@ class GdScriptParserTest {
         var ast = cleanAst("func f():\n\t# first\n\tpass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var body = function.body().statements();
-        assertEquals("# first", assertInstanceOf(CommentStatement.class, body.get(0)).text());
+        assertEquals("# first", assertInstanceOf(CommentStatement.class, body.getFirst()).text());
         assertInstanceOf(PassStatement.class, body.get(1));
     }
 
@@ -2213,7 +2222,7 @@ class GdScriptParserTest {
         var ast = cleanAst("func f():\n\tpass\n# hello\nfunc g():\n\tpass\n");
         var statements = ast.statements();
         assertEquals(3, statements.size());
-        var f = assertInstanceOf(FunctionDeclaration.class, statements.get(0));
+        var f = assertInstanceOf(FunctionDeclaration.class, statements.getFirst());
         // f's body keeps only `pass`; the col-0 comment lands at the top level.
         assertEquals(1, f.body().statements().size());
         assertEquals("# hello", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
@@ -2224,7 +2233,7 @@ class GdScriptParserTest {
     void indentedTailCommentStaysInBody() {
         var ast = cleanAst("class Inner:\n\tpass\n\t# inner\nvar x = 1\n");
         var statements = ast.statements();
-        var inner = assertInstanceOf(ClassDeclaration.class, statements.get(0));
+        var inner = assertInstanceOf(ClassDeclaration.class, statements.getFirst());
         // The indented comment reaches the class-body indentation, so it stays inside and the
         // body block extends over it.
         assertEquals(2, inner.body().statements().size());
@@ -2248,7 +2257,7 @@ class GdScriptParserTest {
     void trailingCommentExtendsSingleLineSuite() {
         var ast = cleanAst("func f():\n\tif x: pass # c\n\tpass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
-        var ifStatement = assertInstanceOf(IfStatement.class, function.body().statements().get(0));
+        var ifStatement = assertInstanceOf(IfStatement.class, function.body().statements().getFirst());
         var ifBody = ifStatement.body().statements();
         assertEquals(2, ifBody.size());
         assertEquals("# c", assertInstanceOf(CommentStatement.class, ifBody.get(1)).text());
@@ -2260,12 +2269,12 @@ class GdScriptParserTest {
         // Both paths drop comments trailing a suite-header line.
         var ast = cleanAst("func f(): # c\n\tpass\nfunc g():\n\tif x: # i\n\t\tpass\n\telse: # e\n\t\tpass\n");
         var statements = ast.statements();
-        var f = assertInstanceOf(FunctionDeclaration.class, statements.get(0));
+        var f = assertInstanceOf(FunctionDeclaration.class, statements.getFirst());
         assertEquals(1, f.body().statements().size());
         var g = assertInstanceOf(FunctionDeclaration.class, statements.get(1));
         var ifStatement = assertInstanceOf(IfStatement.class, g.body().statements().getFirst());
         assertEquals(1, ifStatement.body().statements().size());
-        assertEquals(1, ifStatement.elseBody().statements().size());
+        assertEquals(1, requireNotNull(ifStatement.elseBody()).statements().size());
     }
 
     @Test
@@ -2294,19 +2303,19 @@ class GdScriptParserTest {
         var ast = cleanAst("@export\n# note\nvar x = 1\n");
         var statements = ast.statements();
         assertEquals(3, statements.size());
-        assertInstanceOf(AnnotationStatement.class, statements.get(0));
+        assertInstanceOf(AnnotationStatement.class, statements.getFirst());
         assertEquals("# note", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
         assertInstanceOf(VariableDeclaration.class, statements.get(2));
 
         var reordered = cleanAst("# note\n@export\nvar x = 1\n");
         var reorderedStatements = reordered.statements();
-        assertEquals("# note", assertInstanceOf(CommentStatement.class, reorderedStatements.get(0)).text());
+        assertEquals("# note", assertInstanceOf(CommentStatement.class, reorderedStatements.getFirst()).text());
         assertInstanceOf(AnnotationStatement.class, reorderedStatements.get(1));
     }
 
     @Test
     void newlineBetweenStaticAndMemberIsRejectedLikeGodot() {
-        // Registered §5.7 (ii) divergence: the reference path accepts (and spans) a newline
+        // A registered parity divergence: the reference path accepts (and spans) a newline
         // between `static` and the member; Godot rejects it immediately.
         var result = parse("static\nvar x = 1\n");
         assertTrue(errorMessages(result).contains("Expected \"func\" or \"var\" after \"static\"."));
@@ -2326,7 +2335,7 @@ class GdScriptParserTest {
 
     @Test
     void commentOnlyBodyIsRejectedLikeGodot() {
-        // Registered §5.7 (ii) divergence: comment-only lines never establish indentation, so a
+        // A registered parity divergence: comment-only lines never establish indentation, so a
         // body with only comments is a missing indented block (the reference path accepts it).
         var result = parse("func f():\n\t# only\nvar x = 1\n");
         assertTrue(errorMessages(result).contains("Expected indented block after function declaration."));
@@ -2358,7 +2367,7 @@ class GdScriptParserTest {
         var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
         var call = assertInstanceOf(CallExpression.class, declaration.value());
         assertEquals(2, call.arguments().size());
-        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().get(0));
+        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
         assertEquals(1, lambda.body().statements().size());
         assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
     }
@@ -2412,8 +2421,8 @@ class GdScriptParserTest {
 
     @Test
     void matchBodyColZeroCommentIsDroppedLikeGodot() {
-        // Registered §5.7 (ii): a col-0 comment between branches is trivia to Godot (and this
-        // parser) but breaks the reference grammar, so there is no parity promise.
+        // A registered parity divergence: a col-0 comment between branches is trivia to Godot
+        // (and this parser) but breaks the reference grammar, so there is no parity promise.
         var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t1: pass\n# low\n\t\t2: pass\n\tpass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
@@ -2428,7 +2437,7 @@ class GdScriptParserTest {
         // The sequence comment before the annotation materializes; the argument-list-internal
         // one is silently ignored (registered parity difference).
         assertEquals(3, statements.size());
-        assertEquals("# before", assertInstanceOf(CommentStatement.class, statements.get(0)).text());
+        assertEquals("# before", assertInstanceOf(CommentStatement.class, statements.getFirst()).text());
         assertInstanceOf(AnnotationStatement.class, statements.get(1));
         assertInstanceOf(VariableDeclaration.class, statements.get(2));
         assertFalse(statements.stream().anyMatch(s -> s instanceof CommentStatement c
@@ -2437,13 +2446,13 @@ class GdScriptParserTest {
 
     @Test
     void multiDedentMixedIndentCommentRunKeepsSimpleRule() {
-        // Registered §5.4 known difference: the reference scanner's col-0-comment lookahead
+        // A registered known difference: the reference scanner's col-0-comment lookahead
         // backfills indentation across levels (an upstream-acknowledged heuristic), while this
         // parser applies the plain indentation-threshold rule — a mixed run at a multi-dedent
         // boundary lands at the top level here instead of the middle body.
         var ast = cleanAst("class Outer:\n    class Inner:\n        pass\n# low\n        # high\nvar after = 1\n");
         var statements = ast.statements();
-        assertInstanceOf(ClassDeclaration.class, statements.get(0));
+        assertInstanceOf(ClassDeclaration.class, statements.getFirst());
         assertEquals("# low", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
         assertEquals("# high", assertInstanceOf(CommentStatement.class, statements.get(2)).text());
         assertInstanceOf(VariableDeclaration.class, statements.get(3));
@@ -2465,7 +2474,7 @@ class GdScriptParserTest {
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         var body = function.body().statements();
         assertEquals(2, body.size());
-        var returnStatement = assertInstanceOf(ReturnStatement.class, body.get(0));
+        var returnStatement = assertInstanceOf(ReturnStatement.class, body.getFirst());
         assertInstanceOf(LambdaExpression.class, returnStatement.value());
         var unary = assertInstanceOf(ExpressionStatement.class, body.get(1));
         assertInstanceOf(UnaryExpression.class, unary.expression());
@@ -2484,13 +2493,13 @@ class GdScriptParserTest {
 
         // A comment after the keyword stays a lambda-body comment.
         var withBody = cleanAst("var x = g(\n\tfunc():\n\t\t# body\n\t\treturn 2\n)\n");
-        var bodyLambda = assertInstanceOf(LambdaExpression.class,
-                assertInstanceOf(CallExpression.class,
-                        assertInstanceOf(VariableDeclaration.class, onlyStatement(withBody)).value())
-                        .arguments().get(0));
+        var bodyLambda = requireNotNull(assertInstanceOf(LambdaExpression.class,
+                requireNotNull(assertInstanceOf(CallExpression.class,
+                        assertInstanceOf(VariableDeclaration.class, onlyStatement(withBody)).value()))
+                        .arguments().getFirst()));
         assertEquals(2, bodyLambda.body().statements().size());
         assertEquals("# body", assertInstanceOf(CommentStatement.class,
-                bodyLambda.body().statements().get(0)).text());
+                bodyLambda.body().statements().getFirst()).text());
     }
 
     @Test
@@ -2501,16 +2510,16 @@ class GdScriptParserTest {
         var ast = cleanAst("# before\n@custom(\n\t# internal\n\tfunc():\n\t\t# body\n\t\treturn 2\n)\nvar x = 1\n");
         var statements = ast.statements();
         assertEquals(3, statements.size());
-        assertEquals("# before", assertInstanceOf(CommentStatement.class, statements.get(0)).text());
+        assertEquals("# before", assertInstanceOf(CommentStatement.class, statements.getFirst()).text());
         assertInstanceOf(AnnotationStatement.class, statements.get(1));
         assertInstanceOf(VariableDeclaration.class, statements.get(2));
         assertFalse(statements.stream().anyMatch(s -> s instanceof CommentStatement c
                 && c.text().contains("internal")));
         var annotation = assertInstanceOf(AnnotationStatement.class, statements.get(1));
-        var lambda = assertInstanceOf(LambdaExpression.class, annotation.arguments().getFirst());
+        var lambda = requireNotNull(assertInstanceOf(LambdaExpression.class, annotation.arguments().getFirst()));
         assertEquals(2, lambda.body().statements().size());
         assertEquals("# body", assertInstanceOf(CommentStatement.class,
-                lambda.body().statements().get(0)).text());
+                lambda.body().statements().getFirst()).text());
     }
 
     @Test
@@ -2550,10 +2559,10 @@ class GdScriptParserTest {
         // The inner lambda's fence must not swallow comments of the outer lambda's body.
         var ast = cleanAst("var x = g(func():\n\t# outerBody\n\t@custom(func(): return 2)\n\tvar y = 1\n\treturn y\n)\n");
         var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
-        var outer = assertInstanceOf(LambdaExpression.class,
-                assertInstanceOf(CallExpression.class, declaration.value()).arguments().getFirst());
+        var outer = requireNotNull(assertInstanceOf(LambdaExpression.class,
+                requireNotNull(assertInstanceOf(CallExpression.class, declaration.value())).arguments().getFirst()));
         assertEquals("# outerBody", assertInstanceOf(CommentStatement.class,
-                outer.body().statements().get(0)).text());
+                outer.body().statements().getFirst()).text());
         assertEquals(4, outer.body().statements().size());
     }
 
@@ -2561,7 +2570,7 @@ class GdScriptParserTest {
     void matchTailDiscardedCommentsStillSpanMatchExtent() {
         var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t_: pass\n\t\t# branch\n\treturn 3\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
-        var match = assertInstanceOf(MatchStatement.class, function.body().statements().get(0));
+        var match = requireNotNull(assertInstanceOf(MatchStatement.class, function.body().statements().getFirst()));
         // The tail branch-level comment produces no node, but the match node spans it (the
         // reference path's extent covers it too).
         assertEquals(new Range(12, 41, new Point(1, 1), new Point(3, 10)), match.range());
@@ -2570,14 +2579,14 @@ class GdScriptParserTest {
 
     @Test
     void singleDedentMixedIndentCommentRunKeepsSimpleRule() {
-        // The multi-level mixed-run difference (§5.4 registered) also applies to a single
-        // dedent: the reference scanner backfills the col-0 comment's level from the following
-        // indented comment, this parser keeps the plain threshold rule.
+        // The multi-level mixed-run difference (a registered known difference) also applies to a
+        // single dedent: the reference scanner backfills the col-0 comment's level from the
+        // following indented comment, this parser keeps the plain threshold rule.
         var ast = cleanAst("func f():\n\tpass\n# low\n\t# high\nvar after = 1\n");
         var statements = ast.statements();
         assertEquals(4, statements.size());
-        assertInstanceOf(FunctionDeclaration.class, statements.get(0));
-        assertEquals(1, assertInstanceOf(FunctionDeclaration.class, statements.get(0))
+        assertInstanceOf(FunctionDeclaration.class, statements.getFirst());
+        assertEquals(1, assertInstanceOf(FunctionDeclaration.class, statements.getFirst())
                 .body().statements().size());
         assertEquals("# low", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
         assertEquals("# high", assertInstanceOf(CommentStatement.class, statements.get(2)).text());
@@ -2598,16 +2607,16 @@ class GdScriptParserTest {
     void lambdaBareReturnForms() {
         // `return` at the end of the line stays a bare return…
         var ast = cleanAst("var f = func(): return\n");
-        var lambda = assertInstanceOf(LambdaExpression.class,
-                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        var lambda = requireNotNull(assertInstanceOf(LambdaExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value()));
         assertNull(assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst()).value());
         // …and `return` right before the call's closing paren parses as bare too (the vendor
         // rescues the failed value parse into no-return without an error).
         var inCall = cleanAst("var x = g(func(): return)\n");
-        var callLambda = assertInstanceOf(LambdaExpression.class,
-                assertInstanceOf(CallExpression.class,
-                        assertInstanceOf(VariableDeclaration.class, onlyStatement(inCall)).value())
-                        .arguments().get(0));
+        var callLambda = requireNotNull(assertInstanceOf(LambdaExpression.class,
+                requireNotNull(assertInstanceOf(CallExpression.class,
+                        assertInstanceOf(VariableDeclaration.class, onlyStatement(inCall)).value()))
+                        .arguments().getFirst()));
         assertNull(assertInstanceOf(ReturnStatement.class,
                 callLambda.body().statements().getFirst()).value());
     }

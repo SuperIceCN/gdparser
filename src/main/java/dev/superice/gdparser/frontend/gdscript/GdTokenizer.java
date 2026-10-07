@@ -381,7 +381,7 @@ public final class GdTokenizer {
                 }
                 yield makeToken(GdTokenType.PERIOD);
             }
-            // D1: '+'/'-' never absorb a following number; they always yield operator
+            // '+'/'-' never absorb a following number; they always yield operator
             // tokens (Godot's `can_precede_bin_op` sign-absorption branch is removed).
             case '+' -> {
                 if (peek() == '=') {
@@ -734,7 +734,7 @@ public final class GdTokenizer {
 
     /// Port of `number()`. Handles decimal/hex (`0x`)/binary (`0b`) integers, decimals,
     /// exponents and `_` separators, queueing Godot's exact numeric errors. The sign
-    /// prefix branch is removed: signs never reach this method (see class-level D1 note).
+    /// prefix branch is removed: signs never reach this method (see the class-level note).
     private GdToken number() {
         var base = 10;
         var hasDecimal = false;

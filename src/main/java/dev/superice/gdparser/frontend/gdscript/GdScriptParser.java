@@ -148,7 +148,9 @@ public final class GdScriptParser {
     /// used by the ported constructor-return-value check; `null` outside any function.
     private @Nullable String currentFunctionName;
     /// Comment trivia in source order plus the consumption cursor. Comments never enter the token
-    /// stream; sequence boundaries materialize or discard them per the §5.4 attribution rules.
+    /// stream; sequence boundaries materialize or discard them per the attribution rules (trailing
+    /// comments land right after their statement, whole-line comments hold source position, and
+    /// less-indented comments at a dedent boundary stay pending for the outer sequence).
     /// A lambda body temporarily defers the prefix before its `func` keyword (see
     /// {@link #deferCommentsBefore}) and restores it afterwards, which is why the list is mutable.
     private List<GdComment> comments = List.of();
@@ -162,8 +164,8 @@ public final class GdScriptParser {
     /// Shared budget for every input-driven recursion entry (expressions via `parsePrecedence`,
     /// suites, match patterns, nested classes). Godot has no explicit limit — its C++ stack
     /// tolerates far deeper inputs — but on the JVM a pathological input such as 4096 nested
-    /// `(` overflows the stack before any diagnostic can be produced, violating the §5.7
-    /// recovery contract (illegal sources must yield diagnostics, never exceptions). 256 keeps
+    /// `(` overflows the stack before any diagnostic can be produced, violating the recovery
+    /// contract that illegal sources must yield diagnostics, never exceptions. 256 keeps
     /// roughly an order of magnitude below the overflow point on a default JVM thread stack
     /// while real-world nesting rarely exceeds a few dozen levels.
     private static final int MAX_NESTING_DEPTH = 256;
@@ -371,7 +373,7 @@ public final class GdScriptParser {
         comments.addAll(commentCursor, deferredCommentStack.removeLast());
     }
 
-    /// Materializes one comment trivia as a statement node per the §5.4 rules: `#region…` /
+    /// Materializes one comment trivia as a statement node: `#region…` /
     /// `#endregion…` become `RegionDirectiveStatement` (start label is the text after the
     /// keyword, trimmed, `null` when empty; the end label is always `null`), everything else a
     /// `CommentStatement` with the full comment text (leading `#` included).
@@ -426,7 +428,7 @@ public final class GdScriptParser {
     }
 
     /// Drains trailing (end-of-line) comments passed since the last statement: they materialize
-    /// as the same sequence's siblings right after the statement they follow (§5.4).
+    /// as the same sequence's siblings right after the statement they follow.
     private @NotNull List<Statement> drainTrailingComments() {
         var drained = new ArrayList<Statement>();
         while (true) {
@@ -442,7 +444,7 @@ public final class GdScriptParser {
 
     /// Tail drain at a dedent boundary: whole-line comments materialize into this body only
     /// while their indentation reaches the body's indentation (merged with dangling annotations
-    /// in byte order); less-indented comments stay pending for the outer sequence (§5.4).
+    /// in byte order); less-indented comments stay pending for the outer sequence.
     private @NotNull List<Statement> drainTailWithAnnotations(int bodyIndent) {
         var drained = new ArrayList<Statement>();
         while (true) {
@@ -524,7 +526,6 @@ public final class GdScriptParser {
             switch (current.type()) {
                 case CLASS, FUNC, STATIC, VAR, CONST, SIGNAL, FOR, WHILE, MATCH, RETURN, ANNOTATION -> {
                     // Stop before the sync token without consuming it.
-                    nestingBudgetExceeded = false;
                     panicMode = false;
                     return;
                 }
@@ -840,7 +841,7 @@ public final class GdScriptParser {
     /// produces a `PassStatement` (this AST keeps it).
     /// `bodyIndent` is the indentation width of the body's members (0 for the top-level body):
     /// whole-line comments in the tail window before the closing dedent belong to this body only
-    /// when they reach that indentation (§5.4 tail-attribution rule).
+    /// when they reach that indentation.
     private void parseClassBody(boolean multiline, List<Statement> statements, int bodyIndent) {
         var classEnd = false;
         var nextIsStatic = false;
@@ -922,7 +923,7 @@ public final class GdScriptParser {
             if (token.type() != GdTokenType.STATIC) {
                 nextIsStatic = false;
             }
-            // A comment trailing the member's own line lands right after it (§5.4).
+            // A comment trailing the member's own line lands right after it.
             statements.addAll(drainTrailingComments());
             if (panicMode) {
                 synchronize();
@@ -1305,7 +1306,7 @@ public final class GdScriptParser {
         if (result != null) {
             produced.add(result);
         }
-        // A comment trailing the statement's own line lands right after it (§5.4).
+        // A comment trailing the statement's own line lands right after it.
         produced.addAll(drainTrailingComments());
         if (panicMode) {
             synchronize();
@@ -1487,9 +1488,9 @@ public final class GdScriptParser {
     }
 
     /// Port of `GDScriptParser::parse_match`. Branch-level `pass` is consumed without a node and
-    /// branch-level annotations other than `@warning_ignore` are rejected (both registered in
-    /// §5.7 (ii): the reference path errors/drops differently). The statement's range ends at the
-    /// last branch, before the closing DEDENT.
+    /// branch-level annotations other than `@warning_ignore` are rejected (the reference path
+    /// errors/drops differently — a registered parity divergence). The statement's range ends at
+    /// the last branch, before the closing DEDENT.
     private @Nullable Statement parseMatch() {
         var start = statementStartByte;
         var value = parseExpression(false);
@@ -1528,7 +1529,7 @@ public final class GdScriptParser {
                 continue;
             }
             // The reference path drops comments at the match branch level (a col-0 comment
-            // between branches even breaks its grammar — registered §5.7 (ii)).
+            // between branches even breaks its grammar — a registered parity divergence).
             discardPendingComments();
             if (match(GdTokenType.PASS)) {
                 consume(GdTokenType.NEWLINE, "Expected newline after \"pass\".");
@@ -1583,7 +1584,7 @@ public final class GdScriptParser {
     /// Port of `GDScriptParser::parse_match_branch`: comma-separated patterns, optional `when`
     /// guard, colon, and the branch suite. The section range spans from the first pattern to the
     /// suite end. The vendor's bind-conflict checks (multiple patterns with a bind, duplicate or
-    /// shadowing binds) are deferred with the other symbol-table-dependent checks (§5.6).
+    /// shadowing binds) are symbol-table-dependent and deferred to the analysis layer.
     private @NotNull MatchSection parseMatchSection() {
         var start = current.startByte();
         var patterns = new ArrayList<Expression>();
@@ -2518,7 +2519,7 @@ public final class GdScriptParser {
         private static final ParseRule NONE = new ParseRule(null, null, Precedence.NONE);
     }
 
-    /// Port of `GDScriptParser::get_rule()` for the Phase 2/3 expression slice: literals,
+    /// Port of `GDScriptParser::get_rule()` for the ported expression slice: literals,
     /// identifiers, `self`, the full unary/binary operator families, grouping/array/dictionary
     /// prefixes, `await`/`preload`/`super`/get-node prefixes, ternary, `as`/`is`/`not in`, the
     /// assignment family, and the call/attribute/subscript suffixes. Identifier-like tokens
@@ -2901,7 +2902,8 @@ public final class GdScriptParser {
     /// name follows vendor `consume(IDENTIFIER)`, which accepts the whole `is_identifier()` set
     /// (`match`/`when`/builtin constants, e.g. `super.match()`) but not the wider
     /// `is_node_name()` set. Godot's "implicit super() outside a function" check needs
-    /// function-context tracking and is outside the ported parse-time check set (plan §5.6).
+    /// function-context tracking and is outside the ported parse-time check set, left to the
+    /// analysis layer.
     private @Nullable Expression parseSuperExpression() {
         var superToken = previous;
         var superIdentifier = new IdentifierExpression("super", tokenRange(superToken));
@@ -3061,8 +3063,8 @@ public final class GdScriptParser {
     /// operator text comes from the token source (`"="` for plain assignment). The right-hand
     /// side parses with assignment disallowed, so `a = b = 1` reports the nested-assignment
     /// error exactly like Godot. The vendor's assignee node-type check (`SUBSCRIPT`/`IDENTIFIER`)
-    /// is a parse-time semantic check outside the ported set (plan §5.6) and is not enforced;
-    /// invalid targets produce an `AssignmentExpression` for the analyzer to reject.
+    /// is a parse-time semantic check outside the ported set and is not enforced, left to the
+    /// analysis layer; invalid targets produce an `AssignmentExpression` for the analyzer to reject.
     private @Nullable Expression parseAssignment(@Nullable Expression left, Precedence entryPrecedence,
                                                  boolean canAssign, int extentStart) {
         var operator = previous;

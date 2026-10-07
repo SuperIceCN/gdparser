@@ -19,9 +19,9 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 /// intentionally excluded here and covered by dedicated Godot-structure tests.
 class GdParserParityTest extends GdParserParityTestSupport {
 
-    /// Phase 4 acceptance gate: all 13 fixtures must pass full-file dual-path parity, exercising
-    /// statements, control flow, lambdas, match patterns, properties, comments and regions
-    /// together (§5.7 (i); the whitelist stays limited to the registered entries).
+    /// All 13 fixtures must pass full-file dual-path parity, exercising statements, control flow,
+    /// lambdas, match patterns, properties, comments and regions together; the divergence
+    /// whitelist stays limited to the registered entries.
     @TestFactory
     List<DynamicTest> fixtureFullFileParity() throws IOException {
         var tests = new ArrayList<DynamicTest>();
@@ -221,7 +221,7 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("func f():\n\ta = b if c else d\n");
     }
 
-    /// Representative two-operator cross-family combos from the precedence matrix. §5.8
+    /// Representative two-operator cross-family combos from the precedence matrix. The known
     /// divergence combos (`*` followed by `**`, unary sign before `**`, additive left of `as`)
     /// are excluded here and pinned as Godot structures in `GdScriptParserTest`.
     @Test
@@ -245,8 +245,8 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("var a = x if c else y if d else z\n");
     }
 
-    /// Control-flow statements share the same AST contract on both paths (§5.2 folding); every
-    /// sample must serialize byte-identically, ranges included.
+    /// Control-flow statements share the same AST contract on both paths (elif-chain folding
+    /// included); every sample must serialize byte-identically, ranges included.
     @Test
     void controlFlowParity() {
         assertCleanParity("func f(x):\n\tif x > 0:\n\t\treturn 1\n\telif x < 0:\n\t\treturn -1\n\telse:\n\t\treturn 0\n");
@@ -270,9 +270,10 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("func f():\n\twhile x:\n\t\tpass\n\twhile y: pass\n\tpass\n");
     }
 
-    /// Match sections and every pattern form. Branch-level `pass` is excluded (§5.7 (ii): the
-    /// reference path rejects it); key-only dictionary patterns and `@warning_ignore` are kept:
-    /// both paths drop the same information, so the ASTs still match byte-identically.
+    /// Match sections and every pattern form. Branch-level `pass` is excluded (the reference path
+    /// rejects it — a registered parity divergence); key-only dictionary patterns and
+    /// `@warning_ignore` are kept: both paths drop the same information, so the ASTs still match
+    /// byte-identically.
     @Test
     void matchParity() {
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t1:\n\t\t\tpass\n\t\tvar a:\n\t\t\tpass\n\t\t_:\n\t\t\tpass\n");
@@ -305,9 +306,9 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("var f = func(): return\n");
     }
 
-    /// Comment/region attribution per §5.4: trailing, whole-line, dedent boundaries, annotation
+    /// Comment/region attribution: trailing, whole-line, dedent boundaries, annotation
     /// and static interleavings, single-line suites. Expression-internal comments are excluded
-    /// (registered parity difference); header-line and match-level comments are kept (both paths
+    /// (a registered parity difference); header-line and match-level comments are kept (both paths
     /// drop them identically).
     @Test
     void commentAttributionParity() {

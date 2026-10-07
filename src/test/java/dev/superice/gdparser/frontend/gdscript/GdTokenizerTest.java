@@ -203,7 +203,7 @@ class GdTokenizerTest {
 
     @Test
     void signsAreNeverAbsorbedIntoNumbers() {
-        // D1: unary signs stay separate tokens regardless of the preceding token, so the
+        // Unary signs stay separate tokens regardless of the preceding token, so the
         // parser can model them as UnaryExpression.
         assertTypes("-2", GdTokenType.MINUS, GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF);
         assertTypes("+3", GdTokenType.PLUS, GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF);
@@ -428,8 +428,8 @@ class GdTokenizerTest {
     void blankAndCommentOnlyLinesProduceNoNewlineOrIndent() {
         var tokens = tokenize("var a = 1\n\n# comment\n  \n# c2\nvar b = 2");
         assertEquals(List.of(GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL,
-                GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.VAR, GdTokenType.IDENTIFIER,
-                GdTokenType.EQUAL, GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF),
+                        GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.VAR, GdTokenType.IDENTIFIER,
+                        GdTokenType.EQUAL, GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF),
                 typesOf(tokens));
     }
 
@@ -621,8 +621,8 @@ class GdTokenizerTest {
     void crlfNewlinesAreNormalized() {
         var tokens = tokenize("var a = 1\r\nvar b = 2\r\n");
         assertEquals(List.of(GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL,
-                GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.VAR, GdTokenType.IDENTIFIER,
-                GdTokenType.EQUAL, GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF),
+                        GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.VAR, GdTokenType.IDENTIFIER,
+                        GdTokenType.EQUAL, GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF),
                 typesOf(tokens));
         assertTrue(errorsOf(tokens).isEmpty());
         // The NEWLINE token covers only the '\n' byte; '\r' stays on the previous row.

@@ -188,11 +188,11 @@ The Godot-port stack reports tokenizer errors (from `ERROR` tokens) and parser e
 
 - Illegal sources always terminate with diagnostics — never exceptions; a nesting-depth budget (256) guards the JVM stack against pathological nesting (Godot has no such limit; deliberate deviation)
 - Failed constructs may be omitted or yield partial nodes/empty blocks depending on the construct; expected-but-absent tokens and malformed constructs are reported as `ERROR` diagnostics (nodeType `"ERROR"`). This path never synthesizes `ErrorStatement`/`ErrorExpression` nodes or `MISSING`-kind issues — those belong to the tree-sitter CST model
-- Known recovery limitation: a depth-budget trip on a multiline grouping continuation line can mis-attribute sibling scopes (registered in the implementation plan; diagnostics and termination still hold)
+- Known recovery limitation: a depth-budget trip on a multiline grouping continuation line can mis-attribute sibling scopes (registered in `doc/godot-java-parser-implementation.md` §9; diagnostics and termination still hold)
 
 ### Parity rule index
 
-The canonical contract for dual-path equivalence lives in `doc/godot-java-parser-implementation-plan.md`:
+The canonical contract for dual-path equivalence lives in `doc/godot-java-parser-implementation.md`:
 
 - §5.1-§5.6: AST shape adaptation, literal kind vocabulary, comment/trivia attribution, sign-absorption deviation, diagnostic message alignment
 - §5.7: divergence registration policy — legal sources must serialize identically across both paths; registered divergences and illegal sources follow their own assertion clauses
@@ -259,7 +259,7 @@ Recommended targeted runs during iteration:
 - Linux/macOS end-to-end validation in CI is still pending
 - AST golden snapshot (`input.gd -> ast.json`) baseline is not yet established
 - S-expression protocol version header is not yet explicit
-- Performance regression thresholds are not formalized (a Godot-port fixture timing baseline is recorded in the implementation plan, Phase 6)
+- Performance regression thresholds are not formalized (a Godot-port fixture timing baseline is recorded in `doc/godot-java-parser-implementation.md` §1.2)
 
 ## 9. New Maintainer Quick Start
 
