@@ -2,6 +2,7 @@ package dev.superice.gdparser.frontend.gdscript;
 
 import dev.superice.gdparser.frontend.ast.AnnotationStatement;
 import dev.superice.gdparser.frontend.ast.ArrayExpression;
+import dev.superice.gdparser.frontend.ast.AssertStatement;
 import dev.superice.gdparser.frontend.ast.AssignmentExpression;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
@@ -14,28 +15,42 @@ import dev.superice.gdparser.frontend.ast.AttributeSubscriptStep;
 import dev.superice.gdparser.frontend.ast.AwaitExpression;
 import dev.superice.gdparser.frontend.ast.BinaryExpression;
 import dev.superice.gdparser.frontend.ast.Block;
+import dev.superice.gdparser.frontend.ast.BreakStatement;
+import dev.superice.gdparser.frontend.ast.BreakpointStatement;
 import dev.superice.gdparser.frontend.ast.CallExpression;
 import dev.superice.gdparser.frontend.ast.CastExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.ClassNameStatement;
+import dev.superice.gdparser.frontend.ast.CommentStatement;
 import dev.superice.gdparser.frontend.ast.ConditionalExpression;
 import dev.superice.gdparser.frontend.ast.ConstructorDeclaration;
+import dev.superice.gdparser.frontend.ast.ContinueStatement;
 import dev.superice.gdparser.frontend.ast.DeclarationKind;
 import dev.superice.gdparser.frontend.ast.DictEntry;
 import dev.superice.gdparser.frontend.ast.DictionaryExpression;
+import dev.superice.gdparser.frontend.ast.ElifClause;
 import dev.superice.gdparser.frontend.ast.EnumDeclaration;
 import dev.superice.gdparser.frontend.ast.EnumMember;
 import dev.superice.gdparser.frontend.ast.Expression;
 import dev.superice.gdparser.frontend.ast.ExpressionStatement;
 import dev.superice.gdparser.frontend.ast.ExtendsStatement;
+import dev.superice.gdparser.frontend.ast.ForStatement;
 import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
 import dev.superice.gdparser.frontend.ast.GetNodeExpression;
 import dev.superice.gdparser.frontend.ast.IdentifierExpression;
+import dev.superice.gdparser.frontend.ast.IfStatement;
+import dev.superice.gdparser.frontend.ast.LambdaExpression;
 import dev.superice.gdparser.frontend.ast.LiteralExpression;
+import dev.superice.gdparser.frontend.ast.MatchSection;
+import dev.superice.gdparser.frontend.ast.MatchStatement;
+import dev.superice.gdparser.frontend.ast.Node;
 import dev.superice.gdparser.frontend.ast.Parameter;
 import dev.superice.gdparser.frontend.ast.PassStatement;
+import dev.superice.gdparser.frontend.ast.PatternBindingExpression;
 import dev.superice.gdparser.frontend.ast.PreloadExpression;
 import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.RegionDirectiveStatement;
+import dev.superice.gdparser.frontend.ast.ReturnStatement;
 import dev.superice.gdparser.frontend.ast.SelfExpression;
 import dev.superice.gdparser.frontend.ast.SignalStatement;
 import dev.superice.gdparser.frontend.ast.SourceFile;
@@ -45,6 +60,7 @@ import dev.superice.gdparser.frontend.ast.TypeRef;
 import dev.superice.gdparser.frontend.ast.TypeTestExpression;
 import dev.superice.gdparser.frontend.ast.UnaryExpression;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
+import dev.superice.gdparser.frontend.ast.WhileStatement;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -91,6 +107,17 @@ public final class GdScriptParser {
     private GdToken current;
     private GdToken previous;
     private final Deque<Boolean> multilineStack = new ArrayDeque<>();
+    /// Start byte of the token that opened each multiline frame, parallel to `multilineStack`.
+    private final Deque<Integer> multilineStartStack = new ArrayDeque<>();
+    /// Source spans of closed grouping frames. Comments inside them are grouping-internal: the
+    /// reference path materializes them as unknown-expression placeholders, which this parser
+    /// cannot reproduce (registered parity difference), so every drain skips them. Recording
+    /// spans (instead of discarding at the pop) keeps sequence comments pending before the
+    /// grouping from blocking the skip.
+    private final List<int[]> groupingCommentSpans = new ArrayList<>();
+    /// Deferred comment prefixes of enclosing lambda bodies, innermost last. Restored to the
+    /// cursor head when each body finishes (see {@link #deferCommentsBefore}).
+    private final Deque<List<GdComment>> deferredCommentStack = new ArrayDeque<>();
     private final List<AstDiagnostic> diagnostics = new ArrayList<>();
     private boolean panicMode;
 
@@ -111,6 +138,30 @@ public final class GdScriptParser {
     /// Whether the script-level `extends` was already used (set by both the standalone and the
     /// same-line `class_name … extends` forms; Godot tracks it on the root class node).
     private boolean scriptExtendsUsed;
+    /// Loop-context flags for the ported `break`/`continue` checks (vendor `can_break`/
+    /// `can_continue`): enabled around loop suites, disabled around lambda bodies, both with
+    /// save/restore so nested constructs never leak state into siblings.
+    private boolean canBreak;
+    private boolean canContinue;
+    /// Lambda-boundary states (vendor `in_lambda`/`lambda_ended`): they participate in
+    /// `isStatementEnd()` because a lambda body may end a statement without a newline token.
+    private boolean inLambda;
+    private boolean lambdaEnded;
+    /// Name of the innermost enclosing function/lambda (vendor `current_function->identifier`),
+    /// used by the ported constructor-return-value check; `null` outside any function.
+    private @Nullable String currentFunctionName;
+    /// Comment trivia in source order plus the consumption cursor. Comments never enter the token
+    /// stream; sequence boundaries materialize or discard them per the §5.4 attribution rules.
+    /// A lambda body temporarily defers the prefix before its `func` keyword (see
+    /// {@link #deferCommentsBefore}) and restores it afterwards, which is why the list is mutable.
+    private List<GdComment> comments = List.of();
+    private int commentCursor;
+    /// Right-edge override for expression spans ending in a lambda, or -1. A lambda body's
+    /// trailing `end_statement` may already have consumed the following layout token (NEWLINE/
+    /// DEDENT) before the enclosing expression captures its extent; the reference path never
+    /// spans enclosing extents over that token, so the lambda records its body end here. Any
+    /// token consumed afterwards (see `advance`) invalidates the override.
+    private int trailingLambdaEndByte = -1;
 
     public GdScriptParser() {
     }
@@ -124,15 +175,31 @@ public final class GdScriptParser {
         sourceBytes = source.getBytes(StandardCharsets.UTF_8);
         index = tokenizer.sourceTextIndex();
         multilineStack.clear();
+        multilineStartStack.clear();
         diagnostics.clear();
         pendingAnnotations.clear();
         panicMode = false;
         lastStatementWasNull = false;
         scriptExtendsUsed = false;
+        canBreak = false;
+        canContinue = false;
+        inLambda = false;
+        lambdaEnded = false;
+        currentFunctionName = null;
+        comments = tokenizer.modifiableComments();
+        commentCursor = 0;
+        groupingCommentSpans.clear();
+        deferredCommentStack.clear();
+        trailingLambdaEndByte = -1;
         previous = new GdToken(GdTokenType.EMPTY, "", GdLiteralKind.NONE, null, 0, 0, 1, 1, 1, 1);
         current = scanSkippingErrors();
 
         var statements = parseProgram();
+        // Vendor invariant (debug-only there): the multiline stack must be balanced by the end
+        // of the parse. Surfacing an imbalance here beats silently mis-parsing the next file.
+        if (!multilineStack.isEmpty() || !multilineStartStack.isEmpty()) {
+            throw new IllegalStateException("GDScript parser bug: unbalanced multiline stack at end of parse.");
+        }
         var fileRange = statements.isEmpty()
                 ? range(index.utf8Length(), index.utf8Length())
                 : range(0, index.utf8Length());
@@ -161,8 +228,19 @@ public final class GdScriptParser {
         if (current.type() == GdTokenType.EOF) {
             throw new IllegalStateException("GDScript parser bug: trying to advance past the end of stream.");
         }
+        // Vendor clears the lambda-end marker on every real token advance (a stale marker would
+        // otherwise end a following statement early, e.g. `return` after a lambda argument).
+        lambdaEnded = false;
+        trailingLambdaEndByte = -1;
         previous = current;
         current = scanSkippingErrors();
+    }
+
+    /// End byte of the consumed span of the expression most recently parsed at this level:
+    /// normally the last consumed token's end, but a trailing lambda's body end when the
+    /// lambda's internal trailing machinery already consumed the following layout token.
+    private int extentEnd() {
+        return trailingLambdaEndByte >= 0 ? trailingLambdaEndByte : previous.endByte();
     }
 
     private boolean match(GdTokenType type) {
@@ -231,6 +309,157 @@ public final class GdScriptParser {
         ));
     }
 
+    /// A non-fatal diagnostic (does not set the panic flag). `nodeType` mirrors the reference
+    /// path's CST-derived tag where one exists, so diagnostics stay comparable across paths.
+    private void pushWarning(String message, String nodeType, Range range) {
+        diagnostics.add(new AstDiagnostic(AstDiagnosticSeverity.WARNING, message, nodeType, range));
+    }
+
+    /// Advances the comment cursor past every trivia comment starting before the current token
+    /// WITHOUT materializing nodes — used at sequence boundaries where the reference path drops
+    /// comments (suite-header lines, the match branch level).
+    private void discardPendingComments() {
+        while (commentCursor < comments.size() && comments.get(commentCursor).startByte() < current.startByte()) {
+            commentCursor++;
+        }
+    }
+
+    /// Discards only trailing (end-of-line) comments before the given byte offset. Whole-line
+    /// comments keep pending for the sequence that owns them. Used when entering a suite: a
+    /// comment trailing the header line (`if x: # c`) is dropped by both paths.
+    private void discardTrailingCommentsBefore(int byteOffset) {
+        while (commentCursor < comments.size() && !comments.get(commentCursor).wholeLine()
+                && comments.get(commentCursor).startByte() < byteOffset) {
+            commentCursor++;
+        }
+    }
+
+    /// Moves the pending comment prefix before `limitByte` out of the cursor stream (see the
+    /// `comments` field doc): those comments belong to the enclosing flow, not to the construct
+    /// about to be parsed, and are restored afterwards by {@link #restoreDeferredComments}.
+    private void deferCommentsBefore(int limitByte) {
+        var deferred = new ArrayList<GdComment>();
+        while (commentCursor < comments.size() && comments.get(commentCursor).startByte() < limitByte) {
+            deferred.add(comments.get(commentCursor++));
+        }
+        deferredCommentStack.addLast(deferred);
+    }
+
+    /// Restores the innermost deferred prefix at the cursor head. Everything restored precedes
+    /// anything consumed in the meantime, so byte order is preserved (nested lambdas restore
+    /// inside-out, which keeps the nesting order correct).
+    private void restoreDeferredComments() {
+        comments.addAll(commentCursor, deferredCommentStack.removeLast());
+    }
+
+    /// Materializes one comment trivia as a statement node per the §5.4 rules: `#region…` /
+    /// `#endregion…` become `RegionDirectiveStatement` (start label is the text after the
+    /// keyword, trimmed, `null` when empty; the end label is always `null`), everything else a
+    /// `CommentStatement` with the full comment text (leading `#` included).
+    private @NotNull Statement materializeComment(@NotNull GdComment comment) {
+        var range = range(comment.startByte(), comment.endByte());
+        var text = comment.text();
+        if (text.startsWith("#endregion")) {
+            return new RegionDirectiveStatement("end", null, range);
+        }
+        if (text.startsWith("#region")) {
+            var label = text.substring("#region".length()).trim();
+            return new RegionDirectiveStatement("start", label.isEmpty() ? null : label, range);
+        }
+        return new CommentStatement(text, range);
+    }
+
+    /// Boundary drain before a statement: pending annotations and pending comments (of either
+    /// kind) merge in byte order up to `limitByte`. Whole-line comments reach a boundary only
+    /// when the next statement belongs to the same sequence, and stray trailing comments (left
+    /// over by prefix statements or error paths) take their byte position here.
+    private @NotNull List<Statement> drainAnnotationsAndComments(int limitByte) {
+        var drained = new ArrayList<Statement>();
+        while (true) {
+            skipGroupingInternalComments();
+            var hasAnnotation = !pendingAnnotations.isEmpty();
+            var hasComment = commentCursor < comments.size()
+                    && comments.get(commentCursor).startByte() < limitByte;
+            if (!hasAnnotation && !hasComment) {
+                break;
+            }
+            var annotationStart = hasAnnotation
+                    ? pendingAnnotations.getFirst().range().startByte()
+                    : Integer.MAX_VALUE;
+            if (hasComment && comments.get(commentCursor).startByte() < annotationStart) {
+                drained.add(materializeComment(comments.get(commentCursor++)));
+            } else {
+                drained.add(pendingAnnotations.removeFirst());
+            }
+        }
+        return drained;
+    }
+
+    /// Block-start anchor for indented suites/class bodies: the newline token's start, backed
+    /// over any immediately preceding spaces/tabs (trailing header whitespace belongs to the
+    /// block span on the reference path; a trailing header comment does not).
+    private int layoutBlockStart(@NotNull GdToken newlineToken) {
+        var start = newlineToken.startByte();
+        while (start > 0 && (sourceBytes[start - 1] == ' ' || sourceBytes[start - 1] == '\t')) {
+            start--;
+        }
+        return start;
+    }
+
+    /// Drains trailing (end-of-line) comments passed since the last statement: they materialize
+    /// as the same sequence's siblings right after the statement they follow (§5.4).
+    private @NotNull List<Statement> drainTrailingComments() {
+        var drained = new ArrayList<Statement>();
+        while (true) {
+            skipGroupingInternalComments();
+            if (commentCursor >= comments.size() || comments.get(commentCursor).wholeLine()
+                    || comments.get(commentCursor).startByte() >= current.startByte()) {
+                break;
+            }
+            drained.add(materializeComment(comments.get(commentCursor++)));
+        }
+        return drained;
+    }
+
+    /// Tail drain at a dedent boundary: whole-line comments materialize into this body only
+    /// while their indentation reaches the body's indentation (merged with dangling annotations
+    /// in byte order); less-indented comments stay pending for the outer sequence (§5.4).
+    private @NotNull List<Statement> drainTailWithAnnotations(int bodyIndent) {
+        var drained = new ArrayList<Statement>();
+        while (true) {
+            skipGroupingInternalComments();
+            var hasAnnotation = !pendingAnnotations.isEmpty();
+            var hasComment = commentCursor < comments.size()
+                    && comments.get(commentCursor).startByte() < current.startByte()
+                    && comments.get(commentCursor).wholeLine()
+                    && indentOf(comments.get(commentCursor)) >= bodyIndent;
+            if (!hasAnnotation && !hasComment) {
+                break;
+            }
+            var annotationStart = hasAnnotation
+                    ? pendingAnnotations.getFirst().range().startByte()
+                    : Integer.MAX_VALUE;
+            if (hasComment && comments.get(commentCursor).startByte() < annotationStart) {
+                drained.add(materializeComment(comments.get(commentCursor++)));
+            } else {
+                drained.add(pendingAnnotations.removeFirst());
+            }
+        }
+        return drained;
+    }
+
+    /// Indentation width of a whole-line comment (its column equals its indentation, since the
+    /// comment is the first non-whitespace content of its line).
+    private int indentOf(@NotNull GdComment comment) {
+        return index.pointAt(comment.startByte()).column();
+    }
+
+    /// Indentation width of the line containing the given byte offset (the offset's column when
+    /// it sits right after the leading whitespace, as statement-start tokens do).
+    private int indentOf(int byteOffset) {
+        return index.pointAt(byteOffset).column();
+    }
+
     /// Port of `GDScriptParser::synchronize`: same sync token set (`if` deliberately excluded
     /// because it can appear inside expressions); stops before the sync token without consuming.
     private void synchronize() {
@@ -252,11 +481,21 @@ public final class GdScriptParser {
     }
 
     /// Port of `GDScriptParser::push_multiline(true)`, including the raw consumption of already
-    /// pending NEWLINE/INDENT/DEDENT tokens (which must not touch `previous`). The disabled state
-    /// is unused, so the parameter is omitted.
+    /// pending NEWLINE/INDENT/DEDENT tokens (which must not touch `previous`).
     private void pushMultiline() {
-        multilineStack.addLast(true);
-        tokenizer.setMultilineMode(true);
+        pushMultiline(true);
+    }
+
+    /// Port of `GDScriptParser::push_multiline`. The raw consumption of pending layout tokens
+    /// only happens when enabling multiline mode (vendor `push_multiline(true)`); disabling is a
+    /// plain stack push (used to isolate lambda bodies from an enclosing multiline context).
+    private void pushMultiline(boolean state) {
+        multilineStack.addLast(state);
+        multilineStartStack.addLast(current.startByte());
+        tokenizer.setMultilineMode(state);
+        if (!state) {
+            return;
+        }
         // Discard pending layout tokens without touching `previous`. Unlike Godot (which
         // raw-scans here and can silently drop an ERROR token sitting in `current`), errors
         // are reported immediately — our diagnostics contract requires every tokenizer
@@ -270,24 +509,79 @@ public final class GdScriptParser {
 
     /// Port of `GDScriptParser::pop_multiline`.
     private void popMultiline() {
+        popMultiline(true);
+    }
+
+    /// `recordCommentSpan` is on for grouping-close pops: the popped frame's span is recorded so
+    /// later drains skip the grouping-internal comments within it. The lambda-isolation pop must
+    /// NOT record: comments after the lambda body still belong to the enclosing sequence.
+    private void popMultiline(boolean recordCommentSpan) {
         if (multilineStack.isEmpty()) {
             throw new IllegalStateException("GDScript parser bug: popping the multiline stack without a matching push.");
         }
         multilineStack.removeLast();
+        var frameStart = multilineStartStack.removeLast();
         tokenizer.setMultilineMode(multilineStack.peekLast() != null && multilineStack.peekLast());
+        if (recordCommentSpan) {
+            groupingCommentSpans.add(new int[]{frameStart, current.startByte()});
+        }
+    }
+
+    /// Whether the comment lies inside a closed grouping span (grouping-internal trivia that
+    /// this parser silently ignores — see {@link #groupingCommentSpans}).
+    private boolean isGroupingInternal(@NotNull GdComment comment) {
+        for (var span : groupingCommentSpans) {
+            if (comment.startByte() >= span[0] && comment.startByte() < span[1]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Skips pending grouping-internal comments at the cursor head. Returns the number skipped.
+    private int skipGroupingInternalComments() {
+        var skipped = 0;
+        while (commentCursor < comments.size() && isGroupingInternal(comments.get(commentCursor))) {
+            commentCursor++;
+            skipped++;
+        }
+        return skipped;
     }
 
     private boolean isStatementEndToken() {
         return check(GdTokenType.NEWLINE) || check(GdTokenType.SEMICOLON) || check(GdTokenType.EOF);
     }
 
-    /// Port of `GDScriptParser::end_statement` minus the lambda-end conditions (those only exist
-    /// together with lambda parsing): consumes a run of NEWLINE/SEMICOLON, stops at EOF without
-    /// consuming it, and reports when anything else follows.
+    /// Port of `GDScriptParser::is_statement_end`: the lambda states count as statement end even
+    /// when no end token follows (a lambda body can terminate the enclosing statement).
+    private boolean isStatementEnd() {
+        return lambdaEnded || inLambda || isStatementEndToken();
+    }
+
+    /// Port of `GDScriptParser::end_statement`: consumes a run of NEWLINE/SEMICOLON, stops at EOF
+    /// without consuming it, and reports when anything else follows. The lambda states participate
+    /// like the vendor's: a pending `lambda_ended` is consumed as a virtual end token, and inside
+    /// a lambda any other token marks the lambda as ended (without advancing).
     private void endStatement(String context) {
         var found = false;
-        while (isStatementEndToken() && !isAtEnd()) {
-            advance();
+        while (isStatementEnd() && !isAtEnd()) {
+            if (isStatementEndToken()) {
+                advance();
+            } else if (lambdaEnded) {
+                // Consume the virtual token, like the vendor.
+                lambdaEnded = false;
+                found = true;
+                break;
+            } else {
+                // In a lambda: something else ends the statement; mark the lambda as done — but
+                // only when no real end token was consumed (vendor's `if (!found)`), otherwise a
+                // following body statement on the next line would be cut off.
+                if (!found) {
+                    lambdaEnded = true;
+                    found = true;
+                }
+                break;
+            }
             found = true;
         }
         if (!found && !isAtEnd()) {
@@ -328,8 +622,9 @@ public final class GdScriptParser {
                     } else {
                         classNameUsed = true;
                         statementStartByte = computeStatementStart(previous);
-                        statements.addAll(drainAnnotations());
+                        statements.addAll(drainAnnotationsAndComments(current.startByte()));
                         statements.add(parseClassName());
+                        statements.addAll(drainTrailingComments());
                     }
                 }
                 case EXTENDS -> {
@@ -339,9 +634,10 @@ public final class GdScriptParser {
                     } else {
                         scriptExtendsUsed = true;
                         statementStartByte = computeStatementStart(previous);
-                        statements.addAll(drainAnnotations());
+                        statements.addAll(drainAnnotationsAndComments(current.startByte()));
                         statements.add(parseExtendsStatement());
                         endStatement("superclass");
+                        statements.addAll(drainTrailingComments());
                     }
                 }
                 case LITERAL -> {
@@ -356,7 +652,10 @@ public final class GdScriptParser {
             }
         }
 
-        parseClassBody(true, statements);
+        parseClassBody(true, statements, 0);
+        // Safety net for anything left over at EOF (e.g. a trailing comment after the last
+        // member on a newline-less last line): everything remaining belongs to the top level.
+        statements.addAll(drainAnnotationsAndComments(Integer.MAX_VALUE));
 
         if (!check(GdTokenType.EOF)) {
             pushError("Expected end of file.");
@@ -444,7 +743,10 @@ public final class GdScriptParser {
     /// Port of `GDScriptParser::parse_class_body`, including the Godot 3.x removed-keyword
     /// migration diagnostics and the `static` prefix handling. Unlike Godot, a class-body `pass`
     /// produces a `PassStatement` (this AST keeps it).
-    private void parseClassBody(boolean multiline, List<Statement> statements) {
+    /// `bodyIndent` is the indentation width of the body's members (0 for the top-level body):
+    /// whole-line comments in the tail window before the closing dedent belong to this body only
+    /// when they reach that indentation (§5.4 tail-attribution rule).
+    private void parseClassBody(boolean multiline, List<Statement> statements, int bodyIndent) {
         var classEnd = false;
         var nextIsStatic = false;
         while (!classEnd && !isAtEnd()) {
@@ -525,6 +827,8 @@ public final class GdScriptParser {
             if (token.type() != GdTokenType.STATIC) {
                 nextIsStatic = false;
             }
+            // A comment trailing the member's own line lands right after it (§5.4).
+            statements.addAll(drainTrailingComments());
             if (panicMode) {
                 synchronize();
             }
@@ -532,9 +836,13 @@ public final class GdScriptParser {
                 classEnd = true;
             }
         }
-        // Annotations left dangling at the end of this body belong to this scope (see the
-        // suite flush); they must not escape to a following outer member.
-        statements.addAll(drainAnnotations());
+        // Tail-window comments belong to this body only when indented into it; dangling
+        // annotations also stay in this scope (merged in byte order, see the suite flush).
+        if (multiline) {
+            statements.addAll(drainTailWithAnnotations(bodyIndent));
+        } else {
+            statements.addAll(drainAnnotations());
+        }
     }
 
     /// Default branch of the class-body dispatch: consumes one token and reports either a Godot
@@ -564,13 +872,14 @@ public final class GdScriptParser {
         pushError(message);
     }
 
-    /// Computes the statement start and flushes pending annotations into the sequence, unless a
-    /// `static` prefix already did so for this member.
+    /// Computes the statement start (unless a `static` prefix already did so for this member)
+    /// and flushes pending annotations/comments into the sequence in byte order. The flush runs
+    /// even after `static` so a comment between `static` and the member keeps its position.
     private void beginMember(List<Statement> statements, boolean alreadyStarted) {
         if (!alreadyStarted) {
             statementStartByte = computeStatementStart(current);
-            statements.addAll(drainAnnotations());
         }
+        statements.addAll(drainAnnotationsAndComments(current.startByte()));
     }
 
     /// The statement starts at the keyword, unless a contiguous run of pending annotations sits
@@ -616,11 +925,15 @@ public final class GdScriptParser {
         var headerEnd = previous.endByte();
 
         var multiline = match(GdTokenType.NEWLINE);
-        var blockStart = multiline ? previous.startByte() : current.startByte();
-        if (multiline && !consume(GdTokenType.INDENT, "Expected indented block after class declaration.")) {
-            return new ClassDeclaration(name, extendsTarget,
-                    new Block(List.of(), range(blockStart, blockStart)),
-                    range(start, headerEnd));
+        var blockStart = multiline ? layoutBlockStart(previous) : current.startByte();
+        if (multiline) {
+            // A comment trailing the class-header line (`class Inner: # c`) is dropped.
+            discardTrailingCommentsBefore(previous.startByte());
+            if (!consume(GdTokenType.INDENT, "Expected indented block after class declaration.")) {
+                return new ClassDeclaration(name, extendsTarget,
+                        new Block(List.of(), range(blockStart, blockStart)),
+                        range(start, headerEnd));
+            }
         }
 
         if (match(GdTokenType.EXTENDS)) {
@@ -632,7 +945,7 @@ public final class GdScriptParser {
         }
 
         var bodyStatements = new ArrayList<Statement>();
-        parseClassBody(multiline, bodyStatements);
+        parseClassBody(multiline, bodyStatements, multiline ? indentOf(current.startByte()) : 0);
         var blockEnd = bodyStatements.isEmpty()
                 ? blockStart
                 : bodyStatements.getLast().range().endByte();
@@ -654,12 +967,27 @@ public final class GdScriptParser {
     /// toward the circuit breaker (`error_count++ > 100`, i.e. the 102nd failure aborts the
     /// suite) — `push_error` alone does not count.
     private @NotNull Block parseSuite(String context) {
+        return parseSuite(context, false);
+    }
+
+    /// `forLambda` mirrors the vendor's `p_for_lambda`: the loop also stops when a lambda-end is
+    /// pending, the closing DEDENT becomes optional in that case, and `lambdaEnded` is raised when
+    /// the suite finishes so the enclosing statement ends without a newline token.
+    private @NotNull Block parseSuite(String context, boolean forLambda) {
         var multiline = match(GdTokenType.NEWLINE);
         int blockStart;
+        var suiteIndent = -1;
         if (multiline) {
-            blockStart = previous.startByte();
+            // The reference path spans the body from right after the header content: trailing
+            // whitespace before the newline is included, a trailing comment is not.
+            blockStart = layoutBlockStart(previous);
+            // A comment trailing the suite-header line (`if x: # c`) is dropped by both paths.
+            discardTrailingCommentsBefore(previous.startByte());
             if (!consume(GdTokenType.INDENT, "Expected indented block after %s.".formatted(context))) {
                 return new Block(List.of(), range(blockStart, blockStart));
+            }
+            if (!check(GdTokenType.DEDENT)) {
+                suiteIndent = indentOf(current.startByte());
             }
         } else {
             blockStart = current.startByte();
@@ -682,17 +1010,30 @@ public final class GdScriptParser {
             statements.addAll(produced);
         } while ((multiline || previous.type() == GdTokenType.SEMICOLON)
                 && !check(GdTokenType.DEDENT)
+                && !lambdaEnded
                 && !isAtEnd());
 
         if (multiline) {
-            consume(GdTokenType.DEDENT, "Missing unindent at the end of %s.".formatted(context));
+            if (!lambdaEnded) {
+                consume(GdTokenType.DEDENT, "Missing unindent at the end of %s.".formatted(context));
+            } else {
+                match(GdTokenType.DEDENT);
+            }
         } else if (previous.type() == GdTokenType.SEMICOLON) {
             consume(GdTokenType.NEWLINE, "Expected newline after \";\" at the end of %s.".formatted(context));
         }
+        if (forLambda) {
+            lambdaEnded = true;
+        }
 
-        // Annotations left dangling at the end of this suite belong to this scope: flush them
-        // into the suite's own sequence instead of letting them escape to an outer member.
-        statements.addAll(drainAnnotations());
+        // Comments in the tail window before the closing dedent belong to this suite only when
+        // they are indented into it; dangling annotations flush into the suite's own sequence
+        // instead of escaping to an outer member (merged in byte order).
+        if (multiline && suiteIndent >= 0) {
+            statements.addAll(drainTailWithAnnotations(suiteIndent));
+        } else {
+            statements.addAll(drainAnnotations());
+        }
         var blockEnd = statements.isEmpty() ? blockStart : statements.getLast().range().endByte();
         return new Block(List.copyOf(statements), range(blockStart, blockEnd));
     }
@@ -717,7 +1058,7 @@ public final class GdScriptParser {
 
         lastStatementWasNull = false;
         statementStartByte = computeStatementStart(current);
-        var produced = new ArrayList<Statement>(drainAnnotations());
+        var produced = new ArrayList<>(drainAnnotationsAndComments(current.startByte()));
         Statement result;
         switch (current.type()) {
             case PASS -> {
@@ -733,22 +1074,95 @@ public final class GdScriptParser {
                 advance();
                 result = parseConstant();
             }
+            case IF -> {
+                advance();
+                result = parseIf();
+            }
+            case WHILE -> {
+                advance();
+                result = parseWhile();
+            }
+            case FOR -> {
+                advance();
+                result = parseFor();
+            }
+            case MATCH -> {
+                advance();
+                result = parseMatch();
+            }
+            case RETURN -> {
+                advance();
+                Expression returnValue = null;
+                if (!isStatementEnd()) {
+                    // Ported vendor check: a constructor (`_init`/`_static_init`) may not
+                    // return a value. The error is reported before parsing the value, like Godot.
+                    if ("_init".equals(currentFunctionName) || "_static_init".equals(currentFunctionName)) {
+                        pushError("Constructor cannot return a value.");
+                    }
+                    returnValue = parseExpression(false);
+                } else if (inLambda && !isStatementEndToken()) {
+                    // Inside a lambda `isStatementEnd()` is always true, so a value is attempted
+                    // whenever a real token follows (vendor `parse_statement` RETURN branch).
+                    returnValue = parseExpression(false);
+                }
+                result = new ReturnStatement(returnValue, range(statementStartByte, extentEnd()));
+                endStatement("return statement");
+            }
+            case BREAK -> {
+                advance();
+                if (!canBreak) {
+                    pushError("Cannot use \"break\" outside of a loop.");
+                }
+                result = new BreakStatement(range(statementStartByte, previous.endByte()));
+                endStatement("\"break\"");
+            }
+            case CONTINUE -> {
+                advance();
+                if (!canContinue) {
+                    pushError("Cannot use \"continue\" outside of a loop.");
+                }
+                result = new ContinueStatement(range(statementStartByte, previous.endByte()));
+                endStatement("\"continue\"");
+            }
+            case BREAKPOINT -> {
+                advance();
+                result = new BreakpointStatement(range(statementStartByte, previous.endByte()));
+                endStatement("\"breakpoint\"");
+            }
+            case ASSERT -> {
+                advance();
+                result = parseAssert();
+            }
+            case FUNC -> {
+                advance();
+                result = (Statement) parseLambdaLike(true);
+                // Like the vendor's expression-statement path: consume the lambda-end state so
+                // the surrounding suite keeps parsing following statements.
+                endStatement("expression");
+            }
             default -> {
                 // Only statement-level expressions may contain assignments (Godot's
                 // `parse_expression(true)` call site in `parse_expression_statement`).
                 var expression = parseExpression(true);
                 if (expression == null) {
-                    // Godot's advance() soft-fails at EOF; mirror that by guarding the advance
-                    // so `previous` (and thus the error location/name) matches Godot exactly.
-                    if (!isAtEnd()) {
-                        advance();
+                    if (inLambda) {
+                        // Vendor: inside a lambda a failed expression start ends the lambda
+                        // instead of consuming the token (the enclosing expression continues
+                        // there, e.g. the `,`/`)` after a lambda in call arguments).
+                        lambdaEnded = true;
+                    } else {
+                        // Godot's advance() soft-fails at EOF; mirror that by guarding the advance
+                        // so `previous` (and thus the error location/name) matches Godot exactly.
+                        if (!isAtEnd()) {
+                            advance();
+                        }
+                        pushError("Expected statement, found \"%s\" instead.".formatted(previous.type().displayName()));
                     }
-                    pushError("Expected statement, found \"%s\" instead.".formatted(previous.type().displayName()));
                     result = null;
                 } else {
                     // The statement ends at the last consumed token, not the expression node's
                     // own end (a trailing grouping `)` belongs to the consumed span).
-                    result = new ExpressionStatement(expression, range(statementStartByte, previous.endByte()));
+                    result = new ExpressionStatement(expression, range(statementStartByte, extentEnd()));
                     endStatement("expression");
                 }
             }
@@ -758,10 +1172,463 @@ public final class GdScriptParser {
         if (result != null) {
             produced.add(result);
         }
+        // A comment trailing the statement's own line lands right after it (§5.4).
+        produced.addAll(drainTrailingComments());
         if (panicMode) {
             synchronize();
         }
         return List.copyOf(produced);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Control-flow statements — ports of parse_if / parse_while / parse_for / parse_assert.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Port of `GDScriptParser::parse_if`. Godot nests `elif` as a synthetic suite holding another
+    /// `IfNode` in `false_block`; this AST folds the chain into `elifClauses` plus an optional
+    /// `elseBody` (shape pinned by the reference path). On a missing condition the whole chain is
+    /// still consumed for recovery but no node is produced (the AST has no nullable components).
+    private @Nullable Statement parseIf() {
+        var start = statementStartByte;
+        var condition = parseExpression(false);
+        if (condition == null) {
+            pushError("Expected conditional expression after \"if\".");
+        }
+        if (!match(GdTokenType.COLON)) {
+            pushError("Expected \":\" after \"if\" condition, found \"%s\" instead."
+                    .formatted(current.type().displayName()));
+        }
+        var trueBlock = parseSuite("\"if\" block");
+
+        var elifClauses = new ArrayList<ElifClause>();
+        Block elseBody = null;
+        while (match(GdTokenType.ELIF)) {
+            var elifStart = previous.startByte();
+            var elifCondition = parseExpression(false);
+            if (elifCondition == null) {
+                pushError("Expected conditional expression after \"elif\".");
+            }
+            if (!match(GdTokenType.COLON)) {
+                pushError("Expected \":\" after \"elif\" condition, found \"%s\" instead."
+                        .formatted(current.type().displayName()));
+            }
+            var elifBody = parseSuite("\"elif\" block");
+            if (elifCondition != null) {
+                elifClauses.add(new ElifClause(elifCondition, elifBody,
+                        range(elifStart, elifBody.range().endByte())));
+            }
+        }
+        if (match(GdTokenType.ELSE)) {
+            consume(GdTokenType.COLON, "Expected \":\" after \"else\".");
+            elseBody = parseSuite("\"else\" block");
+        }
+
+        if (condition == null) {
+            return null;
+        }
+        var end = elseBody != null ? elseBody.range().endByte()
+                : !elifClauses.isEmpty() ? elifClauses.getLast().body().range().endByte()
+                  : trueBlock.range().endByte();
+        return new IfStatement(condition, trueBlock, List.copyOf(elifClauses), elseBody,
+                range(start, end));
+    }
+
+    /// Port of `GDScriptParser::parse_while`, including the save/enable/restore of the
+    /// break/continue loop flags around the loop suite.
+    private @Nullable Statement parseWhile() {
+        var start = statementStartByte;
+        var condition = parseExpression(false);
+        if (condition == null) {
+            pushError("Expected conditional expression after \"while\".");
+        }
+        if (!match(GdTokenType.COLON)) {
+            pushError("Expected \":\" after \"while\" condition, found \"%s\" instead."
+                    .formatted(current.type().displayName()));
+        }
+
+        var couldBreak = canBreak;
+        var couldContinue = canContinue;
+        canBreak = true;
+        canContinue = true;
+        var body = parseSuite("\"while\" block");
+        canBreak = couldBreak;
+        canContinue = couldContinue;
+
+        if (condition == null) {
+            return null;
+        }
+        return new WhileStatement(condition, body, range(start, body.range().endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_for`: optional `: type` after the loop variable (the two
+    /// distinct `in` error messages depend on whether a type was given), iterable expression, and
+    /// a loop suite with break/continue enabled.
+    private @Nullable Statement parseFor() {
+        var start = statementStartByte;
+        var hasIterator = consume(GdTokenType.IDENTIFIER, "Expected loop variable name after \"for\".");
+        var iterator = hasIterator ? previous.source() : "";
+
+        TypeRef iteratorType = null;
+        if (match(GdTokenType.COLON)) {
+            iteratorType = parseType(false);
+            if (iteratorType == null) {
+                pushError("Expected type specifier after \":\".");
+            }
+        }
+
+        if (iteratorType == null) {
+            consume(GdTokenType.IN, "Expected \"in\" or \":\" after \"for\" variable name.");
+        } else {
+            consume(GdTokenType.IN, "Expected \"in\" after \"for\" variable type specifier.");
+        }
+
+        var iterable = parseExpression(false);
+        if (iterable == null) {
+            pushError("Expected iterable after \"in\".");
+        }
+        if (!match(GdTokenType.COLON)) {
+            pushError("Expected \":\" after \"for\" condition, found \"%s\" instead."
+                    .formatted(current.type().displayName()));
+        }
+
+        var couldBreak = canBreak;
+        var couldContinue = canContinue;
+        canBreak = true;
+        canContinue = true;
+        var body = parseSuite("\"for\" block");
+        canBreak = couldBreak;
+        canContinue = couldContinue;
+
+        if (!hasIterator || iterable == null) {
+            return null;
+        }
+        return new ForStatement(iterator, iteratorType, iterable, body,
+                range(start, body.range().endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_assert`: parenthesized condition plus optional message after
+    /// a comma (one trailing comma allowed). On a missing condition/message no node is produced
+    /// (vendor returns `nullptr`, counted by the suite circuit breaker).
+    private @Nullable Statement parseAssert() {
+        var start = statementStartByte;
+        pushMultiline();
+        consume(GdTokenType.PARENTHESIS_OPEN, "Expected \"(\" after \"assert\".");
+
+        var condition = parseExpression(false);
+        if (condition == null) {
+            pushError("Expected expression to assert.");
+            popMultiline();
+            return null;
+        }
+
+        Expression message = null;
+        if (match(GdTokenType.COMMA) && !check(GdTokenType.PARENTHESIS_CLOSE)) {
+            message = parseExpression(false);
+            if (message == null) {
+                pushError("Expected error message for assert after \",\".");
+                popMultiline();
+                return null;
+            }
+            match(GdTokenType.COMMA);
+        }
+
+        popMultiline();
+        consume(GdTokenType.PARENTHESIS_CLOSE, "Expected \")\" after assert expression.");
+        var statement = new AssertStatement(condition, message, range(start, previous.endByte()));
+        endStatement("\"assert\"");
+        return statement;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Match statement and patterns — ports of parse_match / parse_match_branch /
+    // parse_match_pattern. Patterns are represented with the existing expression AST (the
+    // reference path's contract): literals/identifiers/general expressions as-is, `var x` as
+    // `PatternBindingExpression`, `_` as a plain identifier, containers as array/dictionary
+    // expressions with `openEnded` carrying the `..` marker.
+    // ---------------------------------------------------------------------------------------------
+
+    /// One parsed match pattern: an expression node, or the `..` rest marker (only legal inside
+    /// array/dictionary patterns, where it turns into `openEnded`). A `null` result means the
+    /// pattern failed (vendor's `nullptr`, skipped by the branch's comma loop).
+    private record MatchPattern(@Nullable Expression expression, boolean rest) {
+    }
+
+    /// Port of `GDScriptParser::parse_match`. Branch-level `pass` is consumed without a node and
+    /// branch-level annotations other than `@warning_ignore` are rejected (both registered in
+    /// §5.7 (ii): the reference path errors/drops differently). The statement's range ends at the
+    /// last branch, before the closing DEDENT.
+    private @Nullable Statement parseMatch() {
+        var start = statementStartByte;
+        var value = parseExpression(false);
+        if (value == null) {
+            pushError("Expected expression to test after \"match\".");
+        }
+        consume(GdTokenType.COLON, "Expected \":\" after \"match\" expression.");
+        if (match(GdTokenType.NEWLINE)) {
+            // A comment trailing the match-header line is dropped by both paths.
+            discardTrailingCommentsBefore(previous.startByte());
+        } else {
+            pushError("Expected a newline after \"match\" statement.");
+        }
+
+        var sections = new ArrayList<MatchSection>();
+        // Accepted `@warning_ignore` annotations pending a branch to attach to; this AST drops
+        // them (branches have no annotation field), but leftover ones are still diagnosed.
+        var danglingAnnotations = new ArrayList<AnnotationStatement>();
+        var matchIndent = -1;
+        if (!consume(GdTokenType.INDENT, "Expected an indented block after \"match\" statement.")) {
+            // Vendor returns immediately on a missing indented block: no DEDENT consumption (an
+            // outer suite's DEDENT must not be eaten) and no comment discard.
+            return value == null ? null
+                    : new MatchStatement(value, List.of(), range(start, previous.endByte()));
+        }
+        if (!check(GdTokenType.DEDENT)) {
+            matchIndent = indentOf(current.startByte());
+        }
+        while (!check(GdTokenType.DEDENT) && !isAtEnd()) {
+            // The reference path drops comments at the match branch level (a col-0 comment
+            // between branches even breaks its grammar — registered §5.7 (ii)).
+            discardPendingComments();
+            if (match(GdTokenType.PASS)) {
+                consume(GdTokenType.NEWLINE, "Expected newline after \"pass\".");
+                continue;
+            }
+            if (match(GdTokenType.ANNOTATION)) {
+                var annotation = parseAnnotation();
+                // Only `@warning_ignore` may annotate a branch (Godot attaches it to the
+                // branch node, which has no annotation field here); anything else is an error
+                // and is not tracked (vendor skips it the same way).
+                if (annotation.name().equals("warning_ignore")) {
+                    danglingAnnotations.add(annotation);
+                } else {
+                    pushError("Annotation \"@%s\" is not allowed in this level."
+                            .formatted(annotation.name()));
+                }
+                continue;
+            }
+            sections.add(parseMatchSection());
+            danglingAnnotations.clear();
+        }
+        // The statement ends at the last branch (before the closing DEDENT), not at the DEDENT
+        // the last branch's suite consumed — the reference path's extent ends there too.
+        var end = sections.isEmpty() ? previous.endByte() : sections.getLast().range().endByte();
+        // Tail comments indented into the match body are branch-level and dropped with it, but
+        // the match node still spans them (the reference path's extent covers them); less-
+        // indented ones stay pending for the outer sequence (they are not match trivia).
+        if (matchIndent >= 0) {
+            while (commentCursor < comments.size()
+                    && comments.get(commentCursor).startByte() < current.startByte()
+                    && comments.get(commentCursor).wholeLine()
+                    && indentOf(comments.get(commentCursor)) >= matchIndent) {
+                end = Math.max(end, comments.get(commentCursor).endByte());
+                commentCursor++;
+            }
+        }
+        for (var dangling : danglingAnnotations) {
+            pushError("Annotation \"@%s\" does not precede a valid target, so it will have no effect."
+                    .formatted(dangling.name()));
+        }
+        consume(GdTokenType.DEDENT, "Expected an indented block after \"match\" statement.");
+
+        if (value == null) {
+            return null;
+        }
+        return new MatchStatement(value, List.copyOf(sections), range(start, end));
+    }
+
+    /// Port of `GDScriptParser::parse_match_branch`: comma-separated patterns, optional `when`
+    /// guard, colon, and the branch suite. The section range spans from the first pattern to the
+    /// suite end. The vendor's bind-conflict checks (multiple patterns with a bind, duplicate or
+    /// shadowing binds) are deferred with the other symbol-table-dependent checks (§5.6).
+    private @NotNull MatchSection parseMatchSection() {
+        var start = current.startByte();
+        var patterns = new ArrayList<Expression>();
+        var sawAnyPattern = false;
+        do {
+            var pattern = parseMatchPattern();
+            if (pattern == null) {
+                continue;
+            }
+            sawAnyPattern = true;
+            if (pattern.rest()) {
+                pushError("Rest pattern can only be used inside array and dictionary patterns.");
+            } else {
+                patterns.add(pattern.expression());
+            }
+        } while (match(GdTokenType.COMMA));
+
+        if (!sawAnyPattern) {
+            pushError("No pattern found for \"match\" branch.");
+        }
+
+        Expression guard = null;
+        if (match(GdTokenType.WHEN)) {
+            guard = parseExpression(false);
+            if (guard == null) {
+                pushError("Expected expression for pattern guard after \"when\".");
+            }
+        }
+
+        Block body;
+        if (!consume(GdTokenType.COLON, guard != null
+                ? "Expected \":\" after \"match\" pattern guard."
+                : "Expected \":\" or \"when\" after \"match\" patterns.")) {
+            // Vendor recovery: consume the rest of the line; the next line starts a new branch.
+            while (current.type() != GdTokenType.NEWLINE && !isAtEnd()) {
+                advance();
+            }
+            if (!isAtEnd()) {
+                advance();
+            }
+            body = new Block(List.of(), range(start, previous.endByte()));
+        } else {
+            body = parseSuite("match pattern block");
+        }
+        return new MatchSection(List.copyOf(patterns), guard, body,
+                range(start, body.range().endByte()));
+    }
+
+    /// Port of `GDScriptParser::parse_match_pattern`: `var` binds, `_` wildcard, `..` rest, and
+    /// nested array/dictionary patterns get dedicated handling; anything else parses as a general
+    /// expression (`false` — no assignments in patterns).
+    private @Nullable MatchPattern parseMatchPattern() {
+        switch (current.type()) {
+            case VAR -> {
+                var start = current.startByte();
+                advance();
+                if (!consume(GdTokenType.IDENTIFIER, "Expected bind name after \"var\".")) {
+                    return null;
+                }
+                return new MatchPattern(new PatternBindingExpression(previous.source(),
+                        range(start, previous.endByte())), false);
+            }
+            case UNDERSCORE -> {
+                advance();
+                return new MatchPattern(new IdentifierExpression("_",
+                        range(previous.startByte(), previous.endByte())), false);
+            }
+            case PERIOD_PERIOD -> {
+                advance();
+                return new MatchPattern(null, true);
+            }
+            case BRACKET_OPEN -> {
+                return parseArrayMatchPattern();
+            }
+            case BRACE_OPEN -> {
+                return parseDictionaryMatchPattern();
+            }
+            default -> {
+                var expression = parseExpression(false);
+                if (expression == null) {
+                    pushError("Expected expression for match pattern.");
+                    return null;
+                }
+                return new MatchPattern(expression, false);
+            }
+        }
+    }
+
+    /// Array pattern: sub-patterns recurse, `..` is legal once at the end (further elements are
+    /// errors but still collected, like the vendor).
+    private @NotNull MatchPattern parseArrayMatchPattern() {
+        var start = current.startByte();
+        pushMultiline();
+        advance();
+
+        var elements = new ArrayList<Expression>();
+        var openEnded = false;
+        do {
+            if (isAtEnd() || check(GdTokenType.BRACKET_CLOSE)) {
+                break;
+            }
+            var sub = parseMatchPattern();
+            if (sub == null) {
+                continue;
+            }
+            if (openEnded) {
+                pushError("The \"..\" pattern must be the last element in the pattern array.");
+                if (!sub.rest()) {
+                    elements.add(sub.expression());
+                }
+            } else if (sub.rest()) {
+                openEnded = true;
+            } else {
+                elements.add(sub.expression());
+            }
+        } while (match(GdTokenType.COMMA));
+
+        consume(GdTokenType.BRACKET_CLOSE, "Expected \"]\" to close the array pattern.");
+        popMultiline();
+        return new MatchPattern(new ArrayExpression(List.copyOf(elements), openEnded,
+                range(start, previous.endByte())), false);
+    }
+
+    /// Dictionary pattern: `key: pattern` entries, the `..` rest marker, and key-only entries.
+    /// A key-only entry drops its key with a WARNING (registered AST expressiveness gap — the
+    /// reference path does the same via its unsupported-child warning).
+    private @NotNull MatchPattern parseDictionaryMatchPattern() {
+        var start = current.startByte();
+        pushMultiline();
+        advance();
+
+        var entries = new ArrayList<DictEntry>();
+        var openEnded = false;
+        do {
+            if (check(GdTokenType.BRACE_CLOSE) || isAtEnd()) {
+                break;
+            }
+            if (match(GdTokenType.PERIOD_PERIOD)) {
+                if (openEnded) {
+                    pushError("The \"..\" pattern must be the last element in the pattern dictionary.");
+                } else {
+                    openEnded = true;
+                }
+                continue;
+            }
+            var key = parseExpression(false);
+            if (key == null) {
+                pushError("Expected expression as key for dictionary pattern.");
+            }
+            if (match(GdTokenType.COLON)) {
+                var sub = parseMatchPattern();
+                if (sub == null) {
+                    continue;
+                }
+                if (openEnded) {
+                    pushError("The \"..\" pattern must be the last element in the pattern dictionary.");
+                } else if (sub.rest()) {
+                    pushError("The \"..\" pattern cannot be used as a value.");
+                } else if (key != null) {
+                    entries.add(new DictEntry(key, sub.expression(),
+                            range(key.range().startByte(), sub.expression().range().endByte())));
+                }
+            } else if (key != null) {
+                pushWarning("Key-only dictionary pattern drops the key (the AST cannot represent it).",
+                        patternKeyNodeType(key), key.range());
+            }
+        } while (match(GdTokenType.COMMA));
+
+        consume(GdTokenType.BRACE_CLOSE, "Expected \"}\" to close the dictionary pattern.");
+        popMultiline();
+        return new MatchPattern(new DictionaryExpression(List.copyOf(entries), openEnded,
+                range(start, previous.endByte())), false);
+    }
+
+    /// CST-style node tag for the key-only-pattern warning, mirroring the reference path's tags
+    /// (`"string"` for a string literal key, `"identifier"` for an identifier key, etc.).
+    private static @NotNull String patternKeyNodeType(@NotNull Expression key) {
+        return switch (key) {
+            case LiteralExpression literal -> literal.kind();
+            case IdentifierExpression ignored -> "identifier";
+            case BinaryExpression ignored -> "binary_operator";
+            case UnaryExpression ignored -> "unary_operator";
+            case CallExpression ignored -> "call";
+            case AttributeExpression ignored -> "attribute";
+            case SubscriptExpression ignored -> "subscript";
+            case ArrayExpression ignored -> "array";
+            case DictionaryExpression ignored -> "dictionary";
+            default -> DIAGNOSTIC_NODE_TYPE;
+        };
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -929,7 +1796,7 @@ public final class GdScriptParser {
         }
 
         var variable = new VariableDeclaration(DeclarationKind.VAR, name, type, value, isStatic,
-                "variable_statement", range(start, previous.endByte()));
+                "variable_statement", range(start, extentEnd()));
         endStatement("variable declaration");
         return variable;
     }
@@ -957,20 +1824,21 @@ public final class GdScriptParser {
 
         var getterUsed = false;
         var setterUsed = false;
+        var accessorEnd = previous.endByte();
         // Run in a loop because accessor order doesn't matter.
         for (var i = 0; i < 2; i++) {
             if (functionName.equals("set")) {
                 if (setterUsed) {
                     pushError("Properties can only have one setter.");
                 } else {
-                    parsePropertyAccessor(true, referenceForm);
+                    accessorEnd = parsePropertyAccessor(true, referenceForm);
                     setterUsed = true;
                 }
             } else if (functionName.equals("get")) {
                 if (getterUsed) {
                     pushError("Properties can only have one getter.");
                 } else {
-                    parsePropertyAccessor(false, referenceForm);
+                    accessorEnd = parsePropertyAccessor(false, referenceForm);
                     getterUsed = true;
                 }
             } else {
@@ -995,7 +1863,9 @@ public final class GdScriptParser {
             functionName = previous.source();
         }
 
-        var end = previous.endByte();
+        // Inline form: the property tail ends at the last accessor suite's content end (the
+        // suite's own trailing DEDENT is not part of it, matching the reference path's extent).
+        var end = referenceForm ? previous.endByte() : accessorEnd;
         if (referenceForm) {
             endStatement("property declaration");
         }
@@ -1005,45 +1875,48 @@ public final class GdScriptParser {
         return end;
     }
 
-    /// Port of `GDScriptParser::parse_property_setter` / `parse_property_getter`.
-    private void parsePropertyAccessor(boolean setter, boolean referenceForm) {
+    /// Port of `GDScriptParser::parse_property_setter` / `parse_property_getter`. Returns the end
+    /// byte of the accessor (for the inline form: its suite's content end).
+    private int parsePropertyAccessor(boolean setter, boolean referenceForm) {
         if (referenceForm) {
             consume(GdTokenType.EQUAL, setter ? "Expected \"=\" after \"set\"" : "Expected \"=\" after \"get\"");
             consume(GdTokenType.IDENTIFIER,
                     setter ? "Expected setter function name after \"=\"." : "Expected getter function name after \"=\".");
-            return;
+            return previous.endByte();
         }
         if (setter) {
             consume(GdTokenType.PARENTHESIS_OPEN, "Expected \"(\" after \"set\".");
             consume(GdTokenType.IDENTIFIER, "Expected parameter name after \"(\".");
             consume(GdTokenType.PARENTHESIS_CLOSE, "Expected \")\" after parameter name.");
             consume(GdTokenType.COLON, "Expected \":\" after \")\".");
-            parseIsolatedSuite("setter declaration");
-        } else {
-            if (match(GdTokenType.PARENTHESIS_OPEN)) {
-                consume(GdTokenType.PARENTHESIS_CLOSE, "Expected \")\" after \"get(\".");
-                consume(GdTokenType.COLON, "Expected \":\" after \"get()\".");
-            } else {
-                consume(GdTokenType.COLON, "Expected \":\" or \"(\" after \"get\".");
-            }
-            parseIsolatedSuite("getter declaration");
+            return parseIsolatedSuite("setter declaration");
         }
+        if (match(GdTokenType.PARENTHESIS_OPEN)) {
+            consume(GdTokenType.PARENTHESIS_CLOSE, "Expected \")\" after \"get(\".");
+            consume(GdTokenType.COLON, "Expected \":\" after \"get()\".");
+        } else {
+            consume(GdTokenType.COLON, "Expected \":\" or \"(\" after \"get\".");
+        }
+        return parseIsolatedSuite("getter declaration");
     }
 
     /// Parses an accessor suite with the outer pending annotations saved aside: the suite's
     /// content is discarded entirely, so annotations inside it must not leak into the outer
     /// sequence (and the outer sequence's pending annotations must not be stolen by it).
-    private void parseIsolatedSuite(String context) {
+    /// Returns the suite block's end byte for the property tail's extent.
+    private int parseIsolatedSuite(String context) {
         var saved = new ArrayList<>(pendingAnnotations);
         pendingAnnotations.clear();
+        Block suite;
         try {
-            parseSuite(context);
+            suite = parseSuite(context);
         } finally {
             // Replace, not append: annotations left dangling inside the discarded accessor suite
             // are discarded with it instead of leaking onto the next outer member.
             pendingAnnotations.clear();
             pendingAnnotations.addAll(saved);
         }
+        return suite.range().endByte();
     }
 
     private record NamedType(@NotNull String name, @Nullable TypeRef type) {
@@ -1085,7 +1958,7 @@ public final class GdScriptParser {
         }
 
         var constant = new VariableDeclaration(DeclarationKind.CONST, named.name(), named.type(), value, false,
-                "const_statement", range(start, previous.endByte()));
+                "const_statement", range(start, extentEnd()));
         endStatement("constant declaration");
         return constant;
     }
@@ -1093,6 +1966,9 @@ public final class GdScriptParser {
     /// Port of `GDScriptParser::parse_parameter` (the variadic `...` marker itself is consumed by
     /// the signature loops, which also set {@link #parameterStartByte}).
     private @Nullable Parameter parseParameter() {
+        // Capture the start locally: a lambda default reuses the shared field for its own
+        // signature's parameters before this parameter's range is computed.
+        var start = parameterStartByte;
         if (!consume(GdTokenType.IDENTIFIER, "Expected parameter name.")) {
             return null;
         }
@@ -1103,7 +1979,7 @@ public final class GdScriptParser {
             defaultValue = parseExpression(false);
         }
         return new Parameter(named.name(), named.type(), defaultValue, false,
-                range(parameterStartByte, previous.endByte()));
+                range(start, extentEnd()));
     }
 
     /// Port of `GDScriptParser::parse_signal`, including the purely syntactic duplicate-name and
@@ -1208,9 +2084,11 @@ public final class GdScriptParser {
 
         pushMultiline();
         consume(GdTokenType.PARENTHESIS_OPEN, "Expected opening \"(\" after function name.");
-        var signature = parseFunctionSignature();
+        var signature = parseFunctionSignature(false);
 
         var headerEnd = previous.endByte();
+        var previousFunctionName = currentFunctionName;
+        currentFunctionName = name;
         Block body;
         if (!signature.hasBody()) {
             // Bodyless (abstract-style) functions end the statement at the signature.
@@ -1221,6 +2099,7 @@ public final class GdScriptParser {
         } else {
             body = parseSuite("function declaration");
         }
+        currentFunctionName = previousFunctionName;
 
         var end = Math.max(body.range().endByte(), headerEnd);
         if (name.equals("_init")) {
@@ -1235,10 +2114,10 @@ public final class GdScriptParser {
                                      boolean hasBody) {
     }
 
-    /// Port of `GDScriptParser::parse_function_signature` for functions: parameter list with rest
-    /// parameter and the purely syntactic ordering/duplicate checks, optional `->` return type, and
-    /// the optional trailing colon (its absence marks a bodyless function).
-    private @NotNull FunctionSignature parseFunctionSignature() {
+    /// Port of `GDScriptParser::parse_function_signature`: parameter list with rest parameter and
+    /// the purely syntactic ordering/duplicate checks, and optional `->` return type. Functions
+    /// allow a missing colon (bodyless/abstract form); lambdas require it (`forLambda`).
+    private @NotNull FunctionSignature parseFunctionSignature(boolean forLambda) {
         var parameters = new ArrayList<Parameter>();
         var declaredNames = new ArrayList<String>();
         if (!check(GdTokenType.PARENTHESIS_CLOSE) && !isAtEnd()) {
@@ -1300,8 +2179,112 @@ public final class GdScriptParser {
             }
         }
 
-        // The colon may not be present in the case of bodyless functions.
-        return new FunctionSignature(List.copyOf(parameters), returnType, match(GdTokenType.COLON));
+        // The colon may not be present in the case of bodyless functions; lambdas require it
+        // (the vendor reports but still parses the body afterwards).
+        var hasBody = forLambda
+                ? consume(GdTokenType.COLON, "Expected \":\" after lambda declaration.")
+                : match(GdTokenType.COLON);
+        return new FunctionSignature(List.copyOf(parameters), returnType, hasBody);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Lambda expression — port of parse_lambda (the `func` prefix rule).
+    // ---------------------------------------------------------------------------------------------
+
+    /// Port of `GDScriptParser::parse_lambda`: optional name, signature (parameters and `->` type
+    /// shared with functions), and a suite parsed with lambda-end semantics. When the lambda sits
+    /// in a multiline context (e.g. inside call parentheses), the enclosing indentation state is
+    /// snapshotted so the body can track indentation, and spurious layout tokens after the body
+    /// are raw-skipped without touching `previous`. Break/continue are disallowed inside, with
+    /// save/restore like the vendor.
+    private @Nullable Expression parseLambdaExpression() {
+        // The expression-level prefix rule always produces a LambdaExpression.
+        return (Expression) parseLambdaLike(false);
+    }
+
+    /// Shared lambda-body machinery. `statementLevel` selects the node type for the
+    /// statement-position `func` form: the reference path maps it to a (possibly named)
+    /// `FunctionDeclaration` rather than a lambda in an expression statement, so parity requires
+    /// that shape here (Godot itself parses both as a lambda expression statement).
+    private @NotNull Node parseLambdaLike(boolean statementLevel) {
+        var start = previous.startByte(); // the consumed `func` keyword
+        String name = null;
+        if (match(GdTokenType.IDENTIFIER)) {
+            name = previous.source();
+        }
+
+        var multilineContext = !multilineStack.isEmpty() && multilineStack.peekLast();
+        // Isolate the lambda body from any enclosing multiline mode (vendor push_multiline(false)).
+        pushMultiline(false);
+        if (multilineContext) {
+            tokenizer.pushExpressionIndentedBlock();
+        }
+        pushMultiline(); // for the parameters
+        consume(GdTokenType.PARENTHESIS_OPEN, name != null
+                ? "Expected opening \"(\" after lambda name."
+                : "Expected opening \"(\" after \"func\".");
+
+        var previousFunctionName = currentFunctionName;
+        currentFunctionName = name;
+        var signature = parseFunctionSignature(true);
+
+        var previousInLambda = inLambda;
+        inLambda = true;
+        var couldBreak = canBreak;
+        var couldContinue = canContinue;
+        canBreak = false;
+        canContinue = false;
+        // The body suite's parseStatement rounds clobber the shared statement-start field;
+        // the enclosing statement's range still needs its own start afterwards.
+        var savedStatementStart = statementStartByte;
+
+        // Comments before the `func` keyword are never lambda-body comments: they belong to the
+        // enclosing sequence (drained there later) or are grouping-internal trivia (skipped
+        // once the enclosing grouping's span is recorded at its close). Defer them for the
+        // duration of the body instead of letting the body's drains consume them.
+        deferCommentsBefore(start);
+        // Same isolation for annotations pending on the enclosing sequence (the body's merged
+        // drain would otherwise steal them, like the accessor-suite isolation does).
+        var enclosingAnnotations = List.copyOf(pendingAnnotations);
+        pendingAnnotations.clear();
+
+        Block body;
+        try {
+            body = parseSuite("lambda declaration", true);
+        } finally {
+            pendingAnnotations.clear();
+            pendingAnnotations.addAll(enclosingAnnotations);
+            statementStartByte = savedStatementStart;
+            restoreDeferredComments();
+        }
+
+        // The lambda-body isolation pop keeps pending comments: those after the body still
+        // belong to the enclosing sequence.
+        popMultiline(false);
+        if (multilineContext) {
+            // Skip spurious layout tokens left over from the enclosing expression without
+            // touching `previous` (vendor raw `tokenizer->scan()`, not `advance()`).
+            while (current.type() == GdTokenType.DEDENT || current.type() == GdTokenType.INDENT
+                    || current.type() == GdTokenType.NEWLINE) {
+                current = scanSkippingErrors();
+            }
+            tokenizer.popExpressionIndentedBlock();
+        }
+
+        currentFunctionName = previousFunctionName;
+        inLambda = previousInLambda;
+        canBreak = couldBreak;
+        canContinue = couldContinue;
+
+        // The lambda body's trailing end_statement may have consumed the layout token that
+        // follows the lambda (a plain NEWLINE here); enclosing extents end at the body instead.
+        trailingLambdaEndByte = body.range().endByte();
+        if (statementLevel) {
+            return new FunctionDeclaration(name != null ? name : "<anonymous>", signature.parameters(),
+                    signature.returnType(), false, body, range(start, body.range().endByte()));
+        }
+        return new LambdaExpression(name, signature.parameters(), signature.returnType(), body,
+                range(start, body.range().endByte()));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -1395,6 +2378,7 @@ public final class GdScriptParser {
                     new ParseRule(null, this::parseAssignment, Precedence.ASSIGNMENT);
             case QUESTION_MARK -> new ParseRule(null, this::parseInvalidToken, Precedence.CAST);
             case AWAIT -> new ParseRule(this::parseAwaitExpression, null, Precedence.NONE);
+            case FUNC -> new ParseRule(this::parseLambdaExpression, null, Precedence.NONE);
             case DOLLAR -> new ParseRule(this::parseGetNodeExpression, null, Precedence.NONE);
             case PRELOAD -> new ParseRule(this::parsePreloadExpression, null, Precedence.NONE);
             case SUPER -> new ParseRule(this::parseSuperExpression, null, Precedence.NONE);
@@ -1453,7 +2437,10 @@ public final class GdScriptParser {
 
         while (precedence.ordinal() <= ruleFor(current.type()).precedence().ordinal()) {
             var infixRule = ruleFor(current.type());
-            if (left == null || infixRule.infix() == null
+            // Vendor's infix-loop head also stops on a pending lambda end: an operator following
+            // the lambda boundary belongs to the enclosing flow, not to this expression
+            // (e.g. `return func(): return 1` keeps the bare lambda as the return value).
+            if (left == null || infixRule.infix() == null || lambdaEnded
                     || (stopOnAssign && current.type() == GdTokenType.EQUAL)) {
                 return left;
             }
@@ -1720,7 +2707,7 @@ public final class GdScriptParser {
             pushError("Expected signal or coroutine after \"await\".");
             return null;
         }
-        return new AwaitExpression(operand, range(startToken.startByte(), previous.endByte()));
+        return new AwaitExpression(operand, range(startToken.startByte(), extentEnd()));
     }
 
     /// Port of the `SUPER` branch of `GDScriptParser::parse_call`, mapped to the AST contract's
@@ -1783,7 +2770,7 @@ public final class GdScriptParser {
         // The right edge is the last consumed token, not the operand node's own end (a trailing
         // grouping `)` belongs to the consumed span, matching the tree-sitter path's CST ranges).
         return new UnaryExpression(operator.source(), operand,
-                range(operator.startByte(), previous.endByte()));
+                range(operator.startByte(), extentEnd()));
     }
 
     /// Port of `GDScriptParser::parse_binary_operator` (left-associative via precedence + 1 on the
@@ -1801,7 +2788,7 @@ public final class GdScriptParser {
             return null;
         }
         return new BinaryExpression(operator.source(), left, right,
-                range(extentStart, previous.endByte()));
+                range(extentStart, extentEnd()));
     }
 
     /// Port of `GDScriptParser::parse_binary_not_in_operator`. Godot wraps the membership binary
@@ -1824,7 +2811,7 @@ public final class GdScriptParser {
             return null;
         }
         return new BinaryExpression("not in", left, right,
-                range(extentStart, previous.endByte()));
+                range(extentStart, extentEnd()));
     }
 
     /// Port of `GDScriptParser::parse_ternary_operator` (`true_value if condition else false_value`).
@@ -1846,7 +2833,7 @@ public final class GdScriptParser {
             return null;
         }
         return new ConditionalExpression(condition, left, falseBranch,
-                range(extentStart, previous.endByte()));
+                range(extentStart, extentEnd()));
     }
 
     /// Port of `GDScriptParser::parse_cast`: the right side is a type specifier (parsed by
@@ -1907,7 +2894,7 @@ public final class GdScriptParser {
             return null;
         }
         return new AssignmentExpression(operator.source(), left, right,
-                range(extentStart, previous.endByte()));
+                range(extentStart, extentEnd()));
     }
 
     /// Port of `GDScriptParser::parse_invalid_token` for `?` (GDScript 2.x ternary syntax hint).

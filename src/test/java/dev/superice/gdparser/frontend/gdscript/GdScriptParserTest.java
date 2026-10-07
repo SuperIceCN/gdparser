@@ -2,6 +2,7 @@ package dev.superice.gdparser.frontend.gdscript;
 
 import dev.superice.gdparser.frontend.ast.AnnotationStatement;
 import dev.superice.gdparser.frontend.ast.ArrayExpression;
+import dev.superice.gdparser.frontend.ast.AssertStatement;
 import dev.superice.gdparser.frontend.ast.AssignmentExpression;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
@@ -12,25 +13,36 @@ import dev.superice.gdparser.frontend.ast.AttributePropertyStep;
 import dev.superice.gdparser.frontend.ast.AttributeSubscriptStep;
 import dev.superice.gdparser.frontend.ast.AwaitExpression;
 import dev.superice.gdparser.frontend.ast.BinaryExpression;
+import dev.superice.gdparser.frontend.ast.BreakStatement;
+import dev.superice.gdparser.frontend.ast.BreakpointStatement;
 import dev.superice.gdparser.frontend.ast.CallExpression;
 import dev.superice.gdparser.frontend.ast.CastExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.ClassNameStatement;
+import dev.superice.gdparser.frontend.ast.CommentStatement;
 import dev.superice.gdparser.frontend.ast.ConditionalExpression;
 import dev.superice.gdparser.frontend.ast.ConstructorDeclaration;
+import dev.superice.gdparser.frontend.ast.ContinueStatement;
 import dev.superice.gdparser.frontend.ast.DeclarationKind;
 import dev.superice.gdparser.frontend.ast.DictionaryExpression;
 import dev.superice.gdparser.frontend.ast.EnumDeclaration;
 import dev.superice.gdparser.frontend.ast.ExpressionStatement;
 import dev.superice.gdparser.frontend.ast.ExtendsStatement;
+import dev.superice.gdparser.frontend.ast.ForStatement;
 import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
 import dev.superice.gdparser.frontend.ast.GetNodeExpression;
 import dev.superice.gdparser.frontend.ast.IdentifierExpression;
+import dev.superice.gdparser.frontend.ast.IfStatement;
+import dev.superice.gdparser.frontend.ast.LambdaExpression;
 import dev.superice.gdparser.frontend.ast.LiteralExpression;
+import dev.superice.gdparser.frontend.ast.MatchStatement;
 import dev.superice.gdparser.frontend.ast.PassStatement;
+import dev.superice.gdparser.frontend.ast.PatternBindingExpression;
 import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.PreloadExpression;
 import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.RegionDirectiveStatement;
+import dev.superice.gdparser.frontend.ast.ReturnStatement;
 import dev.superice.gdparser.frontend.ast.SelfExpression;
 import dev.superice.gdparser.frontend.ast.SignalStatement;
 import dev.superice.gdparser.frontend.ast.SourceFile;
@@ -38,6 +50,7 @@ import dev.superice.gdparser.frontend.ast.Statement;
 import dev.superice.gdparser.frontend.ast.TypeTestExpression;
 import dev.superice.gdparser.frontend.ast.UnaryExpression;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
+import dev.superice.gdparser.frontend.ast.WhileStatement;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -45,6 +58,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1382,9 +1396,10 @@ class GdScriptParserTest {
 
     @Test
     void badStatementInSuiteThenSiblingRecovers() {
-        // `if` is deliberately outside the sync set; the NEWLINE terminates synchronization here.
+        // `if` now dispatches to the if-statement parser (like Godot), so a bare `if` reports the
+        // missing condition; the NEWLINE still terminates synchronization and the sibling recovers.
         var result = parse("func f():\n\tif\n\tpass\n");
-        assertTrue(errorMessages(result).contains("Expected statement, found \"if\" instead."));
+        assertTrue(errorMessages(result).contains("Expected conditional expression after \"if\"."));
         var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
         assertTrue(function.body().statements().stream().anyMatch(PassStatement.class::isInstance));
     }
@@ -1668,5 +1683,961 @@ class GdScriptParserTest {
         // `extends "res://场景.gd"` is 25 UTF-8 bytes + '\n', so `var` starts at byte 26.
         assertEquals(26, variable.range().startByte());
         assertEquals(new Point(1, 0), variable.range().startPoint());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Control flow: if/elif/else, while, for, return, break/continue, breakpoint, assert.
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void ifElifElseFoldsIntoClauses() {
+        var ast = cleanAst("func f(x):\n\tif x > 0:\n\t\treturn 1\n\telif x < 0:\n\t\treturn -1\n\telse:\n\t\treturn 0\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var ifStatement = assertInstanceOf(IfStatement.class, function.body().statements().getFirst());
+        // The statement spans from the `if` keyword to the end of the else suite.
+        assertEquals(new Range(12, 75, new Point(1, 1), new Point(6, 10)), ifStatement.range());
+        assertInstanceOf(BinaryExpression.class, ifStatement.condition());
+        assertEquals(new Range(21, 32, new Point(1, 10), new Point(2, 10)), ifStatement.body().range());
+
+        assertEquals(1, ifStatement.elifClauses().size());
+        var elif = ifStatement.elifClauses().getFirst();
+        // An elif clause spans from the `elif` keyword to the end of its own suite.
+        assertEquals(new Range(34, 57, new Point(3, 1), new Point(4, 11)), elif.range());
+        assertEquals(new Range(45, 57, new Point(3, 12), new Point(4, 11)), elif.body().range());
+
+        assertNotNull(ifStatement.elseBody());
+        assertEquals(new Range(64, 75, new Point(5, 6), new Point(6, 10)), ifStatement.elseBody().range());
+    }
+
+    @Test
+    void ifWithSingleLineSuite() {
+        var ast = cleanAst("func f():\n\tif x: return 1\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var ifStatement = assertInstanceOf(IfStatement.class, function.body().statements().get(0));
+        // A single-line body block spans exactly its statement.
+        assertEquals(new Range(17, 25, new Point(1, 7), new Point(1, 15)), ifStatement.body().range());
+        assertEquals(new Range(11, 25, new Point(1, 1), new Point(1, 15)), ifStatement.range());
+        assertTrue(ifStatement.elifClauses().isEmpty());
+        assertNull(ifStatement.elseBody());
+        assertInstanceOf(PassStatement.class, function.body().statements().get(1));
+    }
+
+    @Test
+    void ifMissingConditionFailsStatementButConsumesChain() {
+        var result = parse("func f():\n\tif:\n\t\tpass\n\telse:\n\t\tpass\n\tvar after = 1\n");
+        assertTrue(errorMessages(result).contains("Expected conditional expression after \"if\"."));
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        // The failed if produces no node, but the elif/else chain must be consumed so the
+        // sibling statement recovers cleanly instead of cascading errors.
+        assertEquals(1, function.body().statements().size());
+        assertInstanceOf(VariableDeclaration.class, function.body().statements().getFirst());
+    }
+
+    @Test
+    void whileLoopWithBreakAndContinue() {
+        var ast = cleanAst("func f():\n\twhile x < 3:\n\t\tbreak\n\t\tcontinue\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var whileStatement = assertInstanceOf(WhileStatement.class, function.body().statements().getFirst());
+        assertEquals(new Range(11, 42, new Point(1, 1), new Point(3, 10)), whileStatement.range());
+        assertEquals(new Range(23, 42, new Point(1, 13), new Point(3, 10)), whileStatement.body().range());
+        assertInstanceOf(BreakStatement.class, whileStatement.body().statements().get(0));
+        assertInstanceOf(ContinueStatement.class, whileStatement.body().statements().get(1));
+    }
+
+    @Test
+    void breakAndContinueOutsideLoopAreErrors() {
+        var breakResult = parse("func f():\n\tbreak\n");
+        assertEquals(List.of("Cannot use \"break\" outside of a loop."), errorMessages(breakResult));
+        var continueResult = parse("func f():\n\tcontinue\n");
+        assertEquals(List.of("Cannot use \"continue\" outside of a loop."), errorMessages(continueResult));
+    }
+
+    @Test
+    void breakInsideIfInsideLoopIsAllowed() {
+        // Loop flags are parser state that flows through nested control-flow suites.
+        var ast = cleanAst("func f():\n\twhile true:\n\t\tif x:\n\t\t\tbreak\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var whileStatement = assertInstanceOf(WhileStatement.class, function.body().statements().getFirst());
+        var ifStatement = assertInstanceOf(IfStatement.class, whileStatement.body().statements().getFirst());
+        assertInstanceOf(BreakStatement.class, ifStatement.body().statements().getFirst());
+    }
+
+    @Test
+    void breakAfterLoopIsRejectedAgain() {
+        // The loop flags must be restored after the loop suite, not left enabled.
+        var result = parse("func f():\n\twhile x:\n\t\tpass\n\tbreak\n");
+        assertEquals(List.of("Cannot use \"break\" outside of a loop."), errorMessages(result));
+    }
+
+    @Test
+    void forLoopPlainAndTyped() {
+        var ast = cleanAst("func f():\n\tfor i in range(3):\n\t\tpass\n\tfor j: int in arr:\n\t\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+
+        var plain = assertInstanceOf(ForStatement.class, function.body().statements().get(0));
+        assertEquals("i", plain.iterator());
+        assertNull(plain.iteratorType());
+        assertInstanceOf(CallExpression.class, plain.iterable());
+        assertEquals(new Range(11, 36, new Point(1, 1), new Point(2, 6)), plain.range());
+
+        var typed = assertInstanceOf(ForStatement.class, function.body().statements().get(1));
+        assertEquals("j", typed.iterator());
+        assertNotNull(typed.iteratorType());
+        assertEquals("int", typed.iteratorType().sourceText());
+        assertEquals(new Range(45, 48, new Point(3, 8), new Point(3, 11)), typed.iteratorType().range());
+        assertInstanceOf(IdentifierExpression.class, typed.iterable());
+    }
+
+    @Test
+    void forLoopMissingInUsesContextualMessage() {
+        var untyped = parse("func f():\n\tfor i x:\n\t\tpass\n");
+        assertTrue(errorMessages(untyped).contains("Expected \"in\" or \":\" after \"for\" variable name."));
+        var typed = parse("func f():\n\tfor i: int x:\n\t\tpass\n");
+        assertTrue(errorMessages(typed).contains("Expected \"in\" after \"for\" variable type specifier."));
+    }
+
+    @Test
+    void returnBareAndValued() {
+        var ast = cleanAst("func f():\n\treturn\nfunc g():\n\treturn 1\n");
+        var f = assertInstanceOf(FunctionDeclaration.class, ast.statements().get(0));
+        var bare = assertInstanceOf(ReturnStatement.class, f.body().statements().getFirst());
+        assertNull(bare.value());
+        assertEquals(new Range(11, 17, new Point(1, 1), new Point(1, 7)), bare.range());
+
+        var g = assertInstanceOf(FunctionDeclaration.class, ast.statements().get(1));
+        var valued = assertInstanceOf(ReturnStatement.class, g.body().statements().getFirst());
+        assertNotNull(valued.value());
+        assertEquals(new Range(29, 37, new Point(3, 1), new Point(3, 9)), valued.range());
+    }
+
+    @Test
+    void constructorReturnValueIsRejected() {
+        var result = parse("func _init():\n\treturn 1\n");
+        assertEquals(List.of("Constructor cannot return a value."), errorMessages(result));
+        // The value expression is still parsed and kept, like Godot's error-annotated node.
+        var constructor = assertInstanceOf(ConstructorDeclaration.class, result.ast().statements().getFirst());
+        assertNotNull(assertInstanceOf(ReturnStatement.class,
+                constructor.body().statements().getFirst()).value());
+
+        var staticResult = parse("static func _static_init():\n\treturn 1\n");
+        assertTrue(errorMessages(staticResult).contains("Constructor cannot return a value."));
+        // A plain function named like a constructor keeps returning values legally.
+        cleanAst("func _initish():\n\treturn 1\n");
+    }
+
+    @Test
+    void assertConditionAndMessage() {
+        var ast = cleanAst("func f():\n\tassert(x > 0, \"bad\")\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var assertStatement = assertInstanceOf(AssertStatement.class, function.body().statements().getFirst());
+        assertInstanceOf(BinaryExpression.class, assertStatement.condition());
+        assertNotNull(assertStatement.message());
+        // The statement spans the whole parenthesized form.
+        assertEquals(new Range(11, 31, new Point(1, 1), new Point(1, 21)), assertStatement.range());
+    }
+
+    @Test
+    void assertFormsWithoutMessageAndWithTrailingComma() {
+        var ast = cleanAst("func f():\n\tassert(x)\n\tassert(y,)\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var plain = assertInstanceOf(AssertStatement.class, function.body().statements().get(0));
+        assertNull(plain.message());
+        var trailing = assertInstanceOf(AssertStatement.class, function.body().statements().get(1));
+        assertNull(trailing.message());
+    }
+
+    @Test
+    void assertErrorsMatchGodot() {
+        var noParens = parse("func f():\n\tassert x > 0\n");
+        assertTrue(errorMessages(noParens).contains("Expected \"(\" after \"assert\"."));
+        var missingCondition = parse("func f():\n\tassert()\n");
+        assertTrue(errorMessages(missingCondition).contains("Expected expression to assert."));
+        var thirdArgument = parse("func f():\n\tassert(1, \"m\", 3)\n");
+        assertTrue(errorMessages(thirdArgument).contains("Expected \")\" after assert expression."));
+    }
+
+    @Test
+    void breakpointStatementParses() {
+        var ast = cleanAst("func f():\n\tbreakpoint\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var breakpoint = assertInstanceOf(BreakpointStatement.class, function.body().statements().getFirst());
+        assertEquals(new Range(11, 21, new Point(1, 1), new Point(1, 11)), breakpoint.range());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Match statement and patterns.
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void matchLiteralBindWildcardSections() {
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t1:\n\t\t\tpass\n\t\tvar a:\n\t\t\tpass\n\t\t_:\n\t\t\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        // The statement spans from the `match` keyword to the last section, excluding the DEDENT.
+        assertEquals(new Range(12, 63, new Point(1, 1), new Point(7, 7)), match.range());
+        assertEquals("v", assertInstanceOf(IdentifierExpression.class, match.value()).name());
+        assertEquals(3, match.sections().size());
+
+        var literal = match.sections().get(0);
+        assertEquals(new Range(23, 33, new Point(2, 2), new Point(3, 7)), literal.range());
+        assertEquals(new Range(23, 24, new Point(2, 2), new Point(2, 3)),
+                assertInstanceOf(LiteralExpression.class, literal.patterns().getFirst()).range());
+        assertNull(literal.guard());
+        assertEquals(new Range(25, 33, new Point(2, 4), new Point(3, 7)), literal.body().range());
+
+        var bind = match.sections().get(1);
+        var binding = assertInstanceOf(PatternBindingExpression.class, bind.patterns().getFirst());
+        assertEquals("a", binding.name());
+        // A bind pattern spans the whole `var a` form.
+        assertEquals(new Range(36, 41, new Point(4, 2), new Point(4, 7)), binding.range());
+
+        var wildcard = match.sections().get(2);
+        // The wildcard is a plain `_` identifier in the AST contract.
+        assertEquals("_", assertInstanceOf(IdentifierExpression.class,
+                wildcard.patterns().getFirst()).name());
+    }
+
+    @Test
+    void matchMultiplePatternsAndGuard() {
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t1, 2:\n\t\t\tpass\n\t\t3 when ok:\n\t\t\tbreakpoint\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+
+        var multi = match.sections().get(0);
+        assertEquals(2, multi.patterns().size());
+        assertEquals(new Range(23, 36, new Point(2, 2), new Point(3, 7)), multi.range());
+
+        var guarded = match.sections().get(1);
+        assertEquals("ok", assertInstanceOf(IdentifierExpression.class, guarded.guard()).name());
+        assertEquals(new Range(46, 48, new Point(4, 9), new Point(4, 11)), guarded.guard().range());
+        assertInstanceOf(BreakpointStatement.class, guarded.body().statements().getFirst());
+    }
+
+    @Test
+    void matchArrayPatternsWithRestMarker() {
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t[1, 2]:\n\t\t\tpass\n\t\t[_, var a, ..]:\n\t\t\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+
+        var closed = assertInstanceOf(ArrayExpression.class, match.sections().get(0).patterns().getFirst());
+        assertFalse(closed.openEnded());
+        assertEquals(2, closed.elements().size());
+        assertEquals(new Range(23, 29, new Point(2, 2), new Point(2, 8)), closed.range());
+
+        var open = assertInstanceOf(ArrayExpression.class, match.sections().get(1).patterns().getFirst());
+        assertTrue(open.openEnded());
+        // The `..` marker sets openEnded instead of adding an element.
+        assertEquals(2, open.elements().size());
+        assertEquals("_", assertInstanceOf(IdentifierExpression.class, open.elements().get(0)).name());
+        assertInstanceOf(PatternBindingExpression.class, open.elements().get(1));
+        assertEquals(new Range(41, 55, new Point(4, 2), new Point(4, 16)), open.range());
+    }
+
+    @Test
+    void matchDictionaryPatterns() {
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t{\"k\": 1, \"j\": var b, ..}:\n\t\t\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        var dictionary = assertInstanceOf(DictionaryExpression.class, match.sections().getFirst().patterns().getFirst());
+        assertTrue(dictionary.openEnded());
+        assertEquals(2, dictionary.entries().size());
+        var first = dictionary.entries().get(0);
+        assertEquals(new Range(24, 30, new Point(2, 3), new Point(2, 9)), first.range());
+        assertInstanceOf(LiteralExpression.class, first.value());
+        var second = dictionary.entries().get(1);
+        assertInstanceOf(PatternBindingExpression.class, second.value());
+        assertEquals(new Range(23, 47, new Point(2, 2), new Point(2, 26)), dictionary.range());
+    }
+
+    @Test
+    void matchNestedAndExpressionPatterns() {
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t[{\"k\": _}, [..]]:\n\t\t\tpass\n\t\t1 + 2:\n\t\t\tpass\n\t\t'y':\n\t\t\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+
+        var nested = assertInstanceOf(ArrayExpression.class, match.sections().get(0).patterns().getFirst());
+        var dict = assertInstanceOf(DictionaryExpression.class, nested.elements().get(0));
+        assertEquals("_", assertInstanceOf(IdentifierExpression.class, dict.entries().getFirst().value()).name());
+        var restOnly = assertInstanceOf(ArrayExpression.class, nested.elements().get(1));
+        assertTrue(restOnly.openEnded());
+        assertEquals(0, restOnly.elements().size());
+
+        assertInstanceOf(BinaryExpression.class, match.sections().get(1).patterns().getFirst());
+        // Single quotes produce a plain string literal (StringName needs the `&` prefix).
+        var stringPattern = assertInstanceOf(LiteralExpression.class, match.sections().get(2).patterns().getFirst());
+        assertEquals("string", stringPattern.kind());
+    }
+
+    @Test
+    void matchKeyOnlyDictionaryPatternDropsKeyWithWarning() {
+        var result = parse("func f(v):\n\tmatch v:\n\t\t{\"name\"}:\n\t\t\tpass\n");
+        // Registered AST expressiveness gap: exactly one WARNING, no errors; the entry is dropped.
+        var errors = errorMessages(result);
+        assertEquals(List.of(), errors);
+        var warnings = result.diagnostics().stream()
+                .filter(d -> d.severity() == AstDiagnosticSeverity.WARNING).toList();
+        assertEquals(1, warnings.size());
+        assertEquals("Key-only dictionary pattern drops the key (the AST cannot represent it).",
+                warnings.getFirst().message());
+        assertEquals("string", warnings.getFirst().nodeType());
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        var dictionary = assertInstanceOf(DictionaryExpression.class,
+                match.sections().getFirst().patterns().getFirst());
+        assertEquals(0, dictionary.entries().size());
+    }
+
+    @Test
+    void matchPassBranchIsConsumedWithoutNode() {
+        // Godot consumes a branch-level `pass` without producing a node; the reference path
+        // rejects it (registered §5.7 (ii) divergence).
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t1:\n\t\t\tpass\n\t\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        assertEquals(1, match.sections().size());
+    }
+
+    @Test
+    void matchLevelAnnotations() {
+        // `@warning_ignore` is consumed and dropped (this AST has no branch annotation field).
+        var ignored = cleanAst("func f(v):\n\tmatch v:\n\t\t@warning_ignore(\"unused\")\n\t\t1:\n\t\t\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ignored));
+        assertEquals(1, assertInstanceOf(MatchStatement.class,
+                function.body().statements().getFirst()).sections().size());
+        // Any other annotation is rejected, like Godot.
+        var result = parse("func f(v):\n\tmatch v:\n\t\t@export\n\t\t1:\n\t\t\tpass\n");
+        assertTrue(errorMessages(result).contains("Annotation \"@export\" is not allowed in this level."));
+    }
+
+    @Test
+    void matchRestPatternMisuseErrors() {
+        var branchLevel = parse("func f(v):\n\tmatch v:\n\t\t..:\n\t\t\tpass\n");
+        assertTrue(errorMessages(branchLevel).contains(
+                "Rest pattern can only be used inside array and dictionary patterns."));
+        var arrayTrailing = parse("func f(v):\n\tmatch v:\n\t\t[1, .., 2]:\n\t\t\tpass\n");
+        assertTrue(errorMessages(arrayTrailing).contains(
+                "The \"..\" pattern must be the last element in the pattern array."));
+        var dictTrailing = parse("func f(v):\n\tmatch v:\n\t\t{.., \"k\": 1}:\n\t\t\tpass\n");
+        assertTrue(errorMessages(dictTrailing).contains(
+                "The \"..\" pattern must be the last element in the pattern dictionary."));
+        var restValue = parse("func f(v):\n\tmatch v:\n\t\t{\"k\": ..}:\n\t\t\tpass\n");
+        assertTrue(errorMessages(restValue).contains("The \"..\" pattern cannot be used as a value."));
+    }
+
+    @Test
+    void matchHeaderAndBranchErrors() {
+        var noValue = parse("func f():\n\tmatch:\n\t\t1:\n\t\t\tpass\n");
+        assertTrue(errorMessages(noValue).contains("Expected expression to test after \"match\"."));
+        var noGuard = parse("func f(v):\n\tmatch v:\n\t\t1 when:\n\t\t\tpass\n");
+        assertTrue(errorMessages(noGuard).contains("Expected expression for pattern guard after \"when\"."));
+        var noColon = parse("func f(v):\n\tmatch v:\n\t\t1\n\t\t\tpass\n\t\t2:\n\t\t\tpass\n");
+        assertTrue(errorMessages(noColon).contains("Expected \":\" or \"when\" after \"match\" patterns."));
+    }
+
+    @Test
+    void matchSectionMissingColonRecoversToNextBranch() {
+        var result = parse("func f(v):\n\tmatch v:\n\t\t1\n\t\t2:\n\t\t\tpass\n");
+        assertTrue(errorMessages(result).contains("Expected \":\" or \"when\" after \"match\" patterns."));
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        // The recovery consumes the broken line; the next line parses as a normal branch.
+        assertEquals(2, match.sections().size());
+        assertEquals(1, match.sections().get(1).body().statements().size());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Lambda expressions.
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void lambdaSingleLineBody() {
+        var ast = cleanAst("var f = func(a): return a\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var lambda = assertInstanceOf(LambdaExpression.class, declaration.value());
+        assertNull(lambda.name());
+        assertNull(lambda.returnType());
+        assertEquals(1, lambda.parameters().size());
+        assertEquals("a", lambda.parameters().getFirst().name());
+        // The lambda spans from `func` to the body end; a single-line body starts at its statement.
+        assertEquals(new Range(8, 25, new Point(0, 8), new Point(0, 25)), lambda.range());
+        assertEquals(new Range(17, 25, new Point(0, 17), new Point(0, 25)), lambda.body().range());
+        assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+    }
+
+    @Test
+    void lambdaMultilineBody() {
+        var ast = cleanAst("var f = func(a):\n\treturn a\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var lambda = assertInstanceOf(LambdaExpression.class, declaration.value());
+        assertEquals(new Range(8, 26, new Point(0, 8), new Point(1, 9)), lambda.range());
+        assertEquals(new Range(16, 26, new Point(0, 16), new Point(1, 9)), lambda.body().range());
+        var returnStatement = assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+        assertEquals(new Range(18, 26, new Point(1, 1), new Point(1, 9)), returnStatement.range());
+    }
+
+    @Test
+    void lambdaNamedWithReturnTypeAndDefaults() {
+        var ast = cleanAst("var f = func named(x) -> int:\n\treturn x\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var lambda = assertInstanceOf(LambdaExpression.class, declaration.value());
+        assertEquals("named", lambda.name());
+        assertNotNull(lambda.returnType());
+        assertEquals("int", lambda.returnType().sourceText());
+        assertEquals(new Range(8, 39, new Point(0, 8), new Point(1, 9)), lambda.range());
+
+        var withDefaults = cleanAst("var g = func(a: int, b = 1): return a + b\n");
+        var defaulted = assertInstanceOf(LambdaExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(withDefaults)).value());
+        assertEquals(2, defaulted.parameters().size());
+        assertNotNull(defaulted.parameters().get(0).type());
+        assertNotNull(defaulted.parameters().get(1).defaultValue());
+    }
+
+    @Test
+    void lambdaInsideCallArguments() {
+        // Single-line body inside parentheses: the enclosing multiline context is snapshotted
+        // and restored, so the call keeps parsing after the lambda.
+        var ast = cleanAst("var x = g(func(a): return a, 2)\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var call = assertInstanceOf(CallExpression.class, declaration.value());
+        assertEquals(2, call.arguments().size());
+        assertInstanceOf(LambdaExpression.class, call.arguments().get(0));
+    }
+
+    @Test
+    void lambdaMultilineBodyInsideCallArguments() {
+        // A multiline lambda body inside call parentheses re-enables indentation tracking via the
+        // tokenizer's expression-indented-block snapshot; layout tokens before `, 2)` are skipped.
+        var ast = cleanAst("var x = g(func():\n\treturn 1\n, 2)\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var call = assertInstanceOf(CallExpression.class, declaration.value());
+        assertEquals(2, call.arguments().size());
+        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().get(0));
+        assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+    }
+
+    @Test
+    void lambdaAtStatementLevelBecomesAnonymousFunction() {
+        // Reference-path contract: a statement-position `func` maps to a FunctionDeclaration
+        // (named or `<anonymous>`), not a lambda in an expression statement.
+        var ast = cleanAst("func f():\n\tfunc(): pass\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var anonymous = assertInstanceOf(FunctionDeclaration.class, function.body().statements().get(0));
+        assertEquals("<anonymous>", anonymous.name());
+        assertNull(anonymous.returnType());
+        assertEquals(new Range(11, 23, new Point(1, 1), new Point(1, 13)), anonymous.range());
+        // The lambda-end state must be consumed so the sibling statement still parses.
+        assertInstanceOf(PassStatement.class, function.body().statements().get(1));
+
+        var named = cleanAst("func f():\n\tfunc named(): pass\n");
+        var namedFn = assertInstanceOf(FunctionDeclaration.class,
+                assertInstanceOf(FunctionDeclaration.class, onlyStatement(named)).body().statements().getFirst());
+        assertEquals("named", namedFn.name());
+
+        var typed = cleanAst("func f():\n\tfunc() -> int: return 1\n");
+        var typedFn = assertInstanceOf(FunctionDeclaration.class,
+                assertInstanceOf(FunctionDeclaration.class, onlyStatement(typed)).body().statements().getFirst());
+        assertEquals("<anonymous>", typedFn.name());
+        assertEquals("int", typedFn.returnType().sourceText());
+    }
+
+    @Test
+    void classBodyAnonymousFunctionIsRejected() {
+        // Godot requires a name on class-body functions; the reference path accepts anonymous
+        // ones (registered §5.7 (ii) divergence).
+        var result = parse("func(): pass\n");
+        assertTrue(errorMessages(result).contains("Expected function name after \"func\"."));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Comment and region-directive attribution (§5.4 rules pinned from the reference path).
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void commentsAndRegionsInsertIntoStatementSequence() {
+        var ast = cleanAst("#region 初始化\nvar x = 1 # 尾注释\n# 整行注释\nfunc f():\n\tpass # 尾\n#endregion\n");
+        var statements = ast.statements();
+
+        var regionStart = assertInstanceOf(RegionDirectiveStatement.class, statements.get(0));
+        assertEquals("start", regionStart.directive());
+        assertEquals("初始化", regionStart.label());
+
+        assertInstanceOf(VariableDeclaration.class, statements.get(1));
+        // A trailing comment lands right after the statement it follows.
+        assertEquals("# 尾注释", assertInstanceOf(CommentStatement.class, statements.get(2)).text());
+        // A whole-line comment takes its source position between siblings.
+        assertEquals("# 整行注释", assertInstanceOf(CommentStatement.class, statements.get(3)).text());
+
+        var function = assertInstanceOf(FunctionDeclaration.class, statements.get(4));
+        var body = function.body().statements();
+        assertInstanceOf(PassStatement.class, body.get(0));
+        var trailing = assertInstanceOf(CommentStatement.class, body.get(1));
+        assertEquals("# 尾", trailing.text());
+        // Columns are byte-based on both paths (`# 尾` is 5 UTF-8 bytes).
+        assertEquals(new Range(71, 76, new Point(4, 6), new Point(4, 11)), trailing.range());
+
+        var regionEnd = assertInstanceOf(RegionDirectiveStatement.class, statements.get(5));
+        assertEquals("end", regionEnd.directive());
+        assertNull(regionEnd.label());
+    }
+
+    @Test
+    void regionClassificationBoundaryForms() {
+        // `#regionfoo` counts as a start directive with label `foo`; `# region` with a space is
+        // a plain comment; `#endregion` always has a null label, even with trailing text.
+        var ast = cleanAst("#regionfoo\nvar x = 1\n#endregion done\n# region\n#region\nvar y = 1\n");
+        var statements = ast.statements();
+        var foo = assertInstanceOf(RegionDirectiveStatement.class, statements.get(0));
+        assertEquals("start", foo.directive());
+        assertEquals("foo", foo.label());
+        var end = assertInstanceOf(RegionDirectiveStatement.class, statements.get(2));
+        assertEquals("end", end.directive());
+        assertNull(end.label());
+        assertEquals("# region", assertInstanceOf(CommentStatement.class, statements.get(3)).text());
+        var noLabel = assertInstanceOf(RegionDirectiveStatement.class, statements.get(4));
+        assertEquals("start", noLabel.directive());
+        assertNull(noLabel.label());
+    }
+
+    @Test
+    void wholeLineCommentBeforeFirstBodyStatement() {
+        var ast = cleanAst("func f():\n\t# first\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var body = function.body().statements();
+        assertEquals("# first", assertInstanceOf(CommentStatement.class, body.get(0)).text());
+        assertInstanceOf(PassStatement.class, body.get(1));
+    }
+
+    @Test
+    void dedentedWholeLineCommentBelongsToOuterSequence() {
+        var ast = cleanAst("func f():\n\tpass\n# hello\nfunc g():\n\tpass\n");
+        var statements = ast.statements();
+        assertEquals(3, statements.size());
+        var f = assertInstanceOf(FunctionDeclaration.class, statements.get(0));
+        // f's body keeps only `pass`; the col-0 comment lands at the top level.
+        assertEquals(1, f.body().statements().size());
+        assertEquals("# hello", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
+        assertInstanceOf(FunctionDeclaration.class, statements.get(2));
+    }
+
+    @Test
+    void indentedTailCommentStaysInBody() {
+        var ast = cleanAst("class Inner:\n\tpass\n\t# inner\nvar x = 1\n");
+        var statements = ast.statements();
+        var inner = assertInstanceOf(ClassDeclaration.class, statements.get(0));
+        // The indented comment reaches the class-body indentation, so it stays inside and the
+        // body block extends over it.
+        assertEquals(2, inner.body().statements().size());
+        assertEquals("# inner", assertInstanceOf(CommentStatement.class,
+                inner.body().statements().get(1)).text());
+        assertEquals(new Range(12, 27, new Point(0, 12), new Point(2, 8)), inner.body().range());
+        assertInstanceOf(VariableDeclaration.class, statements.get(1));
+    }
+
+    @Test
+    void colZeroCommentMidBodyStaysWhenBodyContinues() {
+        var ast = cleanAst("func f():\n\tpass\n# mid\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var body = function.body().statements();
+        // The next code line still belongs to the body, so the col-0 comment stays inside.
+        assertEquals(3, body.size());
+        assertEquals("# mid", assertInstanceOf(CommentStatement.class, body.get(1)).text());
+    }
+
+    @Test
+    void trailingCommentExtendsSingleLineSuite() {
+        var ast = cleanAst("func f():\n\tif x: pass # c\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var ifStatement = assertInstanceOf(IfStatement.class, function.body().statements().get(0));
+        var ifBody = ifStatement.body().statements();
+        assertEquals(2, ifBody.size());
+        assertEquals("# c", assertInstanceOf(CommentStatement.class, ifBody.get(1)).text());
+        assertEquals(new Range(17, 25, new Point(1, 7), new Point(1, 15)), ifStatement.body().range());
+    }
+
+    @Test
+    void suiteHeaderTrailingCommentsAreDropped() {
+        // Both paths drop comments trailing a suite-header line.
+        var ast = cleanAst("func f(): # c\n\tpass\nfunc g():\n\tif x: # i\n\t\tpass\n\telse: # e\n\t\tpass\n");
+        var statements = ast.statements();
+        var f = assertInstanceOf(FunctionDeclaration.class, statements.get(0));
+        assertEquals(1, f.body().statements().size());
+        var g = assertInstanceOf(FunctionDeclaration.class, statements.get(1));
+        var ifStatement = assertInstanceOf(IfStatement.class, g.body().statements().getFirst());
+        assertEquals(1, ifStatement.body().statements().size());
+        assertEquals(1, ifStatement.elseBody().statements().size());
+    }
+
+    @Test
+    void matchBranchLevelCommentsAreDropped() {
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t# c\n\t\t1:\n\t\t\tpass\n\t\t# tail\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        assertEquals(1, match.sections().size());
+        // The section body keeps its own comment-free content; branch-level comments vanish.
+        assertEquals(1, match.sections().getFirst().body().statements().size());
+    }
+
+    @Test
+    void commentInsideExpressionIsIgnored() {
+        // Registered parity difference: the reference path materializes expression-internal
+        // comments as unknown-expression placeholders, which this parser cannot reproduce —
+        // comments never enter its token stream, so they are silently ignored.
+        var ast = cleanAst("var a = [\n\t1, # one\n\t2\n]\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var array = assertInstanceOf(ArrayExpression.class, declaration.value());
+        assertEquals(2, array.elements().size());
+    }
+
+    @Test
+    void commentBetweenAnnotationAndStatementKeepsByteOrder() {
+        var ast = cleanAst("@export\n# note\nvar x = 1\n");
+        var statements = ast.statements();
+        assertEquals(3, statements.size());
+        assertInstanceOf(AnnotationStatement.class, statements.get(0));
+        assertEquals("# note", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
+        assertInstanceOf(VariableDeclaration.class, statements.get(2));
+
+        var reordered = cleanAst("# note\n@export\nvar x = 1\n");
+        var reorderedStatements = reordered.statements();
+        assertEquals("# note", assertInstanceOf(CommentStatement.class, reorderedStatements.get(0)).text());
+        assertInstanceOf(AnnotationStatement.class, reorderedStatements.get(1));
+    }
+
+    @Test
+    void newlineBetweenStaticAndMemberIsRejectedLikeGodot() {
+        // Registered §5.7 (ii) divergence: the reference path accepts (and spans) a newline
+        // between `static` and the member; Godot rejects it immediately.
+        var result = parse("static\nvar x = 1\n");
+        assertTrue(errorMessages(result).contains("Expected \"func\" or \"var\" after \"static\"."));
+    }
+
+    @Test
+    void commentAtEofLandsAtTopLevel() {
+        var ast = cleanAst("var x = 1\n# eof comment\n");
+        var statements = ast.statements();
+        assertEquals(2, statements.size());
+        assertEquals("# eof comment", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
+        var noNewline = cleanAst("var x = 1 # tail");
+        assertEquals(2, noNewline.statements().size());
+        assertEquals("# tail", assertInstanceOf(CommentStatement.class,
+                noNewline.statements().get(1)).text());
+    }
+
+    @Test
+    void commentOnlyBodyIsRejectedLikeGodot() {
+        // Registered §5.7 (ii) divergence: comment-only lines never establish indentation, so a
+        // body with only comments is a missing indented block (the reference path accepts it).
+        var result = parse("func f():\n\t# only\nvar x = 1\n");
+        assertTrue(errorMessages(result).contains("Expected indented block after function declaration."));
+        // The comment is not lost into the void: it lands at the outer (top-level) sequence.
+        assertTrue(result.ast().statements().stream().anyMatch(CommentStatement.class::isInstance));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Review-driven regressions: lambda state machine, match recovery, grouping trivia.
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void lambdaArgumentDoesNotSwallowFollowingReturnValue() {
+        // Vendor clears the lambda-end marker on every real token advance: after a lambda in a
+        // condition's call, the following `return` must still parse its value.
+        var ast = cleanAst("func test():\n\tif f(func(): return 1, 2):\n\t\treturn 3\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var ifStatement = assertInstanceOf(IfStatement.class, function.body().statements().getFirst());
+        var returnStatement = assertInstanceOf(ReturnStatement.class,
+                ifStatement.body().statements().getFirst());
+        assertNotNull(returnStatement.value());
+    }
+
+    @Test
+    void lambdaBodyFailedStatementEndsLambdaAtOuterSeparator() {
+        // A token that cannot start a statement ends the lambda instead of being consumed
+        // (vendor's in-lambda branch); the enclosing call's separator stays intact.
+        var ast = cleanAst("var x = g(func():\n\treturn 1\n\t, 2)\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var call = assertInstanceOf(CallExpression.class, declaration.value());
+        assertEquals(2, call.arguments().size());
+        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().get(0));
+        assertEquals(1, lambda.body().statements().size());
+        assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+    }
+
+    @Test
+    void multilineLambdaDefaultKeepsParameterRangeAtBodyEnd() {
+        // The lambda body's trailing layout consumption must not stretch the parameter's range
+        // past the body (regression: it used to end at the trailing DEDENT).
+        var ast = cleanAst("func f(cb = func():\n\treturn 1\n):\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var parameter = function.parameters().getFirst();
+        assertEquals(new Range(7, 29, new Point(0, 7), new Point(1, 9)), parameter.range());
+        assertInstanceOf(LambdaExpression.class, parameter.defaultValue());
+    }
+
+    @Test
+    void matchMissingIndentDoesNotEatOuterDedent() {
+        var result = parse("func f():\n\tmatch v:\npass\nfunc g():\n\tpass\n");
+        assertTrue(errorMessages(result).contains("Expected an indented block after \"match\" statement."));
+        // Vendor returns immediately on the missing indented block: the outer function's DEDENT
+        // stays put, so the sibling declaration recovers as a top-level function.
+        var statements = result.ast().statements();
+        assertEquals(2, statements.stream().filter(FunctionDeclaration.class::isInstance).count());
+        var g = assertInstanceOf(FunctionDeclaration.class, statements.getLast());
+        assertEquals("g", g.name());
+        assertEquals(1, g.body().statements().size());
+    }
+
+    @Test
+    void matchDanglingWarningIgnoreIsDiagnosed() {
+        // A `@warning_ignore` left unattached (only `pass` follows, or it sits after the last
+        // branch) is reported, like the vendor's end-of-match sweep.
+        var beforePass = parse("func f(v):\n\tmatch v:\n\t\t@warning_ignore(\"unused\")\n\t\tpass\n");
+        assertTrue(errorMessages(beforePass).contains(
+                "Annotation \"@warning_ignore\" does not precede a valid target, so it will have no effect."));
+        var afterLastBranch = parse("func f(v):\n\tmatch v:\n\t\t1:\n\t\t\tpass\n\t\t@warning_ignore(\"unused\")\n");
+        assertTrue(errorMessages(afterLastBranch).contains(
+                "Annotation \"@warning_ignore\" does not precede a valid target, so it will have no effect."));
+        // Attached to a branch: consumed and dropped without diagnostics.
+        cleanAst("func f(v):\n\tmatch v:\n\t\t@warning_ignore(\"unused\")\n\t\t1:\n\t\t\tpass\n");
+    }
+
+    @Test
+    void matchTailKeepsLessIndentedCommentsForOuterSequence() {
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t_: pass\n# outer\nvar after = 1\n");
+        var statements = ast.statements();
+        assertEquals(3, statements.size());
+        assertEquals("# outer", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
+        assertInstanceOf(VariableDeclaration.class, statements.get(2));
+    }
+
+    @Test
+    void matchBodyColZeroCommentIsDroppedLikeGodot() {
+        // Registered §5.7 (ii): a col-0 comment between branches is trivia to Godot (and this
+        // parser) but breaks the reference grammar, so there is no parity promise.
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t1: pass\n# low\n\t\t2: pass\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        assertEquals(2, match.sections().size());
+        assertFalse(function.body().statements().stream().anyMatch(CommentStatement.class::isInstance));
+    }
+
+    @Test
+    void groupingInternalCommentIsSkippedWithoutEatingSequenceComments() {
+        var ast = cleanAst("# before\n@export_range(\n\t0, # internal\n\t10\n)\nvar x = 1\n");
+        var statements = ast.statements();
+        // The sequence comment before the annotation materializes; the argument-list-internal
+        // one is silently ignored (registered parity difference).
+        assertEquals(3, statements.size());
+        assertEquals("# before", assertInstanceOf(CommentStatement.class, statements.get(0)).text());
+        assertInstanceOf(AnnotationStatement.class, statements.get(1));
+        assertInstanceOf(VariableDeclaration.class, statements.get(2));
+        assertFalse(statements.stream().anyMatch(s -> s instanceof CommentStatement c
+                && c.text().contains("internal")));
+    }
+
+    @Test
+    void multiDedentMixedIndentCommentRunKeepsSimpleRule() {
+        // Registered §5.4 known difference: the reference scanner's col-0-comment lookahead
+        // backfills indentation across levels (an upstream-acknowledged heuristic), while this
+        // parser applies the plain indentation-threshold rule — a mixed run at a multi-dedent
+        // boundary lands at the top level here instead of the middle body.
+        var ast = cleanAst("class Outer:\n    class Inner:\n        pass\n# low\n        # high\nvar after = 1\n");
+        var statements = ast.statements();
+        assertInstanceOf(ClassDeclaration.class, statements.get(0));
+        assertEquals("# low", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
+        assertEquals("# high", assertInstanceOf(CommentStatement.class, statements.get(2)).text());
+        assertInstanceOf(VariableDeclaration.class, statements.get(3));
+    }
+
+    @Test
+    void forLoopTypeParseFailureUsesPlainInMessage() {
+        // Vendor `parse_type` returns null on failure, which selects the untyped message (a
+        // review-suggested alternate message was verified against the vendor and rejected).
+        var result = parse("func f():\n\tfor i: ??? in xs:\n\t\tpass\n");
+        assertTrue(errorMessages(result).contains("Expected \"in\" or \":\" after \"for\" variable name."));
+    }
+
+    @Test
+    void operatorAfterLambdaBoundaryIsNotFolded() {
+        // Vendor's infix-loop head stops on a pending lambda end: the same-indent `+ 2` is a
+        // new unary statement, not part of the return value (the reference path agrees).
+        var ast = cleanAst("func f():\n\treturn func(): return 1\n\t+ 2\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var body = function.body().statements();
+        assertEquals(2, body.size());
+        var returnStatement = assertInstanceOf(ReturnStatement.class, body.get(0));
+        assertInstanceOf(LambdaExpression.class, returnStatement.value());
+        var unary = assertInstanceOf(ExpressionStatement.class, body.get(1));
+        assertInstanceOf(UnaryExpression.class, unary.expression());
+    }
+
+    @Test
+    void commentBeforeLambdaInsideGroupingIsIgnored() {
+        // A comment inside an enclosing grouping but before the `func` keyword is grouping-
+        // internal trivia (registered difference), not a lambda-body comment.
+        var ast = cleanAst("var x = g(\n\t# internal\n\tfunc():\n\t\treturn 2\n)\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var call = assertInstanceOf(CallExpression.class, declaration.value());
+        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+        assertEquals(1, lambda.body().statements().size());
+        assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+
+        // A comment after the keyword stays a lambda-body comment.
+        var withBody = cleanAst("var x = g(\n\tfunc():\n\t\t# body\n\t\treturn 2\n)\n");
+        var bodyLambda = assertInstanceOf(LambdaExpression.class,
+                assertInstanceOf(CallExpression.class,
+                        assertInstanceOf(VariableDeclaration.class, onlyStatement(withBody)).value())
+                        .arguments().get(0));
+        assertEquals(2, bodyLambda.body().statements().size());
+        assertEquals("# body", assertInstanceOf(CommentStatement.class,
+                bodyLambda.body().statements().get(0)).text());
+    }
+
+    @Test
+    void lambdaBodyDoesNotStealPreKeywordPendingComments() {
+        // Pending comments before the `func` keyword are fenced off for the body: the sequence
+        // comment keeps its enclosing position, the argument-list one is ignored once the
+        // enclosing grouping closes, and only the body's own comment is drained.
+        var ast = cleanAst("# before\n@custom(\n\t# internal\n\tfunc():\n\t\t# body\n\t\treturn 2\n)\nvar x = 1\n");
+        var statements = ast.statements();
+        assertEquals(3, statements.size());
+        assertEquals("# before", assertInstanceOf(CommentStatement.class, statements.get(0)).text());
+        assertInstanceOf(AnnotationStatement.class, statements.get(1));
+        assertInstanceOf(VariableDeclaration.class, statements.get(2));
+        assertFalse(statements.stream().anyMatch(s -> s instanceof CommentStatement c
+                && c.text().contains("internal")));
+        var annotation = assertInstanceOf(AnnotationStatement.class, statements.get(1));
+        var lambda = assertInstanceOf(LambdaExpression.class, annotation.arguments().getFirst());
+        assertEquals(2, lambda.body().statements().size());
+        assertEquals("# body", assertInstanceOf(CommentStatement.class,
+                lambda.body().statements().get(0)).text());
+    }
+
+    @Test
+    void lambdaBodyDoesNotStealEnclosingPendingAnnotations() {
+        // Annotations collected by the enclosing sequence stay there; the lambda body's merged
+        // drain is isolated from them (same pattern as the accessor-suite isolation).
+        var ast = cleanAst("# before\n@first\n@custom(func(): return 2)\nvar x = 1\n");
+        var statements = ast.statements();
+        var names = statements.stream()
+                .filter(AnnotationStatement.class::isInstance)
+                .map(s -> ((AnnotationStatement) s).name())
+                .toList();
+        assertEquals(List.of("first", "custom"), names);
+        var custom = statements.stream()
+                .filter(AnnotationStatement.class::isInstance)
+                .map(AnnotationStatement.class::cast)
+                .filter(a -> a.name().equals("custom"))
+                .findFirst().orElseThrow();
+        var lambda = assertInstanceOf(LambdaExpression.class, custom.arguments().getFirst());
+        assertEquals(1, lambda.body().statements().size());
+        assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+    }
+
+    @Test
+    void nestedLambdaDefaultDoesNotStealEnclosingPendingAnnotations() {
+        var ast = cleanAst("@first\n@custom(func(cb = func(): return 1): return cb)\nvar x = 1\n");
+        var statements = ast.statements();
+        var names = statements.stream()
+                .filter(AnnotationStatement.class::isInstance)
+                .map(s -> ((AnnotationStatement) s).name())
+                .toList();
+        assertEquals(List.of("first", "custom"), names);
+    }
+
+    @Test
+    void nestedLambdaKeepsOuterBodyComments() {
+        // The inner lambda's fence must not swallow comments of the outer lambda's body.
+        var ast = cleanAst("var x = g(func():\n\t# outerBody\n\t@custom(func(): return 2)\n\tvar y = 1\n\treturn y\n)\n");
+        var declaration = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+        var outer = assertInstanceOf(LambdaExpression.class,
+                assertInstanceOf(CallExpression.class, declaration.value()).arguments().getFirst());
+        assertEquals("# outerBody", assertInstanceOf(CommentStatement.class,
+                outer.body().statements().get(0)).text());
+        assertEquals(4, outer.body().statements().size());
+    }
+
+    @Test
+    void matchTailDiscardedCommentsStillSpanMatchExtent() {
+        var ast = cleanAst("func f(v):\n\tmatch v:\n\t\t_: pass\n\t\t# branch\n\treturn 3\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().get(0));
+        // The tail branch-level comment produces no node, but the match node spans it (the
+        // reference path's extent covers it too).
+        assertEquals(new Range(12, 41, new Point(1, 1), new Point(3, 10)), match.range());
+        assertFalse(function.body().statements().stream().anyMatch(CommentStatement.class::isInstance));
+    }
+
+    @Test
+    void singleDedentMixedIndentCommentRunKeepsSimpleRule() {
+        // The multi-level mixed-run difference (§5.4 registered) also applies to a single
+        // dedent: the reference scanner backfills the col-0 comment's level from the following
+        // indented comment, this parser keeps the plain threshold rule.
+        var ast = cleanAst("func f():\n\tpass\n# low\n\t# high\nvar after = 1\n");
+        var statements = ast.statements();
+        assertEquals(4, statements.size());
+        assertInstanceOf(FunctionDeclaration.class, statements.get(0));
+        assertEquals(1, assertInstanceOf(FunctionDeclaration.class, statements.get(0))
+                .body().statements().size());
+        assertEquals("# low", assertInstanceOf(CommentStatement.class, statements.get(1)).text());
+        assertEquals("# high", assertInstanceOf(CommentStatement.class, statements.get(2)).text());
+    }
+
+    @Test
+    void lambdaDisallowsBreakButRestoresLoopState() {
+        var result = parse("func f():\n\twhile x:\n\t\tg(func(): break)\n\t\tbreak\n");
+        // `break` inside the lambda is rejected (vendor resets the loop flags for lambda bodies)…
+        assertTrue(errorMessages(result).contains("Cannot use \"break\" outside of a loop."));
+        // …but the enclosing loop's own `break` afterwards stays legal.
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var whileStatement = assertInstanceOf(WhileStatement.class, function.body().statements().getFirst());
+        assertInstanceOf(BreakStatement.class, whileStatement.body().statements().get(1));
+    }
+
+    @Test
+    void lambdaBareReturnForms() {
+        // `return` at the end of the line stays a bare return…
+        var ast = cleanAst("var f = func(): return\n");
+        var lambda = assertInstanceOf(LambdaExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value());
+        assertNull(assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst()).value());
+        // …and `return` right before the call's closing paren parses as bare too (the vendor
+        // rescues the failed value parse into no-return without an error).
+        var inCall = cleanAst("var x = g(func(): return)\n");
+        var callLambda = assertInstanceOf(LambdaExpression.class,
+                assertInstanceOf(CallExpression.class,
+                        assertInstanceOf(VariableDeclaration.class, onlyStatement(inCall)).value())
+                        .arguments().get(0));
+        assertNull(assertInstanceOf(ReturnStatement.class,
+                callLambda.body().statements().getFirst()).value());
+    }
+
+    @Test
+    void lambdaInsideParameterDefaultKeepsOuterRanges() {
+        // The lambda body's statements and the lambda signature's parameters reuse the shared
+        // statement/parameter start fields; the enclosing statement and parameter ranges must
+        // keep their own starts (regression: ranges were clobbered by nested parses).
+        var ast = cleanAst("func f(cb = func(a): return a):\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
+        var parameter = function.parameters().getFirst();
+        assertEquals("cb", parameter.name());
+        assertEquals(new Range(7, 29, new Point(0, 7), new Point(0, 29)), parameter.range());
+        assertInstanceOf(LambdaExpression.class, parameter.defaultValue());
+    }
+
+    @Test
+    void lambdaHeaderErrors() {
+        var namedNoParen = parse("var f = func named x:\n");
+        assertTrue(errorMessages(namedNoParen).contains("Expected opening \"(\" after lambda name."));
+        // `func x` treats `x` as the lambda name (the vendor matches any identifier), so the
+        // anonymous-message path needs a non-identifier after `func`.
+        var anonNoParen = parse("var f = func : return\n");
+        assertTrue(errorMessages(anonNoParen).contains("Expected opening \"(\" after \"func\"."));
+        var noColon = parse("var f = func(a) return a\n");
+        assertTrue(errorMessages(noColon).contains("Expected \":\" after lambda declaration."));
+        // The body is still parsed after the missing colon, like the vendor.
+        var lambda = assertInstanceOf(LambdaExpression.class,
+                assertInstanceOf(VariableDeclaration.class, noColon.ast().statements().getFirst()).value());
+        assertEquals(1, lambda.body().statements().size());
     }
 }

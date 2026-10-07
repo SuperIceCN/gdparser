@@ -170,6 +170,12 @@ public final class GdTokenizer {
         return Collections.unmodifiableList(comments);
     }
 
+    /// The live mutable trivia list for the parser (same package): it grows during scanning,
+    /// and the parser both reads ahead and temporarily re-inserts deferred prefixes into it.
+    @NotNull List<GdComment> modifiableComments() {
+        return comments;
+    }
+
     /// Port of `get_continuation_lines`: 1-based lines produced by backslash continuations.
     public @NotNull List<Integer> getContinuationLines() {
         return Collections.unmodifiableList(continuationLines);
@@ -510,7 +516,7 @@ public final class GdTokenizer {
             return;
         }
 
-        for (;;) {
+        for (; ; ) {
             var currentIndentChar = peek();
             var indentCount = 0;
 
@@ -660,7 +666,7 @@ public final class GdTokenizer {
             return;
         }
 
-        for (;;) {
+        for (; ; ) {
             var c = peek();
             switch (c) {
                 case ' ', '\t' -> advance();
@@ -884,7 +890,7 @@ public final class GdTokenizer {
         var prevLine = 0;
         var prevColumn = 0;
 
-        for (;;) {
+        for (; ; ) {
             if (isAtEnd()) {
                 return makeError("Unterminated string.");
             }

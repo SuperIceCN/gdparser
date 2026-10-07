@@ -1,6 +1,16 @@
 package dev.superice.gdparser.frontend.gdscript;
 
+import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestFactory;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
 /// Dual-path parity for the declaration layer: program prefix, class-body declarations,
 /// suites, annotations, types and the declaration-scoped expression subset. All snippets
@@ -8,6 +18,21 @@ import org.junit.jupiter.api.Test;
 /// divergences (docstring consumption, in-body `extends`, precedence corner combos) are
 /// intentionally excluded here and covered by dedicated Godot-structure tests.
 class GdParserParityTest extends GdParserParityTestSupport {
+
+    /// Phase 4 acceptance gate: all 13 fixtures must pass full-file dual-path parity, exercising
+    /// statements, control flow, lambdas, match patterns, properties, comments and regions
+    /// together (§5.7 (i); the whitelist stays limited to the registered entries).
+    @TestFactory
+    List<DynamicTest> fixtureFullFileParity() throws IOException {
+        var tests = new ArrayList<DynamicTest>();
+        for (var fixture : fixtureScripts()) {
+            tests.add(dynamicTest("fixture: " + fixture.getFileName(), () -> {
+                var source = Files.readString(fixture, StandardCharsets.UTF_8);
+                assertCleanParity(source);
+            }));
+        }
+        return List.copyOf(tests);
+    }
 
     @Test
     void programPrefixParity() {
@@ -218,5 +243,102 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("var a = 1 if c else 2 + 3\n");
         assertCleanParity("var a = x + 1 if c else y - 2\n");
         assertCleanParity("var a = x if c else y if d else z\n");
+    }
+
+    /// Control-flow statements share the same AST contract on both paths (§5.2 folding); every
+    /// sample must serialize byte-identically, ranges included.
+    @Test
+    void controlFlowParity() {
+        assertCleanParity("func f(x):\n\tif x > 0:\n\t\treturn 1\n\telif x < 0:\n\t\treturn -1\n\telse:\n\t\treturn 0\n");
+        assertCleanParity("func f():\n\tif x: return 1\n\tpass\n");
+        assertCleanParity("func f():\n\tif x:\n\t\tpass\n\telif y:\n\t\tpass\n\telif z:\n\t\tpass\n");
+        assertCleanParity("func f():\n\twhile x < 3:\n\t\tbreak\n\t\tcontinue\n");
+        assertCleanParity("func f():\n\tfor i in range(3):\n\t\tpass\n");
+        assertCleanParity("func f():\n\tfor i: int in arr:\n\t\tpass\n");
+        assertCleanParity("func f():\n\treturn\nfunc g():\n\treturn 1\n");
+        assertCleanParity("func f():\n\tassert(x > 0, \"bad\")\n");
+        assertCleanParity("func f():\n\tassert(x)\n\tbreakpoint\n");
+        assertCleanParity("func f():\n\twhile true:\n\t\tif x:\n\t\t\tbreak\n\t\telif y:\n\t\t\tcontinue\n");
+    }
+
+    /// Nested suites, semicolon-joined single-line suites and suite boundaries around loops.
+    @Test
+    void suiteShapeParity() {
+        assertCleanParity("func f():\n\tif x: pass; pass\n");
+        assertCleanParity("func f():\n\tfor i in a:\n\t\tfor j in b:\n\t\t\tif j: break\n");
+        assertCleanParity("func f():\n\tif a:\n\t\tpass\n\telse:\n\t\tif b:\n\t\t\tpass\n");
+        assertCleanParity("func f():\n\twhile x:\n\t\tpass\n\twhile y: pass\n\tpass\n");
+    }
+
+    /// Match sections and every pattern form. Branch-level `pass` is excluded (§5.7 (ii): the
+    /// reference path rejects it); key-only dictionary patterns and `@warning_ignore` are kept:
+    /// both paths drop the same information, so the ASTs still match byte-identically.
+    @Test
+    void matchParity() {
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t1:\n\t\t\tpass\n\t\tvar a:\n\t\t\tpass\n\t\t_:\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t1, 2:\n\t\t\tpass\n\t\t3 when ok:\n\t\t\tbreakpoint\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t[1, 2]:\n\t\t\tpass\n\t\t[_, var a, ..]:\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t[..]:\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t{\"k\": 1, \"j\": var b, ..}:\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t{\"name\"}:\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t[{\"k\": _}, [..]]:\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t1 + 2:\n\t\t\tpass\n\t\tCONST:\n\t\t\tpass\n\t\t'y':\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t1: pass\n\t\t_: pass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t@warning_ignore(\"unused\")\n\t\t1:\n\t\t\tpass\n");
+    }
+
+    /// Lambdas: single-line and indented bodies, names, signatures, statement-level use, and
+    /// lambdas nested in call parentheses (which exercise the expression-indented-block
+    /// snapshot/restore path on both sides).
+    @Test
+    void lambdaParity() {
+        assertCleanParity("var f = func(a): return a\n");
+        assertCleanParity("var f = func(a):\n\treturn a\n");
+        assertCleanParity("var f = func named(x) -> int:\n\treturn x\n");
+        assertCleanParity("var g = func(a: int, b = 1): return a + b\n");
+        assertCleanParity("var f = func(a):\n\tvar t = a\n\treturn t\n");
+        assertCleanParity("var x = g(func(a): return a, 2)\n");
+        assertCleanParity("var x = g(func():\n\treturn 1\n, 2)\n");
+        assertCleanParity("func f():\n\tfunc(): pass\n\tpass\n");
+        assertCleanParity("func f():\n\tfunc named(): pass\n");
+        assertCleanParity("func f():\n\tfunc() -> int: return 1\n");
+        assertCleanParity("var f = func(): return\n");
+    }
+
+    /// Comment/region attribution per §5.4: trailing, whole-line, dedent boundaries, annotation
+    /// and static interleavings, single-line suites. Expression-internal comments are excluded
+    /// (registered parity difference); header-line and match-level comments are kept (both paths
+    /// drop them identically).
+    @Test
+    void commentAttributionParity() {
+        assertCleanParity("#region 初始化\nvar x = 1 # 尾注释\n# 整行注释\nfunc f():\n\tpass # 尾\n#endregion\n");
+        assertCleanParity("func f():\n\tpass\n# hello\nfunc g():\n\tpass\n");
+        assertCleanParity("func f():\n\t# first\n\tpass\n");
+        assertCleanParity("var x = 1\n# eof comment\n");
+        assertCleanParity("@export\n# note\nvar x = 1\n");
+        assertCleanParity("# note\n@export\nvar x = 1\n");
+        assertCleanParity("class Inner:\n\tpass\n\t# inner\nvar x = 1\n");
+        assertCleanParity("func f():\n\tpass\n# mid\n\tpass\n");
+        assertCleanParity("func f():\n\tif x: pass # c\n\tpass\n");
+        assertCleanParity("func f(): # c\n\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t# c\n\t\t1:\n\t\t\tpass\n");
+        assertCleanParity("#regionfoo\nvar x = 1\n#endregion done\n# region\n#region\nvar y = 1\n");
+        assertCleanParity("func f():\n\twhile x: # w\n\t\tbreak # b\n");
+        assertCleanParity("func f():\n\tfor i in a: # f\n\t\tcontinue\n");
+    }
+
+    /// Cross-mechanism combinations that exercise the lambda state machine against calls,
+    /// conditions, defaults and match tails (review-driven).
+    @Test
+    void lambdaInteractionParity() {
+        assertCleanParity("func test():\n\tif f(func(): return 1, 2):\n\t\treturn 3\n");
+        assertCleanParity("var x = g(func():\n\treturn 1\n\t, 2)\n");
+        assertCleanParity("func f(cb = func():\n\treturn 1\n):\n\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t_: pass\n# outer\nvar after = 1\n");
+        assertCleanParity("func f():\n\treturn func(): return 1\n\t+ 2\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t_: pass\n\t\t# branch\n\treturn 3\n");
+        assertCleanParity("var x = g(func():\n\t# outerBody\n\t@custom(func(): return 2)\n\tvar y = 1\n\treturn y\n)\n");
+        assertCleanParity("# before\n@first\n@custom(func(): return 2)\nvar x = 1\n");
+        assertCleanParity("@first\n@custom(func(cb = func(): return 1): return cb)\nvar x = 1\n");
     }
 }

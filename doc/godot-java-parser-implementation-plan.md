@@ -157,8 +157,12 @@ tree-sitter 数据流（`GdParserFacade -> CstAdapter -> CstToAstMapper`）保�
 
 - tokenizer 将注释作为 trivia 收集（文本含前导 `#`、范围、是否整行/行尾），不进入 token 流。
 - 插入规则（已用现有路径 dump 钉死）：注释按其源位置插入**所属 suite/类体的语句序列**，作为独立 `CommentStatement`；行尾注释位于其所跟随语句**之后**（同级后继语句），整行注释按源顺序占位。示例：`var x = 1 # tail` → 类体语句序列 `[VariableDeclaration, CommentStatement("# tail"), ...]`；函数体内整行注释按源位置排在相邻语句之间。
-- `#region <label>`/`#endregion` 注释分类为 `RegionDirectiveStatement("start"/"end", label)`（`label` 为关键字后文本；`#endregion` 的 label 为 `null`，已钉死）。
-- Phase 4 对 fixtures 全量注释归属做 parity 验证；若发现无法以该规则复现的位置（如表达式内部的注释），登记为已知 parity 差异并附样例。
+- `#region <label>`/`#endregion` 注释分类为 `RegionDirectiveStatement("start"/"end", label)`（`label` 为关键字后文本去首尾空白，空则为 `null`；`#endregion` 的 label 恒为 `null`；`#regionfoo` 也算 start、label `"foo"`，`# region` 带空格则为普通注释——均已用旧路径 dump 钉死）。
+- 丢弃规则（两路径一致，已用旧路径 dump 钉死）：套件头行尾注释（`func f(): # c`、`if x: # c`、`else: # c` 等冒号后同行注释）不进入任何语句序列；match 体分支层级的整行注释同样被丢弃（分支 suite 内的注释按常规归属）。
+- dedent 前尾窗口的整行注释归属：注释缩进 ≥ 所属 body 缩进时留在 body 内（如 `func f():\n\tpass\n\t# inner\nvar x = 1\n` 中 `# inner` 留在 f 体内），否则归属外层序列（如 `func f():\n\tpass\n# hello\nfunc g():...` 中 `# hello` 归属顶层）；body 中间的整行注释只要下一行代码仍属于该 body 即留在 body 内（col 0 亦然）。
+- 表达式内部注释（如数组字面量元素间的 `[\n\t1, # one\n\t2\n]` 或调用/注解实参列表内）：旧路径产出 `UnknownExpression`（nodeType `comment`）+ WARNING；新 parser 的注释不进入 token 流、无法复现该形状，登记为已知 parity 差异——新 parser 静默忽略该类注释（实现：分组闭合时记录 span，各排水点跳过 span 内注释），parity 语料排除此类片段。
+- dedent 尾窗口的混合缩进注释组（col-0 注释与缩进注释相邻出现在 body 末尾，如 `func f():\n\tpass\n# low\n\t# high\nvar after = 1\n` 或多层嵌套 `class Outer:\n    class Inner:\n        pass\n# low\n        # high\nvar after = 1\n`）：旧路径 scanner 对 col-0 注释做下一行 lookahead 回填缩进（上游 issue #85/#42 承认的启发式缺陷），把整组注释回填进 body；新 parser 应用一致的缩进阈值规则，整组归属外层序列。该差异在**单层与多层 dedent 下均出现**（最小单层样例即上例；另有三层嵌套与顺序变体样例实证），登记为已知 parity 差异，parity 语料排除此类片段；孤立的单条注释（col-0 外出、缩进保留、body 中间 col-0）两路径一致，不受影响。
+- Phase 4 对 fixtures 全量注释归属做 parity 验证。
 
 ### 5.5 负号吸收（偏差 D1）
 
@@ -183,6 +187,13 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
   - key-only 字典 pattern（`{"name"}:`）：旧路径丢弃 key + WARNING——v1 对齐该行为并登记为 AST 表达力缺口（§5.2）。
   - 脚本前缀/类体中的独立文档字符串（如 `"""doc"""\nclass_name X\n`、`var x = 1\n"""doc"""\nvar y = 2\n`）：Godot 将其消费为文档字符串、不产出节点；旧路径产出 `ExpressionStatement(LiteralExpression("string"))`——新 parser 按 Godot 落地（不产节点），parity 语料排除此类片段（Phase 2 探针实证，fixtures 不含此形态）。
   - 嵌套类缩进体首行的 `extends`（`class Inner:\n\textends Base\n\tpass\n`）：Godot 将其设为类超类、不产出节点；旧路径在 body 内产出 `ExtendsStatement` 且 `extendsTarget = null`——新 parser 按 Godot 落地（`extendsTarget = "Base"`），parity 语料排除此类片段（Phase 2 探针实证，fixtures 不含此形态）。
+  - match 体 `pass` 分支（`match v:\n\t1:\n\t\tpass\n\tpass\n`）：Godot 消费 `pass` 且不产出分支；旧路径整体报 ERROR——新 parser 按 Godot 处理，parity 语料排除（Phase 4 探针实证）。
+  - match 层级注解：`@warning_ignore(...)` 两路径均消费并丢弃（旧路径静默、Godot 挂到分支后由本项目 AST 丢弃）；其他注解（如 `@export`）Godot 报 `Annotation "%s" is not allowed in this level.`，旧路径静默丢弃——新 parser 按 Godot 报错，parity 语料排除（Phase 4 探针实证）。
+  - 纯注释套件体（`func f():\n\t# only\nvar x = 1\n`）：注释行不建立缩进，Godot/新 parser 报 `Expected indented block...`；旧路径接受并把注释作为 body 唯一内容——parity 语料排除（Phase 4 探针实证）。
+  - `assert` 超过两个实参（`assert(1, "m", 3)`）：Godot/新 parser 报 `Expected ")" after assert expression.`；旧路径静默丢弃多余实参——parity 语料排除（Phase 4 探针实证）。
+  - 类体/顶层匿名函数（`func(): pass\n`）：Godot/新 parser 报 `Expected function name after "func".`；旧路径接受并产出 `FunctionDeclaration("<anonymous>")`——parity 语料排除（Phase 4 探针实证）。注：**suite 内**的语句级 `func`（命名或匿名）两路径行为一致——均产出 `FunctionDeclaration`（匿名时 `"<anonymous>"`），这是 AST 契约形状而非分歧。
+  - `static` 与成员之间换行（`static\nvar x = 1`、`static\n# c\nvar x = 1`）：Godot/新 parser 立即报 `Expected "func" or "var" after "static".`（vendor 逐字如此）；旧路径接受并把 `static` 跨进成员节点（其间注释随之丢弃）——parity 语料排除（Phase 4 探针实证）。
+  - match 体分支间 col-0 整行注释（`match v:\n\t\t1: pass\n# low\n\t\t2: pass\n`）：Godot 视注释为 trivia 正常解析；旧路径 grammar 报 ERROR——新 parser 按 Godot 解析（注释随 match 分支层丢弃），parity 语料排除（Phase 4 探针实证）。match 体**尾部** col-0 注释（后续代码 dedent）旧路径正常并归属外层，两路径一致。
 - **(iii) 运算符优先级分歧组合**：见 §5.8（D3 已确认与 Godot 锚定）；parity 矩阵对这些组合断言 Godot 结构、不作双路径一致要求。
 - **非法源**（独立验收，不参与 parity 分类）：不要求 AST 一致；要求新 parser (a) 不抛异常、可终止，(b) 产生 ≥1 条 ERROR 诊断且 range 有效，(c) synchronize 后的兄弟声明结构正确（如类体中一个坏函数之后的函数完整解析）。
 - 已知差异白名单：仅本条 (ii)(iii) 登记项；新增豁免须在 §5 中登记原因与样例。
@@ -335,6 +346,37 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 - 13 个 fixtures 全文件双路径 parity 通过（§5.7 (i) 类；白名单仅限 §5.7 已登记项）。
 - `Sample10_Operators.gd` 全文件 parity 在此一并验收；lambda/match/属性块/region 专测通过。
 - 运行：`script/run-gradle-targeted-tests.sh --tests GdScriptParserTest,GdParserParityTest`。
+
+实施状态（2026-10-07 完成）：
+
+- 控制流语句：✅ `if`/`elif`/`else`（§5.2 折叠，`elif` 链由循环消费、缺条件时整链消费但不出节点）、`while`、`for`（可选 `: type`，两条语境化 `in` 错误消息）、`return`（含 lambda 形态的 `in_lambda && !is_statement_end_token()` 补解析分支）、`break`/`continue`/`breakpoint`、`assert`（括号形态、可选 message、允许一个尾逗号；三参按 Godot 报 `Expected ")" after assert expression.`，登记 §5.7 (ii)）。语句/子句/套件 range 全部按旧路径 dump 钉死（body 块始于冒号后 NEWLINE、单行套件始于首语句、`elif` 子句始于 `elif` 关键字、外围语句终于最后套件尾）。
+- 移植检查（§5.6）：✅ `break`/`continue` 循环上下文（`canBreak`/`canContinue` 围绕循环套件 save/enable/restore，循环后自动复原）、构造器 `return` 带值（`currentFunctionName` 跟踪 `_init`/`_static_init`，报错后值表达式照常解析保留）。
+- 测试：✅ `GdScriptParserTest` 新增 14 例（形状/range/恢复/正反诊断），`GdParserParityTest` 新增 `controlFlowParity`/`suiteShapeParity` 两组；既有 `badStatementInSuiteThenSiblingRecovers` 因 `if` 成为合法语句关键字而按 Godot 新行为更新断言（裸 `if` 现报 `Expected conditional expression after "if".`，兄弟恢复不变）。
+- match：✅ `parseMatch`/`parseMatchSection`/`parseMatchPattern` 全量移植——字面量/表达式（一般表达式解析，`false` 禁赋值）、`var x` 绑定（`PatternBindingExpression`，range 覆盖 `var x`）、`_` 通配（普通标识符 AST）、`..` rest（仅容器内合法，转为 `openEnded`；分支层级/rest 作值/rest 后还有元素均按 vendor 消息报错）、数组/字典嵌套 pattern、逗号多 pattern、`when` guard。match 体 `pass` 按 Godot 消费不产节点（登记 §5.7 (ii)）；match 层级注解仅 `@warning_ignore` 消费丢弃、其余报 `Annotation "@%s" is not allowed in this level.`（登记 §5.7 (ii)）；match 体分支层级注释丢弃（两路径一致）。key-only 字典 pattern 丢 key + 单条 WARNING（nodeType 镜像旧路径 CST 标签，如 `"string"`），已登记表达力缺口。bind 冲突族检查（多 pattern+bind、重复 bind、遮蔽局部变量）随 §5.6 暂缓。match 语句 range 终于最后分支（不含 DEDENT，实证修复）。
+- 测试：✅ `GdScriptParserTest` 新增 11 例（全 pattern 形态/归属/range/恢复/正反诊断）、`GdParserParityTest` 新增 `matchParity`（含 key-only 与 `@warning_ignore`——两路径丢同样信息故 AST 仍逐字节一致）。
+- lambda：✅ `parseLambdaLike` 全量移植——可选名字、签名复用（`forLambda` 参数化冒号为必需，`Expected ":" after lambda declaration.`）、`pushMultiline(false)` 隔离 + multiline 上下文时 `pushExpressionIndentedBlock` 快照、体结束后按 vendor 顺序 pop 并 raw-skip 多余 DEDENT/INDENT/NEWLINE（不动 `previous`）再 `popExpressionIndentedBlock`；`inLambda`/`lambdaEnded` 全状态接入 `isStatementEnd()`/`endStatement()`（含 vendor `if (!found)` 守卫——仅在未消费真实终止 token 时才标记 lambda 结束，否则多语句 lambda 体次行语句会被切断，已实证）；`parseSuite(context, forLambda)` 的 DEDENT consume/match 分岔与循环 `!lambdaEnded` 条件按 vendor 落地；lambda 内禁 break/continue（save/restore），`return` 的 lambda 补解析分支（`g(func(): return)` 为 bare return 不报错）。**语句级 `func` 按旧路径契约产出 `FunctionDeclaration`（匿名时 `"<anonymous>"`）** 并随后 `endStatement("expression")` 消费 lambda-end 状态；类体匿名函数按 Godot 报错（登记 §5.7 (ii)）。
+- 尾随 lambda extent：✅ Godot 与 tree-sitter 对 lambda 尾部 extent 存在结构分歧（lambda 体内层 `end_statement` 已消费后续 NEWLINE/DEDENT，Godot 将其算入外层 extent、tree-sitter 不算）——按 parity 锚定引入 `trailingLambdaEndByte` 覆盖（lambda 记录 body 尾，后续任意 `advance()` 失效），作用于 var/const/return/表达式语句/赋值/二元/三元/一元/`not in`/`await` 的右缘取值，分组/调用/容器等后续 token 场景不受影响。
+- 测试：✅ `GdScriptParserTest` 新增 10 例（单行/多行/命名/默认值/括号内/多行括号内/语句级三种形态/类体匿名负例/break 状态/bare return/头部错误），`GdParserParityTest` 新增 `lambdaParity` 9 条。
+- 注释/region trivia：✅ §5.4 规则全量落地——`materializeComment`（`#endregion` 优先于 `#region` 前缀判定；start label 去空白、空为 null、end 恒 null；`#regionfoo`/`# region` 边界钉死）；三源合并排水 `drainAnnotationsAndComments`（注解+两类注释按字节序，处理 `@export\n# note\nvar` 与 `# note\n@export\nvar` 两种交错）、`drainTrailingComments`（语句/成员后紧跟）、`drainTailWithAnnotations`（dedent 尾窗口按缩进阈值归属，含悬挂注解字节序合并）；套件头行尾注释（`func f(): # c`/`if x: # c`/`else: # c`/`class Inner: # c`/`match v: # c`）与 match 分支层级注释按两路径一致行为丢弃；**分组闭合 pop 丢弃组内注释**（`popMultiline(discardInternalComments)`——表达式内部注释按登记差异静默忽略，lambda 隔离 pop 明确不丢弃以免误吃外层注释）；`static` 后换行按 vendor 逐字报错（登记 §5.7 (ii)）。
+- 测试：✅ `GdScriptParserTest` 新增 15 例（归属/region 边界/dedent 双向/注解交错/丢弃规则/EOF/纯注释体负例等），`GdParserParityTest` 新增 `commentAttributionParity` 15 条。
+- 属性块与 range 收尾：✅ 内联属性尾缘取最后 accessor suite 的内容尾（不吃 suite 自己的 DEDENT）；`layoutBlockStart`（多行套件/类体块起点回填行尾空白，与旧路径块起点一致）；`parseLambdaLike` 保存恢复 `statementStartByte`、`parseParameter` 本地化起点（lambda 体/签名嵌套不再覆盖外层 range 起点，两处均以 fixtures 实证并加回归）；`parseAssignment` 右缘补接 `extentEnd()`。
+- **验收：✅ 13 个 fixtures 全文件双路径 parity 通过（含 `Sample10_Operators.gd`，由 `GdParserParityTest.fixtureFullFileParity` 动态发现断言）；lambda/match/属性块/region 专测全绿；18 个前端测试类回归全绿（`GdScriptParserTest` 239 例中的两类合计 + parity 动态用例）。**
+- 审阅修复（review-expert-a/c 复核确认）：
+  - `advance()` 按 vendor 逐字清 `lambdaEnded`（`gdscript_parser.cpp:582`）——修复 lambda 实参后 `return` 值被吞（`if f(func(): return 1, 2):\n\t\treturn 3` 实证）。
+  - `parseStatement` 表达式失败分岔补 vendor `in_lambda` 分支（`gdscript_parser.cpp:2163-2175`）：lambda 体内不能开头的 token 置 `lambdaEnded` 而不消费，外层表达式分隔符保留（`g(func():\n\treturn 1\n\t, 2)` 实证两实参零诊断）。
+  - match 缺 INDENT 按 vendor 立即返回：不消费 DEDENT（不再吃掉外层套件边界）、不做注释丢弃。
+  - match 尾部注释改为按缩进 scoped 丢弃（仅 ≥ match 体缩进的分支层注释丢弃），col-0 外层注释不再被误吞；分支间 col-0 注释行为登记 §5.7 (ii)（旧路径 grammar 报错）。
+  - match 悬空 `@warning_ignore` 按 vendor 报 `Annotation "@%s" does not precede a valid target, so it will have no effect.`（仅 `@warning_ignore` 入栈，`@export` 等仍走 "not allowed" 且不入栈）。
+  - 分组内注释丢弃改为 **span 记录**（`groupingCommentSpans` + 各排水点跳过），修复游标前缀阻塞导致分组内注释外泄（`# before\n@export_range(\n\t0, # internal\n\t10\n)` 实证：序列注释保留、组内注释忽略）。
+  - `parseParameter` 右缘补 `extentEnd()`（多行 lambda 默认值时参数 range 不再跨入 DEDENT）。
+  - `parse()` 末尾加 multiline 双栈配平断言（vendor debug 不变量）。
+  - A 提出的 for 类型失败后 `in` 消息选择问题经 vendor 核实**不成立**（`parse_type` 失败返回 `nullptr`，`gdscript_parser.cpp:3860-3861`，消息选择与现状一致），已加钉死测试。
+  - C 提出的多重 dedent 混合缩进注释组归属差异经 4 组探针实证旧路径确为上游承认的启发式行为，按 §5.4 登记为已知 parity 差异（主流单层形态两路径一致）。
+- 审阅修复·第二轮（A/C 复核确认）：
+  - `parsePrecedence` 中缀循环头补 vendor `lambda_ended` 早退（`gdscript_parser.cpp:2807-2809`）：lambda 边界后的同缩进运算符不再被折叠（`return func(): return 1\n\t+ 2` 中返回值为裸 lambda、`+ 2` 为独立一元语句；旧路径与 vendor 一致，已入 parity）。A 原始复现（`return 1 +\n\t, 2`）经探针证实两路径均为非法源（旧路径产出畸形 `+ ,` 运算符 + ERROR），不构成 parity 缺陷，但触发的合法形态缺失属实。
+  - lambda 体前的 pending 注释处理：采用**延迟-归还**机制（`deferCommentsBefore`/`restoreDeferredComments`，可变 trivia 视图 `GdTokenizer.modifiableComments`）——`func` 关键字前的注释在体解析期间移出游标（既不属 lambda body，也不被体排水窃取），体毕归还游标头；组内注释随后由分组闭合 span 惰性跳过，序列注释回到外层排水（`# before\n@custom(\n\t# internal\n\tfunc():…` 与嵌套 lambda `@custom(func(): return 2)` 两复现实证，后者与旧路径逐字节 parity 并入语料）；同模式隔离 `pendingAnnotations`（try/finally save/clear/restore，与 accessor 套件隔离同构），外层悬挂注解不再被 lambda body 窃取（`@first\n@custom(func(): return 2)` 直接与默认参数嵌套两复现，均入 parity 语料）。
+  - match 尾部 scoped 丢弃注释同步扩展 match 右缘（旧路径 match extent 覆盖被丢注释；`_: pass\n\t\t# branch` 实证并入 parity）。
+  - §5.4 混合缩进注释组差异边界由"多重 dedent"扩展为"dedent 尾窗口（含单层）"，附最小单层样例（C 复核裁决）。
 
 ### Phase 5：错误恢复与诊断（P0）
 
