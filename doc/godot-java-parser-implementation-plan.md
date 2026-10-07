@@ -413,6 +413,17 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 
 ### Phase 6：Facade、并发与收尾（P1）
 
+实施状态（2026-10-07 完成，review-expert-c 终审 APPROVE）：
+
+- Facade：✅ 新建 `GdScriptParserFacade`（`frontend.gdscript`，包已在 module-info 导出）——`parse`（容错，fresh parser per call）、`parseStrict`（首个 ERROR 诊断即抛 `IllegalStateException`，消息格式 `Parsing failed at <nodeType>: <message>` 镜像 `CstToAstMapper.mapStrict` 的 `Lowering failed at ...` 形态；WARNING 不触发）、`tokenize`（raw 扫描流，含 ERROR 与结尾 EOF token，无 parser multiline 干预）。类注释钉死无状态并发契约。
+- 测试：✅ `GdScriptParserFacadeTest` 11 例——容错/严格正反（含 WARNING-only 不抛：key-only 字典 pattern 语料）、strict 消息格式钉死、raw 流三条（ERROR token 透传至 EOF；分组内 NEWLINE/INDENT 在 raw 流保留而 parse 干净；分组内错位 dedent 在 raw 流报 `Unindent doesn't match...` 而 parse 零错误——锚定「raw 流 ERROR 数不作合法性判据」）、同 facade 顺序调用状态隔离、共享 facade 8 线程 × 25 轮并发（parse/tokenize/parseStrict 三入口均覆盖合法与非法语料并与顺序基线一致，AST 经序列化对比、诊断按 record 值相等对比）。
+- 性能基线（风险 9）：✅ 13 个 fixtures 经一次性计时夹具测量（JIT 预热 20 轮后每 fixture 200 次 `GdScriptParser.parse`，取均值/最优；测量后夹具已删除，不入常规套件）。环境：JDK 25.0.4、Xeon E5-2699 v4 @ 2.20GHz（仅作量级参照，不设阈值）：单 fixture 均值 35.4–870.0 µs（最大为 5.3 KB 的 `Sample10_Operators.gd`），13 个 fixtures（合计约 41.6 KB）均值合计约 4.38 ms/全量轮，即吞吐量级 ≈9.5 MB/s。
+- 文档：✅ `doc/architecture-overview.md` 更新——§1 双前端定位、§2 双数据流图（两路在 `frontend.ast` 汇合；raw tokenize 注意事项；补全仍为 tree-sitter 路径独占）、§3 新增 `frontend.gdscript` 包（职责/主要类型/并发契约/vendor 基线）、§5 拆分两栈错误模型并新增 parity 规则索引（指向本文档 §5.1-§5.7/§7）、§6 测试分层补新 parser 五类、§8 性能基线状态、§9 目标测试命令补 parity；`doc/tree-sitter-ng-gdscript-implementation-plan.md` §7 增加对本文档的交叉引用。
+- 审阅修复（review-expert-c 一轮）：
+  - **MEDIUM**：架构文档误称新 parser 产出 `ErrorStatement`/`ErrorExpression` 占位与 MISSING 类诊断——实证 `GdScriptParser` 从不构造这两类节点（缺条件等必需表达式时按 vendor 消费整链但不产节点/部分节点/空 Block，期望 token 缺失一律报 nodeType `"ERROR"` 的 ERROR 诊断）；§5 条目改写为既有实现的真实描述（Error\*/MISSING 概念仅属 tree-sitter CST 模型）。同时澄清：§5.2 的「恢复占位 → ErrorStatement/ErrorExpression、MISSING」规划条款在新路径实际未采用，以此处 as-built 记录为准（非法源不做 AST parity，§5.7 (ii) 条款不受影响）。
+  - **LOW**：strict 首错测试改为两条不同消息的错误语料（`var a = \nstatic const B = 1\n`），真正钉死「首个 ERROR」顺序契约；新增 WARNING 先于 ERROR 的混合语料（key-only pattern + 缺初始化器），钉死 strict 跳过 WARNING 且不取「首条诊断」。
+  - **LOW**：并发断言由字符串拼接改为 `Snapshot(String, List<AstDiagnostic>)` record 值比较，使注释/实施记录宣称的「诊断按 record 值相等对比」名副其实。
+
 任务：
 
 - `GdScriptParserFacade`（`parse`/`parseStrict`/`tokenize`，§3.1 raw 流语义）；共享 facade 并发 parse 测试。
@@ -442,7 +453,7 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 6. **Godot master 漂移**：基线锁定 commit `c016f22`；升级走独立评估。风险等级：低。
 7. **pattern 形状适配**：match pattern 在现有 AST 中以 `Expression` 表达（`PatternBindingExpression` 等），Godot `PatternNode` 形态差异大；key-only 字典 pattern 已登记信息丢失（§5.2），其余 Phase 4 以 tree-sitter 路径产出为准逐一钉死。风险等级：中。
 8. **parity 过度承诺**：非法源与 §5.7 (ii) 类语法不做 AST 一致承诺，避免被 tree-sitter 容错形状绑架。风险等级：低。
-9. **性能**：递归下降 + 单 token 前瞻成本低；v1 不设阈值，仅在 Phase 6 记录 fixtures 解析耗时基线。风险等级：低。
+9. **性能**：递归下降 + 单 token 前瞻成本低；v1 不设阈值。Phase 6 已记录 fixtures 解析耗时基线（见 Phase 6 实施状态：13 fixtures 全量轮均值约 4.4 ms，吞吐量级 ≈9.5 MB/s）。风险等级：低。
 
 ## 9. 参考资料
 

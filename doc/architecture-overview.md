@@ -4,7 +4,7 @@ This document explains how the repository is structured, how data flows through 
 
 ## 1. What This Repository Does
 
-`gdparser` is a Java 25 project that parses GDScript using Tree-sitter, then maps CST (concrete syntax tree) into a stable Java AST.
+`gdparser` is a Java 25 project with two GDScript parse frontends that converge on one stable Java AST: the original Tree-sitter pipeline (CST -> lowering) and a pure-Java port of Godot's official GDScript tokenizer/parser (no native dependency).
 
 At a high level, the repository provides:
 
@@ -12,28 +12,38 @@ At a high level, the repository provides:
 - Parse facade for source text -> CST root
 - CST abstraction layer independent from raw `org.treesitter` API
 - CST -> AST lowering with diagnostics
+- Pure-Java Godot-port tokenizer + recursive-descent/Pratt parser with panic-mode recovery (`frontend.gdscript`)
 - AST <-> S-expression serialization/deserialization
-- Regression tests using real fixture scripts
+- Regression tests using real fixture scripts, including dual-path parity tests
 
 ## 2. End-to-End Data Flow
 
+Two parse pipelines converge on the shared `frontend.ast` model:
+
 ```text
 GDScript Source (String)
-  -> GdParserFacade (TSParser + TSLanguage)
-  -> TSNode root
-  -> CstAdapter
-  -> CstNodeView immutable tree
-  -> CstToAstMapper
-  -> SourceFile AST + AstDiagnostic list
-  -> (optional) AstSexprSerializer / AstSexprDeserializer
+  |-- Tree-sitter path (reference / fallback):
+  |     GdParserFacade (TSParser + TSLanguage)
+  |       -> TSNode root
+  |       -> CstAdapter -> CstNodeView immutable tree
+  |       -> CstToAstMapper ---------------------+
+  |                                             |
+  |-- Pure-Java Godot-port path:                |
+  |     GdScriptParserFacade                    |
+  |       -> GdTokenizer (token stream + comment trivia)
+  |       -> GdScriptParser (recursive descent + Pratt, panic-mode recovery)
+  |       --------------------------------------+
+                                                v
+                          SourceFile AST + AstDiagnostic list (AstMappingResult)
+                          -> (optional) AstSexprSerializer / AstSexprDeserializer
 ```
 
-Key mode difference in lowering:
+Key mode differences:
 
-- `map(...)`: tolerant, returns AST + diagnostics
-- `mapStrict(...)`: throws on any `ERROR` diagnostic
+- Tree-sitter path: `CstToAstMapper.map(...)` is tolerant (AST + diagnostics); `mapStrict(...)` throws on any `ERROR` diagnostic.
+- Godot-port path: `GdScriptParserFacade.parse(...)` is tolerant; `parseStrict(...)` mirrors the strict contract (throws on the first `ERROR` diagnostic). `tokenize(...)` exposes the raw token stream for tests/tooling — without parser-driven multiline suppression, so its ERROR tokens are not a source-validity criterion.
 
-Completion support flow:
+Completion support flow (tree-sitter path only; the Godot-port path has no completion support in v1):
 
 - `GdParserFacade.parseCompletionContext(source, byteOffset)` classifies the cursor position into a `CompletionContext` (`MEMBER_ACCESS` / `IDENTIFIER` / `TYPE_POSITION` / `CALL_ARGUMENT` / `UNKNOWN`) directly from the immutable CST snapshot.
 - It resolves both natural tree-sitter `ERROR`/missing-placeholder structures left by unfinished input (e.g. `obj.|` at end of file) and syntactically complete member access with the cursor inside a member name prefix (e.g. `obj.pa|r`).
@@ -105,6 +115,22 @@ Responsibilities:
 - Convert CST structural errors into `ERROR` diagnostics
 - Reject legacy GDScript 3.x syntax during lowering so the typed AST stays 4.x-only
 
+### `frontend.gdscript`
+
+Purpose: Pure-Java port of Godot's official GDScript tokenizer and parser (baseline pinned to `godotengine/godot` commit `c016f22`, vendor copies under `vendor/godot/`), producing `frontend.ast` records directly — no CST stage, no native dependency.
+
+Main classes:
+
+- `GdTokenizer`: incremental `scan()` port of `GDScriptTokenizerText` (indent stack, pending-newline model, comment trivia collection)
+- `GdToken` / `GdTokenType` / `GdLiteralKind`: token model aligned with Godot's `Token::Type`
+- `SourceTextIndex`: UTF-8 byte offset <-> row/column conversion; physical byte cursor is the single source of truth for `Range`
+- `GdScriptParser`: recursive descent + Pratt expressions, panic-mode recovery with `synchronize()`, depth-budget guard against JVM stack overflow on pathological nesting
+- `GdScriptParserFacade`: public entry points (`parse`, `parseStrict`, `tokenize`)
+
+Concurrency contract:
+
+- `GdScriptParser`/`GdTokenizer` instances are stateful and not thread-safe; the facade holds no state and creates fresh instances per call, so a shared facade is safe for concurrent use without locking or pooling (same contract shape as `GdParserFacade`).
+
 ### `frontend.serialize`
 
 Purpose: stable textual format for AST persistence/debugging.
@@ -139,7 +165,9 @@ Why this matters:
 
 ## 5. Error Model and Recovery Philosophy
 
-The parser/lowering stack separates three error classes:
+Both pipelines report through the shared `AstDiagnostic(severity, message, nodeType, range)` model; ranges are always UTF-8 byte offsets with byte-based points.
+
+The tree-sitter stack separates three error classes:
 
 1. CST structural issues (`ERROR`, `MISSING`) from Tree-sitter
 2. Lowering-time unsupported constructs
@@ -156,6 +184,20 @@ Behavior policy:
 - Keep spans available so diagnostics are actionable
 - Treat legacy GDScript 3.x syntax accepted by the upstream grammar as lowering-time `ERROR`s
 
+The Godot-port stack reports tokenizer errors (from `ERROR` tokens) and parser errors (ported `push_error` messages) into the same diagnostic list, and recovers with Godot's panic-mode + `synchronize()` policy: advance to a statement/member boundary, then resume sibling parsing. Contract highlights:
+
+- Illegal sources always terminate with diagnostics — never exceptions; a nesting-depth budget (256) guards the JVM stack against pathological nesting (Godot has no such limit; deliberate deviation)
+- Failed constructs may be omitted or yield partial nodes/empty blocks depending on the construct; expected-but-absent tokens and malformed constructs are reported as `ERROR` diagnostics (nodeType `"ERROR"`). This path never synthesizes `ErrorStatement`/`ErrorExpression` nodes or `MISSING`-kind issues — those belong to the tree-sitter CST model
+- Known recovery limitation: a depth-budget trip on a multiline grouping continuation line can mis-attribute sibling scopes (registered in the implementation plan; diagnostics and termination still hold)
+
+### Parity rule index
+
+The canonical contract for dual-path equivalence lives in `doc/godot-java-parser-implementation-plan.md`:
+
+- §5.1-§5.6: AST shape adaptation, literal kind vocabulary, comment/trivia attribution, sign-absorption deviation, diagnostic message alignment
+- §5.7: divergence registration policy — legal sources must serialize identically across both paths; registered divergences and illegal sources follow their own assertion clauses
+- §7: layered test strategy (`GdTokenizerTest` -> `GdScriptParserTest` -> `GdScriptParserErrorRecoveryTest` -> `GdParserParityTest` -> `GdScriptParserFacadeTest`)
+
 ## 6. Test Architecture
 
 Test suite is layered by concern:
@@ -168,6 +210,12 @@ Test suite is layered by concern:
 - `CstToAstMapperErrorRecoveryTest`: error-node mapping, partial chains, sibling continuation
 - `AstCollectionFreezeTest`: AST collection immutability contract
 - `AstSexprSerdeTest`: AST serde unit + fixture round-trip
+- `SourceTextIndexTest`: byte-offset/point conversion edge cases (CRLF, CJK, emoji, tabs, EOF)
+- `GdTokenizerTest`: Godot-port token stream snapshots (indent/newline model, literals, errors)
+- `GdScriptParserTest`: legal-syntax AST shapes, ranges, comment attribution
+- `GdScriptParserErrorRecoveryTest`: panic-mode recovery corpus with termination timeouts
+- `GdParserParityTest` / `GdParityReferenceTest` / `GdFixtureParityAuditTest`: dual-path parity over inline corpus and all fixtures
+- `GdScriptParserFacadeTest`: Godot-port facade entry semantics + shared-facade concurrency check
 
 Fixture corpus:
 
@@ -178,6 +226,7 @@ Recommended targeted runs during iteration:
 ```bash
 ./gradlew test --tests dev.superice.gdparser.frontend.lowering.CstToAstMapperTest --no-daemon --info --console=plain
 ./gradlew test --tests dev.superice.gdparser.frontend.serialize.AstSexprSerdeTest --no-daemon --info --console=plain
+./gradlew test --tests dev.superice.gdparser.frontend.gdscript.GdParserParityTest --no-daemon --info --console=plain
 ```
 
 ## 7. Common Maintenance Tasks
@@ -210,7 +259,7 @@ Recommended targeted runs during iteration:
 - Linux/macOS end-to-end validation in CI is still pending
 - AST golden snapshot (`input.gd -> ast.json`) baseline is not yet established
 - S-expression protocol version header is not yet explicit
-- Performance baseline and regression thresholds are not yet formalized
+- Performance regression thresholds are not formalized (a Godot-port fixture timing baseline is recorded in the implementation plan, Phase 6)
 
 ## 9. New Maintainer Quick Start
 

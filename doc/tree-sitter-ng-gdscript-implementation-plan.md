@@ -219,6 +219,7 @@
 
 ## 7. 参考资料
 
+- 仓库文档：`doc/godot-java-parser-implementation-plan.md`（纯 Java Godot parser 移植计划；tree-sitter 路径在该计划中作为对照/回退路径保留，双路径 parity 契约见其 §5/§7）、`doc/architecture-overview.md`
 - tree-sitter-ng: https://github.com/bonede/tree-sitter-ng
 - tree-sitter `api.h`: https://github.com/tree-sitter/tree-sitter/blob/master/lib/include/tree_sitter/api.h
 - tree-sitter-gdscript: https://github.com/PrestonKnopp/tree-sitter-gdscript
