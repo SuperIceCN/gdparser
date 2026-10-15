@@ -187,7 +187,7 @@ Behavior policy:
 The Godot-port stack reports tokenizer errors (from `ERROR` tokens) and parser errors (ported `push_error` messages) into the same diagnostic list, and recovers with Godot's panic-mode + `synchronize()` policy: advance to a statement/member boundary, then resume sibling parsing. Contract highlights:
 
 - Illegal sources always terminate with diagnostics — never exceptions; a nesting-depth budget (256) guards the JVM stack against pathological nesting (Godot has no such limit; deliberate deviation)
-- Failed constructs may be omitted or yield partial nodes/empty blocks depending on the construct; expected-but-absent tokens and malformed constructs are reported as `ERROR` diagnostics (nodeType `"ERROR"`). This path never synthesizes `ErrorStatement`/`ErrorExpression` nodes or `MISSING`-kind issues — those belong to the tree-sitter CST model
+- Failed expression slots keep marker/partial nodes via the parser's sealed `ParseOutcome` protocol: a zero-consumption slot holds a zero-width `ErrorExpression(CstIssueKind.MISSING)` at the failure point, a consumed-but-failed slot holds an `ERROR`-kind fragment over the consumed span, and a missing member name after `.` keeps a `MissingAttributeStep` in the surviving chain; damaged control-flow statements (if/while/for/assert/const/match headers, match guards/patterns, enum values) survive with markers in place. Missing closers (grouping/array/dictionary/call/subscript/annotation/preload/assert) produce zero-width `ERROR` diagnostics carrying a stable `code` plus a same-generation `RecoveryLink` to the owning construct. Constructs with no node able to carry the failure (e.g. a missing function name) are still omitted, and `ErrorStatement` is never synthesized
 - Known recovery limitation: a depth-budget trip on a multiline grouping continuation line can mis-attribute sibling scopes (registered in `doc/godot-java-parser-implementation.md` §9; diagnostics and termination still hold)
 
 ### Parity rule index
@@ -214,6 +214,7 @@ Test suite is layered by concern:
 - `GdTokenizerTest`: Godot-port token stream snapshots (indent/newline model, literals, errors)
 - `GdScriptParserTest`: legal-syntax AST shapes, ranges, comment attribution
 - `GdScriptParserErrorRecoveryTest`: panic-mode recovery corpus with termination timeouts
+- `GdScriptParserRangeInvariantTest`: AST range-envelope invariant over the recovery corpus and all fixtures
 - `GdParserParityTest` / `GdParityReferenceTest` / `GdFixtureParityAuditTest`: dual-path parity over inline corpus and all fixtures
 - `GdScriptParserFacadeTest`: Godot-port facade entry semantics + shared-facade concurrency check
 

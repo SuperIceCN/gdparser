@@ -164,6 +164,38 @@ class AstSexprSerdeTest {
     }
 
     @Test
+    void shouldRoundTripParserProducedMarkersAndDamagedNodes() {
+        // Recovery markers produced by the pure Java parser (ErrorExpression MISSING/ERROR and
+        // MissingAttributeStep) round-trip like any other node.
+        var parser = new dev.superice.gdparser.frontend.gdscript.GdScriptParser();
+        var corpus = List.of(
+                // MISSING slot markers (initializer, binary right operand, array element).
+                "var hp =\nvar x = 1 +\nvar a = [1, , 3]\n",
+                // ERROR fragment (consumed-span) plus a damaged binary.
+                "var hp = $/!!\nvar r = 1 +\n",
+                // Missing-member chain step.
+                "var x = self.b.(1)\n",
+                // Dictionary-pattern whole-pattern ERROR fallback.
+                "func f():\n\tmatch x:\n\t\t{1+}: pass\n"
+        );
+        for (var source : corpus) {
+            var ast = parser.parse(source).ast();
+            var restored = deserializer.deserialize(serializer.serialize(ast));
+            assertEquals(ast, restored, () -> "round-trip mismatch for: " + source);
+            // Sanity: the corpus entry really does carry recovery nodes.
+            assertTrue(containsRecoveryNode(ast), () -> "expected recovery nodes in: " + source);
+        }
+    }
+
+    private static boolean containsRecoveryNode(dev.superice.gdparser.frontend.ast.Node node) {
+        if (node instanceof ErrorExpression || node instanceof ErrorStatement
+                || node instanceof MissingAttributeStep) {
+            return true;
+        }
+        return node.getChildren().stream().anyMatch(AstSexprSerdeTest::containsRecoveryNode);
+    }
+
+    @Test
     void shouldRejectMalformedSexpr() {
         var malformedInputs = List.of(
                 "(",

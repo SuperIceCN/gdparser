@@ -31,7 +31,7 @@
 
 - `frontend.ast` 解析器无关：sealed `Node`/`Statement`/`Expression` + record 节点；`Range` 为 UTF-8 字节偏移 + 0-based `Point(row, column)`（列为字节列）；集合组件构造时 `List.copyOf` 冻结。
 - `AstFactory` 的 helper 签名耦合 `CstRange`/`CstNodeView`/`CstIssueKind`——新 parser **不使用** `AstFactory`，直接调用 record 构造器。
-- `ErrorStatement`/`ErrorExpression` 的 `kind` 组件类型为 `CstIssueKind`（`ERROR`/`MISSING`）——语义通用，直接复用，不做包迁移。注意：新 parser 实际**从不构造**这两类节点（见 §5.2 与 §9），该复用仅维持 tree-sitter 路径不动。
+- `ErrorStatement`/`ErrorExpression` 的 `kind` 组件类型为 `CstIssueKind`（`ERROR`/`MISSING`）——语义通用，直接复用，不做包迁移。新 parser 自 sealed-outcome 恢复改造（§9）起在受损表达式槽位构造 `ErrorExpression` marker 并在缺名点号链上构造 `MissingAttributeStep`（仍不构造 `ErrorStatement`）；tree-sitter 路径行为不变。
 - `CstToAstMapper` 深度耦合 tree-sitter grammar 的节点类型名与字段名——新 parser **不复用**该 mapper，直接构建 AST。
 - 项目无 parser 接口抽象：`GdParserFacade` 是 tree-sitter 路径的唯一入口，新 parser 使用独立的 `GdScriptParserFacade`，两者不共享入口类。
 - `LiteralExpression.kind` 的字符串集合是 AST 契约词汇表（§5.3）。
@@ -99,8 +99,8 @@ tree-sitter 数据流（`GdParserFacade -> CstAdapter -> CstToAstMapper`）保�
 - 类体 `pass`（偏差 D4）：产出 `PassStatement`（Godot 不产出节点；tree-sitter 路径保留）。
 - key-only 字典 pattern（如 `{"name"}:`）：tree-sitter 路径丢弃 key 并发 `WARNING` 诊断（`DictEntry` 无法表达缺失 value）。新 parser 对齐该行为（丢弃 + WARNING），登记为 AST 表达力缺口，未来随 AST 演进补全。
 - 函数/信号/参数：`FunctionDeclaration`/`SignalStatement`/`Parameter`（含 `variadic` 对应 Godot rest 参数 `...`）。
-- 缺失必需表达式（如 `if` 缺条件）：按 vendor 行为消费整链，但**不产出该构造节点，或按构造产出部分节点/空 Block**；伴随 nodeType `"ERROR"` 的 ERROR 诊断。新 parser 不产生 `ErrorExpression` 占位，也不在非空组件留 `null` 洞。
-- 恢复占位：`ErrorStatement`/`ErrorExpression`（`CstIssueKind.ERROR`）与 `MISSING` 概念仅属 tree-sitter CST 模型，新 parser 从不构造；失败构造按上一条政策落地（非法源不做 AST parity，§5.7）。
+- 受损表达式槽位（如 `if` 缺条件、`var x =` 缺初始化器、`1 +` 缺右操作数）：宿主构造带 marker 存活——零消费槽位填零宽 `ErrorExpression(CstIssueKind.MISSING, slotName, "", [extentEnd(), extentEnd()))`，有消费的失败填 `ERROR` kind 片段（`nodeType` `"ERROR"`，覆盖实际消费区间 `[slotStart, extentEnd())`），部分节点（如带 marker 右槽的 `BinaryExpression`）原样保留；语句/声明宿主（if/while/for/assert/const/match 头、match guard/pattern、enum 值、elif 分支）随之存活（§9 sealed-outcome 协议）。缺名点号在链上填 `MissingAttributeStep`（点号末端零宽）并继续续折。
+- 恢复占位与诊断归属：`ErrorStatement` 仍不构造（无法承载失败的语句级构造按丢弃 + sync 处理）；缺闭合符（分组/数组/字典/调用/下标/注解/preload/assert 共 8 处）发零宽 ERROR 诊断，带稳定 `code`（`parse.missing_closer.*`）与同代 `RecoveryLink`（owner 为最终 AST 中可按对象身份到达的承载构造，facet 为点分槽位名；owner 未存活时 link 在 `parse()` 返回前被清除，保留 code/range/message；link 不跨 serde 持久化）。非法源不做 AST parity（§5.7）。
 
 ### 5.3 字面量 kind 词汇表（AST 契约）
 
@@ -187,11 +187,11 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 
 ## 7. 测试策略与验收
 
-- 分层：`SourceTextIndexTest`（坐标换算）→ `GdTokenizerTest`（token 流）→ `GdScriptParserTest`（合法语法 AST）→ `GdScriptParserErrorRecoveryTest`（容错）→ `GdParserParityTest`（双路径一致）→ `GdScriptParserFacadeTest`（入口/并发）；另有 `GdParityReferenceTest`（钉死形状断言）与 `GdFixtureParityAuditTest`（fixtures 分歧组合审计，动态用例）支撑。
+- 分层：`SourceTextIndexTest`（坐标换算）→ `GdTokenizerTest`（token 流）→ `GdScriptParserTest`（合法语法 AST）→ `GdScriptParserErrorRecoveryTest`（容错与 marker 形状）→ `GdScriptParserRangeInvariantTest`（范围包络不变量）→ `GdParserParityTest`（双路径一致）→ `GdScriptParserFacadeTest`（入口/并发）；另有 `GdParityReferenceTest`（钉死形状断言）与 `GdFixtureParityAuditTest`（fixtures 分歧组合审计，动态用例）支撑。
 - parity 实现：复用 `AstSexprSerializer` 输出做逐字符 diff；fixture 遍历模仿 `CstToAstMapperTest` 的动态 `.gd` 发现模式；合法语料经 `assertCleanParity`（AST 一致 + 双端零 ERROR）断言；诊断列表不参与合法语料 parity（非法语料与 §5.7 (ii) 登记项按其条款断言）。
 - 语料：优先内联字符串；确需文件时放 `src/test/resources/gdscript` 并纳入动态遍历；tree-sitter 路径 AST 参照快照存于 `src/test/resources/gdparser-parity/*.sexp`。
 - 迭代纪律：迭代期只跑目标测试类（`script/run-gradle-targeted-tests.sh --tests <Class>`）；改动后跑既有前端测试回归（`CstToAstMapperTest`、`AstSexprSerdeTest` 等）确认 tree-sitter 路径零影响；PR 前全量 `./gradlew clean build --no-daemon --info --console=plain`。
-- 当前测试规模（`@Test` 计数，动态发现用例另计）：`GdTokenizerTest` 51、`SourceTextIndexTest` 12、`GdScriptParserTest` 224、`GdScriptParserErrorRecoveryTest` 47、`GdParserParityTest` 22、`GdParityReferenceTest` 13、`GdScriptParserFacadeTest` 11。
+- 当前测试规模（`@Test` 计数，动态发现用例另计）：`GdTokenizerTest` 51、`SourceTextIndexTest` 12、`GdScriptParserTest` 234、`GdScriptParserErrorRecoveryTest` 79、`GdScriptParserRangeInvariantTest` 2、`GdParserParityTest` 22、`GdParityReferenceTest` 13、`GdScriptParserFacadeTest` 11。
 - Godot 对照方法：本环境无编辑器二进制，以 vendor 源码追踪为基准（commit `c016f22`），行列号按 Godot 字符列口径；代表性错误场景的对照结论以注释记录在用例上。
 
 ## 8. Godot 官方实现机制摘要（维护参考）
@@ -230,6 +230,12 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 - 中毒区域布局感知消耗：跳闸时记录跳闸行缩进 `poisonedLineIndent`（lexer 布局宽度口径，tab=4/space=1）；`synchronize()` 在跳闸期间配对消费垃圾 INDENT/DEDENT（`garbageIndents` 计数）、吃掉 NEWLINE，行首 token 缩进 ≤ 跳闸行时停在边界前，超出配对余额的 DEDENT 停住留给已解析套件帧。
 - tokenizer 错误必入诊断：`pushMultiline` 待丢弃 token 走 `scanSkippingErrors` 上报——vendor 裸 `scan()` 会静默丢弃 ERROR token，与「tokenizer 错误必入诊断」政策冲突，此为有意偏差。
 - 非法源验收契约（§5.7 非法源条款的落地）：不抛异常、可终止；≥1 条 ERROR 诊断且 range 不越界（UTF-8 字节口径）；synchronize 后兄弟声明结构正确。
+- sealed-outcome 恢复协议：表达式族解析返回密封接口 `ParseOutcome<T>`（`Ok`/`Missing`/`Failed`/`Damaged`）而非可空引用——`Missing` 为零消费且未推诊断（槽位宿主经 `absorbSlot` 补发泛化消息并填零宽 MISSING marker），`Failed` 为已推诊断、无节点（宿主填消费区间 ERROR 片段，不补发），`Damaged` 为已推诊断的部分节点（宿主保留，不补发）——单槽位单根因；Pratt 循环在非 `Ok` 左操作数处停折（与旧 null 停折逐点等价），后缀链内缺名点号续折（`MissingAttributeStep` 充当折叠障碍：后续 `(`/`[` 不再折向前一属性 step）、受损实参/索引走完清理建成节点后即返（不再续折后续 suffix）。语句分派：`Missing` 走旧 null 路径逐字不变；`Failed` 复用同一条丢弃路径（省泛化诊断）；`Damaged` 仅在真语句边界（`isStatementEndToken() || lambdaEnded`，`isStatementEnd()` 在 lambda 内恒真不能作门控）存活为 `ExpressionStatement`，否则按丢弃路径处理。
+- 诊断 code 词汇表（包私有 `DiagnosticCodes` 集中登记）：`parse.missing_closer.{grouping,array,dictionary,call,subscript,annotation,preload,assert}`；`parse.missing_expression.<slot>`（由点分槽位名把 `.` 换 `_` 机械推导，与 marker `nodeType`/`RecoveryLink.facet` 共用词汇）：`variable.initializer`、`constant.value`、`parameter.default`、`return.value`、`annotation.argument`、`array.element`、`dictionary.key`、`dictionary.value`、`call.argument`、`subscript.index`、`grouping`、`binary.right`、`unary.operand`、`ternary.condition`、`ternary.else`、`assignment.value`、`await.operand`、`preload.path`、`assert.condition`、`assert.message`、`match.value`、`match.guard`、`match.pattern`、`dictionary_pattern.key`、`enum.value`、`if.condition`、`elif.condition`、`while.condition`、`for.iterable`；另有 `parse.attribute.missing_name`、`parse.super.{missing_access,missing_name,missing_call}`、`parse.signature.{mandatory_after_optional,rest_with_default,parameter_after_rest}`。槽位补发之外的既有诊断（如 synchronize/endStatement 类）暂不分配 code。
+- owner frame 与可达性清扫：可存活构造在槽位解析前 push owner frame、槽位解析完立即 pop 暂存（先 pop 后进 suite，防止 body 的闭合符诊断误绑头部 facet），节点建成时绑定 `RecoveryLink(owner, facet)`；参数默认值的 frame 延迟到签名最终接纳该参数时绑定（rest 参数的 variadic 重建随帧迁移到重建后节点，被丢弃的重复名参数的 frame 一并丢弃）；`parse()` 返回前按对象身份遍历最终 AST 建立可达集合，owner 不可达的 link 一律清空（不回绑外层 owner）。facet 词汇（开 frame 的位点）：`variable.initializer`、`constant.value`、`parameter.default`、`return.value`、`assert.condition`、`assert.message`、`assert.arguments`、`match.value`、`match.guard`、`match.pattern`、`if.condition`、`elif.condition`、`while.condition`、`for.iterable`、`enum.value`、`expression`（表达式语句）、`annotation.arguments`。
+- C3 槽位 marker：match guard / enum 值 / elif 条件 / 字典 pattern key 失败不再置 null 或丢槽——guard/enum 值/elif 填槽位 marker 且宿主存活（enum `memberEnd` 扩展到 marker 末端，elif 保留分支与健康 body）；字典 pattern 受损 key 有 `: sub-pattern` 载体时保留在 entry，无载体（无冒号、子 pattern 被丢、`..` 误用丢 entry 分支）时整个字典 pattern 回退为 `ErrorExpression(ERROR)` 片段（覆盖实际消费前缀 `[patternStart, extentEnd())`，健康兄弟 entry 一并损失——`DictEntry` 无法表示受损 key 的 key-only 形态，不为受损 key 伪造未开启的 value 槽位）；key-only 警告只对未受损 key 发出。这些槽位的 `null` 语义收窄为「从未书写」。
+- 参数顺序诊断不丢参数（有意偏离 vendor 的丢弃行为，保留身份与位置供编辑器消费）：mandatory-after-optional / rest 带默认值 / rest 后参数报错后参数仍留在签名列表；rest 参数的 variadic 重建保留已解析默认值与参数 range。重复名参数仍丢弃。
+- C2 存活偏差：assert/const/match 值失败后语句带 marker 存活并消费成功路径尾部（vendor 丢弃该节点，此处为有意优于 vendor 的恢复）；登记同步集早停差异——存活路径把同步关键字当作槽位内容继续解析（`assert(1+, func(): pass)` 的 `func(): pass` 进消息槽），垃圾尾部比旧行为多一条 endStatement 类诊断。
 - **已知限制（登记不修）**：跨行分组的 continuation 行跳闸（>256 层病态嵌套与跨行分组同时出现）会破坏作用域归属——分组的 `pushMultiline` 丢弃了 pending 的 INDENT，但 tokenizer 缩进栈已记录新层级，跳闸后失败帧先 pop multiline 再消费分组剩余内容，使 continuation 行的 DEDENT 成为无 parser 帧认领的孤儿布局，`poisonedLineIndent` 又取跳闸 token 所在行（continuation 行）而非逻辑构造起点行，导致闭合行被误判为恢复边界。此情形下解析仍终止、仍产生有效诊断、不抛异常，满足最低恢复契约；回归护栏（`multilinePoisonedPatternTerminatesWithDiagnostics`）仅钉终止性与诊断存在性，不钉作用域归属。正确修复需 tokenizer 暴露缩进栈深度 + parser 跟踪布局作用域数以识别孤儿 DEDENT，复杂度与风险不成比例。
 
 ## 10. 关键实现机制备注
