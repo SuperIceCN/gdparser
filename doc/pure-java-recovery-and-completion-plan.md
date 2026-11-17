@@ -1,6 +1,6 @@
 # 纯 Java Parser 错误/缺失节点产出与补全能力迁移实施计划
 
-日期：2026-10-08。状态：**恢复侧（B0-B9）已实施**（2026-10-15：sealed-outcome 协议、2C 闭合符诊断 + RecoveryLink、3A C3 槽位 marker、参数顺序保留全部落地；实现经 review-expert-a / review-expert-c 双评审修复后均 APPROVE）；**补全迁移（B10，§4.4）与旧路径弃用（§8.3）未实施**。计划主体经 review-expert-a / review-expert-c 多轮评审确认；§8.2 于 2026-10-14 按用户决策重写为 sealed-outcome 设计并纳入 2C/3A 修复方案；`:` 缺类型问题按用户决策接受。
+日期：2026-10-08。状态：**恢复侧（B0-B9）、纯 Java 补全迁移与旧路径弃用（B10）、补全边界与布局处理（B11）均已实施**（§11–§12）。错配闭合符后的跨层恢复限制仍暂缓（§12.4）。`:` 缺类型问题按用户决策接受。
 
 本文依据 `doc/analysis/gdparser_0_7_pure_java_parser_regressions_report.md`（下称「回归报告」）、
 `doc/analysis/gdparser_0_7_lsp_migration_research_report.md`（下称「迁移报告」）与
@@ -174,7 +174,7 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
 1. 新增 `src/main/java/dev/superice/gdparser/frontend/gdscript/CompletionContext.java`：与旧版同合同的 public record
    （`Kind` 五值 `MEMBER_ACCESS/IDENTIFIER/TYPE_POSITION/CALL_ARGUMENT/UNKNOWN`；`MEMBER_ACCESS` 必带 `receiverRange`，
    其余必不带）。放 `frontend.gdscript` 包（module-info.java:7 已导出，无需改模块描述）。旧
-   `infra.treesitter.CompletionContext` 保留不动，GDCC 切换前双轨并存。
+   `infra.treesitter.CompletionContext` 保留原字段与运行时行为，仅按 §8.3 标注弃用，GDCC 切换前双轨并存。
 2. 新增包私有 `CompletionContextAnalyzer`（同包）。输入：跳过 ERROR token 的 token 流（`scanSkippingErrors` 同口径）、
    容错 AST、源文本、字节偏移。输出为「分类规则按序命中」，**顺序与旧分析器的最深优先语义对齐**：
    - 预备：offset clamp 到 `[0, sourceLength]`；`nodeAt(root, offset)` 按 range 包含下钻（`start <= offset <= end`，
@@ -202,8 +202,11 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
    - R1 链上名字：offset 落在某 step 的名字 token 内（名字 token = 位于 `step.range().startByte()` 处的 token；
      对 `AttributeCallStep`/`AttributeSubscriptStep` 这样取避免误覆盖实参区）→ `MEMBER_ACCESS`，
      `replaceableRange` = 该名字 token range，`receiverRange` 按通用公式。
-   - R2 点号光标：offset 处的 token 是 `.` 且属于某 `AttributeExpression` 链 → `MEMBER_ACCESS`，`replaceableRange` =
+   - R2 点号光标：光标已越过 `.` 且属于某 `AttributeExpression` 链 → `MEMBER_ACCESS`，`replaceableRange` =
      点号后名字 token（无则点号末端零宽），receiver 按通用公式。
+     共享边界按用户确认采用左侧名字优先：`node|.pa` / `node|.` 为 IDENTIFIER(`node`)，
+     `a.b|.c` 为 MEMBER_ACCESS(`b`, receiver=`a`)，`Outer|.Inner` 为 TYPE_POSITION(`Outer`)；
+     右侧点号不得清空已经命中的词尾名字。
    - R3 缺名末步（AST 存活）：链末步为 `MissingAttributeStep` 且 offset 落在 `[点号末端, 链末端]` → `MEMBER_ACCESS`，
      `replaceableRange` 零宽于 marker 位置，receiver 按通用公式。`super` base 即 `IdentifierExpression("super")`，
      receiver 覆盖 `super` token，GDCC 据此走词法超类候选。
@@ -244,8 +247,10 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
      是 `not in` 或一元 `not`，不开启类型槽）。是 `extends` 且
      目标尚未开始（无名字 token 或光标在其前）→ 零宽 `TYPE_POSITION`；是函数/lambda 签名中的 `->` 且
      返回类型尚未开始 → 零宽 `TYPE_POSITION`；是 `:` 则仅在变量/常量/参数/signal 上下文（回扫序列形如
-     `var|const name :` 或签名参数表内 `name :`）→ 零宽 `TYPE_POSITION`；**排除**函数体冒号（`:` 前为 `)`）
+     `var|const|for name :` 或签名参数表内 `name :`）→ 零宽 `TYPE_POSITION`；**排除**函数体冒号（`:` 前为 `)`）
      与字典冒号。
+     只有名字 token 自身属于类型槽时才替换它；`: |in`、`is |and`、`Array[int]|in` 不覆盖右侧关键字，
+     进入非类型关键字内部（`i|n`）后不再以之前的类型开启符判为类型槽。`is` 后可选的 `not` 仅对首个非布局 token 有效。
    - R7 调用实参：token 级找最内层「实参区含 offset」的括号对（闭合或 EOF 未闭合均可），先做**括号角色判定**：
      `(` 前是 callee 形态 token（identifier/`)`/`]`/`.`）或特殊调用前缀 `super`/`preload`（token 级判定，
      不以 callee AST 存活为必要条件——`super(`/`preload(` 由 parser 建成 CallExpression/PreloadExpression）；
@@ -262,7 +267,9 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
      本路径覆盖 `target(`、`target(1,`、`target(1` 三种 EOF 无最终换行形态（E12/E13 存活后多数情形已有
      CallExpression 锚点，token 级回退保留为兜底）；`target(1` EOF 判为 `CALL_ARGUMENT` 是对旧分类器
      UNKNOWN 结果的有意改进，登记在 §6.2。
-   - R8 兜底：字符串/注释/空白/空源/其他 → `UNKNOWN`。
+   - R8 兜底：字符串/注释内部、空白/空源/其他 → `UNKNOWN`。光标在 `#` 或字符串 token 首字节之前不算内部：
+     `node.pa|# comment` 保持成员补全；按用户确认，`target(|"hello")` 与未闭合变体为空实参 CALL_ARGUMENT。
+     前缀字符串首字节之前同理，但进入 `r`/`&`/`^` 前缀之后即为字符串内部；未闭合字符串末端仍 UNKNOWN。
    - 优先级冲突显式规则：缺名点号位（R3/R3b）压过实参区（R7）；光标深入受损 call 的实参区（越过空首实参位）
      才让 R7 生效。
 3. `GdScriptParserFacade` 新增 `parseCompletionContext(String source, long byteOffset)`：内部 tokenize（跳 ERROR token）
@@ -620,6 +627,7 @@ sealed interface ParseOutcome<T> {
 | B8 | 文档：`godot-java-parser-implementation.md` 词汇表（code/marker/facet）与产出政策、`architecture-overview.md:190` 政策行、本计划状态收尾 | `doc/` | 文档与实现一致性自查 |
 | B9 | 恢复侧评审：review-expert-a + review-expert-c 并行审阅实现与文档，修复中/高/阻断项后复审 | — | 双 APPROVE |
 | B10 | 补全迁移（§4.4）：`CompletionContext` DTO、`CompletionContextAnalyzer`（R1-R8 + token 级回退 + lambda 禁用帧）、`GdScriptParserFacade.parseCompletionContext`、T15-T17；随后执行旧路径弃用（§8.3） | `frontend/gdscript/CompletionContext.java`（新）、`CompletionContextAnalyzer.java`（新）、`GdScriptParserFacade.java`、`infra/treesitter/`（弃用标注） | `GdCompletionContextTest` 全绿 + parity 回归 |
+| B11 | 补全边界与布局处理（§12，已实施；跨层限制见 §12.4）：完整路径、共享光标/类型槽、签名与无体函数帧、lambda 逻辑布局 | `CompletionContextAnalyzer.java`、`CompletionTokenStream.java`、`GdCompletionContextTest.java`；关联文档已同步 | 18 类 959 项、独立进程及无 native 验证通过；独立复核通过 |
 
 每批内部遵守：marker 不消费 token；push/pop（multiline 与 owner frame）逐路径配平；新 `pushError` 一律带
 code；改动位点的既有 doc 注释同步更新（政策表述类）。
@@ -637,3 +645,57 @@ code；改动位点的既有 doc 注释同步更新（政策表述类）。
 | `frontend/serialize/AstSexprSchema.java` | 109/122/138 已注册错误/缺失节点 |
 | `vendor/godot/gdscript_parser.cpp` | 3369-3404 attribute 失败保留 base；3450-3554 super/call completion hook；3255-3356 字典 dummy literal；1529-1555/1704-1792 参数（vendor 也跳参，本计划有意偏离）；2261-2293 assert 丢弃（本计划有意偏离） |
 | GDCC 侧（仅合同点） | `FrontendSnapshotCompletionService.java:72-109,337-367`；`FrontendClassSkeletonBuilder.java:768-814` |
+
+## 11. 纯 Java 补全迁移结果
+
+- `frontend.gdscript.CompletionContext`、`CompletionContextAnalyzer` 与包内 `CompletionTokenStream` 提供纯 Java 补全上下文分类，公开入口为无状态的 `GdScriptParserFacade.parseCompletionContext(String, long)`。入口不初始化 tree-sitter/native，可并发共享 facade。
+- 分类返回 MEMBER_ACCESS、IDENTIFIER、TYPE_POSITION、CALL_ARGUMENT 或 UNKNOWN；范围为 UTF-8 字节偏移与零基行/字节列，替换范围覆盖完整名字，仅成员访问携带 receiver。
+- 容错 AST 提供幸存节点的结构与 extent；独立 token 视图覆盖恢复过程中被丢弃的表达式，维护括号角色、类型位置、有效 multiline 与 function/lambda 帧。ERROR token 不进入分类流，未闭合字符串区间单独保留。
+- `infra.treesitter` 的 facade、补全 DTO/分析器与 snapshot 已标注 `@Deprecated` 并提供迁移入口，运行时行为不变。CST/lowering 与旧后端测试继续保留作为兼容/parity 对照。
+- `GdCompletionContextTest` 保留与旧补全 21 例的逐条对应，并覆盖类型/实参回退、受损链、Unicode/CRLF、字符串/注释、截断与并发。EOF 下 `target(1` 返回 CALL_ARGUMENT，是相对旧 CST 分类器 UNKNOWN 的有意改进。
+- 当前能力不包含候选生成、语义解析、注解名补全、signature-help DTO 或增量解析；GDCC 消费入口和 native 依赖移除不在此范围内。
+
+## 12. 补全边界与布局处理结果
+
+### 12.1 实现范围
+
+边界与布局处理位于 `CompletionContextAnalyzer.java` 和 `CompletionTokenStream.java`，测试位于 `GdCompletionContextTest.java`。公开 Facade/DTO 的接口形状与五种 Kind 保持不变；AST/serde、原 parser/tokenizer 及旧 tree-sitter 路径的行为未改变。
+
+路径、函数签名、lambda 和类型语法以 vendored Godot 的 `parse_get_node`、`parse_function_signature`、`parse_lambda`、`parse_type` 与 `parse_match_branch` 为参照；本项目的五类上下文不等同于 Godot 的语义补全 DTO。
+
+### 12.2 已实现行为
+
+- **完整 receiver**：get-node 路径支持名字/普通字符串段、`/%`、绝对路径和独立 `%Child`，例如 `$Root/"Child"`、`$Root/%Child`、`$/Root/"Child"/%Leaf`。AST 存活或目标链被丢弃时，回退均保留完整路径；分组、调用与下标的 receiver 保留各自完整范围。
+- **路径与算符分离**：`%` 依据完整 primary/postfix 的前缀角色区分唯一路径与取模，`await`、`return` 等关键字只有在已确认的路径/成员角色下才作为名字。普通除法、取模的左操作数不进入右侧 receiver；`a / %Child.method` 的 receiver 为 `%Child`，`a % (b).method` 为 `(b)`，`value%-name.method` 为 `name`，`(-name).method` 为 `(-name)`。回扫不跨有效硬布局边界。
+- **光标共享边界**：名字与点号相接时左侧名字优先，`node|.pa` 返回 IDENTIFIER(`node`)，`a.b|.c` 替换 `b`，`Outer|.Inner` 替换类型名 `Outer`。注释或字符串起点之前仍属代码侧，`target(|"s")` 为 CALL_ARGUMENT；进入引号、字符串前缀或注释后为 UNKNOWN。闭合字符串不包含末端，未闭合字符串和注释包含末端。
+- **类型结束边界**：有限类型状态区分起点、`is` 的一次可选 `not`、首段、点分段、容器完成与字符串 `extends` 路径。类型替换仅覆盖自身处于类型位置的名字，`for x: Array[int]|in arr:` 不覆盖 `in`，`x is Foo not bar|` 为 IDENTIFIER，`x is not Foo|` 为 TYPE_POSITION。完整 cast 后的 `when` 不延续类型；容器类型完成后的 `.size` 与 `[idx]` 属于表达式成员/下标，点分类型后的 `[` 亦为表达式下标。`extends "res://base.gd".In|ner` 即使没有 TypeRef AST，仍为 TYPE_POSITION，字符串内部仍 UNKNOWN。
+- **函数头与无体签名**：待开启参数表、跨硬换行的匿名参数表、已命名参数表、RETURN_TYPE、INLINE 与 INDENTED body 各自维护生命周期。函数名接受完整 `isIdentifier` 集合，包括 `match`、`when`、`PI`、`TAU`、`INF`、`NAN`。无效头或无体签名退出后，当前 token 按外层状态重新处理；`func\ntarget(|` 为 CALL_ARGUMENT，无体函数之后的显式类型槽正常分类。合法跨行匿名/命名签名、signal、构造器及参数默认值内的调用保持各自角色。
+- **逻辑布局与缩进恢复**：有效硬换行而非物理行号决定逻辑行和 body 边界；显式续行不覆盖外层缩进基线，也不提前结束 INLINE body。`a.` 后的独立下一行 `b` 为 IDENTIFIER，真实反斜杠续行后的 `b` 为 MEMBER_ACCESS。函数帧退出按 LIFO 恢复外层缩进；退出 INLINE/RETURN_TYPE 时先保留终止它的硬换行，再恢复外层 multiline。
+- **match 模式逗号**：INDENTED 函数帧局部跟踪 match 值、待分支、模式头、body 及其缩进。模式头中的逗号不结束 lambda；分支冒号或模式头硬换行结束该模式头。分支 body 的尾逗号在存在外层表达式括号时仍可结束 lambda 并恢复外层调用。多模式、数组模式、多分支与嵌套 match 均有回归覆盖。
+- **受损类型帧退出**：硬换行或普通 token 使类型失效时，连续非 multiline 类型容器先退出，再处理 RETURN_TYPE 与当前 token；硬换行不会被恢复后的外层 multiline 吞掉。签名参数中合法继承 multiline 的类型容器不受该清理影响。`var x = g(func() -> Array[\n,\n\tnode.\n\tpa|)` 和同一行 `Array[, node.\n\tpa|` 均恢复 MEMBER_ACCESS(`pa`)，receiver 为 `node`；后者目标链不在最终 AST 中，由 token 回退提供结果。
+
+上述示例中的 `|` 表示光标，`\n` 表示真实换行。回归测试同时检查 Kind、完整替换范围、receiver/必空 receiver 与 UTF-8 points，并区分健康 AST、损坏但幸存的节点和已丢弃目标链，不假设损坏输入零诊断。
+
+### 12.3 验证结论
+
+- 18 个相关定向测试类共 **959 项通过**，其中 `GdCompletionContextTest` 335 项；失败、错误、跳过均为 0。
+- 独立进程的七项边界回归全部匹配；仅以 `build/classes/java/main` 为 classpath、确认 tree-sitter 类不存在的进程通过七项补全冒烟。
+- Javadoc 生成与 `git diff --check` 通过，计划和代码的独立复核通过。
+- 未运行全量 `clean build` 或 GDCC 联动验收。
+
+### 12.4 已知限制：错配闭合符后的跨层恢复
+
+状态：**暂缓，未修复**。
+
+```gdscript
+func f():
+    var bad = [1)
+    a.
+    b|
+```
+
+此处 `|` 表示光标。原 parser 恢复后保留独立 IdentifierExpression `b`，补全却返回 receiver 为 `a` 的 MEMBER_ACCESS。
+
+错配的 `)` 被 tokenizer 记为 ERROR；补全 token 视图跳过它后仍保留 `[` 的 multiline 帧，吞掉 `a.` 与 `b` 之间的硬换行。parser 的语法恢复则已退出该表达式，两者布局所有权不一致。这影响此类损坏括号之后的补全分类，不改变 parse AST、诊断或旧 tree-sitter 路径。
+
+跨层恢复调整尚未实施。词法错误/括号元数据与共享 parser 恢复布局所有权均需另行设计和授权；简单把所有 ERROR 当作闭合符会影响真正未闭合的表达式。独立 token 视图对任意损坏 match 模式的恢复也不承诺完全等同于 parser 的 panic recovery。

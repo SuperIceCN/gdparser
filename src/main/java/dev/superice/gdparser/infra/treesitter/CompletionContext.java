@@ -1,6 +1,7 @@
 package dev.superice.gdparser.infra.treesitter;
 
 import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.gdscript.GdScriptParserFacade;
 import org.jetbrains.annotations.Nullable;
 
 /// Completion context at a cursor byte offset, derived from the immutable CST snapshot.
@@ -13,6 +14,9 @@ import org.jetbrains.annotations.Nullable;
 ///
 /// `receiverRange` is only present for `MEMBER_ACCESS` and covers the fragment on the left side
 /// of the dot as a byte range; no AST node is exposed for it.
+///
+/// @deprecated Use the context returned by [GdScriptParserFacade#parseCompletionContext(String, long)].
+@Deprecated
 public record CompletionContext(Kind kind, Range replaceableRange, @Nullable Range receiverRange) {
 
     public CompletionContext {

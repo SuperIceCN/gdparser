@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 /// Completion context classification at a cursor offset. In the sources below, `|` marks the
 /// cursor position and is stripped before parsing.
+@SuppressWarnings("deprecation") // The legacy backend remains a regression reference.
 class CompletionContextTest {
 
     private static GdParserFacade parserFacade;

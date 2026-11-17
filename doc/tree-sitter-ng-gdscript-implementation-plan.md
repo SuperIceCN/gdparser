@@ -5,6 +5,7 @@
 - 本文档用于维护 **当前可用能力、长期工程约定、未完成事项与后续执行清单**。
 - 本文档不再保留阶段性流水过程（谁在何时做了什么），仅保留对后续工程有持续价值的信息。
 - 时间基线：**2026-03-01**（已落地能力与待办以该日期工作区为准）。
+- 当前迁移状态：纯 Java 路径已提供解析与补全上下文入口；`infra.treesitter` 的 facade、补全 DTO/分析器与 snapshot 已标注弃用，原行为暂保留为兼容/parity 对照。新消费者使用 `frontend.gdscript.GdScriptParserFacade`，详见 `doc/godot-java-parser-implementation.md` §12。
 
 ## 2. 当前能力基线（已完成）
 

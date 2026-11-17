@@ -25,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 /// Regression tests for lowering sources that use `\` line continuations.
 /// The grammar emits `line_continuation` as a named extra node, so the mapper must
 /// ignore it when enumerating children and when recovering operator source text.
+@SuppressWarnings("deprecation") // The legacy backend remains a regression reference.
 class CstToAstMapperLineContinuationTest {
 
     private static GdParserFacade parserFacade;

@@ -4,7 +4,7 @@ This document explains how the repository is structured, how data flows through 
 
 ## 1. What This Repository Does
 
-`gdparser` is a Java 25 project with two GDScript parse frontends that converge on one stable Java AST: the original Tree-sitter pipeline (CST -> lowering) and a pure-Java port of Godot's official GDScript tokenizer/parser (no native dependency).
+`gdparser` is a Java 25 project with two GDScript parse frontends that converge on one stable Java AST: the deprecated original Tree-sitter pipeline (CST -> lowering, retained for compatibility and parity) and the primary pure-Java port of Godot's official GDScript tokenizer/parser (no native dependency).
 
 At a high level, the repository provides:
 
@@ -13,6 +13,7 @@ At a high level, the repository provides:
 - CST abstraction layer independent from raw `org.treesitter` API
 - CST -> AST lowering with diagnostics
 - Pure-Java Godot-port tokenizer + recursive-descent/Pratt parser with panic-mode recovery (`frontend.gdscript`)
+- Pure-Java completion-context classification over tolerant syntax and recovery-independent tokens
 - AST <-> S-expression serialization/deserialization
 - Regression tests using real fixture scripts, including dual-path parity tests
 
@@ -22,7 +23,7 @@ Two parse pipelines converge on the shared `frontend.ast` model:
 
 ```text
 GDScript Source (String)
-  |-- Tree-sitter path (reference / fallback):
+  |-- Deprecated Tree-sitter path (reference / fallback):
   |     GdParserFacade (TSParser + TSLanguage)
   |       -> TSNode root
   |       -> CstAdapter -> CstNodeView immutable tree
@@ -43,11 +44,16 @@ Key mode differences:
 - Tree-sitter path: `CstToAstMapper.map(...)` is tolerant (AST + diagnostics); `mapStrict(...)` throws on any `ERROR` diagnostic.
 - Godot-port path: `GdScriptParserFacade.parse(...)` is tolerant; `parseStrict(...)` mirrors the strict contract (throws on the first `ERROR` diagnostic). `tokenize(...)` exposes the raw token stream for tests/tooling — without parser-driven multiline suppression, so its ERROR tokens are not a source-validity criterion.
 
-Completion support flow (tree-sitter path only; the Godot-port path has no completion support in v1):
+Completion support flow:
 
-- `GdParserFacade.parseCompletionContext(source, byteOffset)` classifies the cursor position into a `CompletionContext` (`MEMBER_ACCESS` / `IDENTIFIER` / `TYPE_POSITION` / `CALL_ARGUMENT` / `UNKNOWN`) directly from the immutable CST snapshot.
-- It resolves both natural tree-sitter `ERROR`/missing-placeholder structures left by unfinished input (e.g. `obj.|` at end of file) and syntactically complete member access with the cursor inside a member name prefix (e.g. `obj.pa|r`).
+- `GdScriptParserFacade.parseCompletionContext(source, byteOffset)` classifies the cursor into a `frontend.gdscript.CompletionContext` (`MEMBER_ACCESS` / `IDENTIFIER` / `TYPE_POSITION` / `CALL_ARGUMENT` / `UNKNOWN`), without loading a native runtime.
+- Tolerant AST structure supplies surviving nodes; token-level fallback also covers expressions discarded during recovery, including incomplete `super`/member chains, type slots and EOF-unclosed calls. Get-node paths include quoted segments and slash-delimited unique names; prefix `%` is distinguished from modulo.
+- The token view tracks inherited type-container layout and disabled function/lambda frames. Pending headers, bodyless signatures and inline/indented bodies have separate exit rules. Retained hard newlines, not physical rows, govern layout; explicit continuation does not overwrite the outer indentation baseline, which is restored when function frames unwind.
+- Finite type states distinguish completed casts from following expressions and support inner types after string-based `extends`. Match-pattern commas retain their lambda body; invalid non-multiline type containers cannot hide return-header cleanup.
 - `replaceableRange` always covers the whole identifier under the cursor; `receiverRange` (only for `MEMBER_ACCESS`) covers the fragment on the left side of the dot.
+- Offsets clamp to the physical UTF-8 source bounds; points use zero-based rows and byte columns. At a name/dot shared boundary the left name wins. String/comment interiors return `UNKNOWN`, but a cursor before their first byte remains in the code context, including an empty call slot before an opening quote. Type slots never replace a following non-type keyword.
+- The old `GdParserFacade.parseCompletionContext` and `infra.treesitter.CompletionContext` are deprecated but remain available unchanged in behavior. Candidate generation, semantic resolution and signature-help DTOs remain downstream concerns.
+- Known recovery limit: a mismatched closing bracket emitted as a lexical ERROR can leave the independent token view in multiline mode after the parser has recovered. Completion may then join otherwise separate statements; cross-layer recovery ownership changes are deferred pending approval.
 
 ## 3. Package Map
 
@@ -59,9 +65,9 @@ Main classes:
 
 - `GdLanguageLoader`: resolves/loads `tree_sitter_gdscript` symbol with fallback strategy
 - `GdLanguageAbiChecker`: verifies language ABI compatibility
-- `GdParserFacade`: minimal parse entrypoints (`parseSnapshot`, `parseCstRoot`, `parseCompletionContext`)
-- `GdParseSnapshot`: small parse result record for smoke checks
-- `CompletionContext` / `CompletionContextAnalyzer`: completion classification at a cursor byte offset
+- `GdParserFacade`: deprecated parse entrypoints (`parseSnapshot`, `parseCstRoot`, `parseCompletionContext`)
+- `GdParseSnapshot`: deprecated small parse result record for smoke checks
+- `CompletionContext` / `CompletionContextAnalyzer`: deprecated CST completion classification, retained for compatibility
 
 Concurrency contract:
 
@@ -125,7 +131,9 @@ Main classes:
 - `GdToken` / `GdTokenType` / `GdLiteralKind`: token model aligned with Godot's `Token::Type`
 - `SourceTextIndex`: UTF-8 byte offset <-> row/column conversion; physical byte cursor is the single source of truth for `Range`
 - `GdScriptParser`: recursive descent + Pratt expressions, panic-mode recovery with `synchronize()`, depth-budget guard against JVM stack overflow on pathological nesting
-- `GdScriptParserFacade`: public entry points (`parse`, `parseStrict`, `tokenize`)
+- `GdScriptParserFacade`: public entry points (`parse`, `parseStrict`, `tokenize`, `parseCompletionContext`)
+- `CompletionContext` / `CompletionContextAnalyzer`: completion DTO and AST/token classification
+- `CompletionTokenStream`: ERROR-skipping token view with bracket roles, effective multiline/body frames and type-position tracking; retains incomplete-string spans separately from syntax tokens
 
 Concurrency contract:
 
@@ -203,7 +211,8 @@ The canonical contract for dual-path equivalence lives in `doc/godot-java-parser
 Test suite is layered by concern:
 
 - `GdParserFacadeTest`: loader/bootstrap + parse smoke tests + shared-facade concurrency check
-- `CompletionContextTest`: completion classification at cursor offsets
+- `CompletionContextTest`: deprecated CST completion classification, retained as the migration reference
+- `GdCompletionContextTest`: numbered mapping of the 21 legacy cases, recovery/type/call fallbacks, UTF-8/CRLF points, trivia, truncations and shared-facade concurrency
 - `CstAdapterTest`: CST API behavior and invariants
 - `CstFixtureScriptsTest`: fixture-wide CST structure baseline
 - `CstToAstMapperTest`: lowering correctness and diagnostics

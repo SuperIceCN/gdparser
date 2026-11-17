@@ -1,5 +1,10 @@
 package dev.superice.gdparser.infra.treesitter;
 
-/// Minimal parse output for PoC verification.
+import dev.superice.gdparser.frontend.gdscript.GdScriptParserFacade;
+
+/// Legacy native parser snapshot.
+///
+/// @deprecated Use [GdScriptParserFacade#parse(String)] for typed syntax and diagnostics.
+@Deprecated
 public record GdParseSnapshot(String rootType, String sExpression, boolean hasError) {
 }

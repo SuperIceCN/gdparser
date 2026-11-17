@@ -43,6 +43,13 @@ public final class GdScriptParserFacade {
         return result.ast();
     }
 
+    /// Resolves completion from tolerant syntax and tokens, without native dependencies.
+    /// `byteOffset` is a UTF-8 byte offset, clamped to the physical source bounds.
+    public @NotNull CompletionContext parseCompletionContext(@NotNull String source, long byteOffset) {
+        Objects.requireNonNull(source, "source must not be null");
+        return CompletionContextAnalyzer.analyze(source, parse(source).ast(), byteOffset);
+    }
+
     /// Raw token stream from `GdTokenizer.scan()` up to and including the EOF token.
     ///
     /// Unlike `parse`, no parser drives the tokenizer here, so multiline mode is never pushed:

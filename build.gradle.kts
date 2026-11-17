@@ -7,7 +7,7 @@ plugins {
 }
 
 val defaultProjectGroup = "dev.superice"
-val defaultProjectVersion = "0.7.0"
+val defaultProjectVersion = "0.7.1"
 val requestedGroup = findProperty("group")?.toString()
 val requestedVersion = findProperty("version")?.toString()
 

@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
+@SuppressWarnings("deprecation") // The legacy backend remains a regression reference.
 class CstToAstMapperTest {
 
     private static final Path FIXTURE_DIR = Path.of("src", "test", "resources", "gdscript");

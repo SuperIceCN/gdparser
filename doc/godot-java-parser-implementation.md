@@ -6,13 +6,13 @@
 
 ### 1.1 定位与动机
 
-- 双 parser 并存：`frontend.gdscript` 为纯 Java、无 native 依赖的移植版，忠实对齐 Godot 官方 tokenizer 与 parser 的词法/语法/错误恢复行为，直接产出 `frontend.ast` 的 AST；tree-sitter 路径（`infra.treesitter` + `frontend.cst` + `frontend.lowering`）保持原样，作为对照与回退，两路在 `frontend.ast` / `frontend.serialize` 汇合。
+- 双 parser 并存：`frontend.gdscript` 为纯 Java、无 native 依赖的移植版，忠实对齐 Godot 官方 tokenizer 与 parser 的词法/语法/错误恢复行为，直接产出 `frontend.ast` 的 AST；tree-sitter 为已弃用的旧路径（`infra.treesitter` 公开入口标注 `@Deprecated`，运行时行为不变），暂保留为对照与回退，两路在 `frontend.ast` / `frontend.serialize` 汇合。
 - 动机：tree-sitter-gdscript 的 GLR 未实现 Godot「换行即语句结束」的 tokenizer 级语义（`NEWLINE`/`INDENT`/`DEDENT` 由 tokenizer 显式产生，附带 pending 机制与 multiline 抑制规则），在换行/缩进边界与官方行为不一致；其 `ERROR` 节点是通用容错产物，恢复粒度不可控。Godot 官方 parser 有明确的 panic-mode + 同步集恢复机制，可为 LSP 提供可预测的诊断与部分 AST。
-- 移植范围严格限定为 parser：裁剪语义分析（类型解析、常量折叠、符号表、补全钩子、注解验证等），只产出干净 AST 与语法诊断；补全能力继续由 tree-sitter 路径的 `CompletionContextAnalyzer` 承担。
+- Godot 移植范围严格限定为 parser：裁剪语义分析（类型解析、常量折叠、符号表、Godot 补全钩子、注解验证等），产出 AST 与语法诊断；纯 Java 路径另提供基于容错 AST 与 token 的补全上下文分类，不移植 Godot 的语义补全状态机（§12）。
 
 ### 1.2 当前状态
 
-- 移植已完成：tokenizer、Pratt 表达式、全部语句/声明、panic-mode 恢复、注释/region trivia、Facade（`parse`/`parseStrict`/`tokenize`）与并发契约全部落地。
+- 移植已完成：tokenizer、Pratt 表达式、全部语句/声明、panic-mode 恢复、注释/region trivia、Facade（`parse`/`parseStrict`/`tokenize`/`parseCompletionContext`）与并发契约全部落地。
 - 13 个 fixtures 全文件双路径 parity 通过（§5.7 (i)），由 `GdParserParityTest.fixtureFullFileParity` 动态发现断言。
 - 性能基线（JIT 预热后一次性夹具测量，仅作量级参照，不设回归阈值）：13 个 fixtures（合计约 41.6 KB）全量轮均值约 4.38 ms，吞吐量级 ≈9.5 MB/s；单 fixture 均值 35.4–870.0 µs（最大为 5.3 KB 的 `Sample10_Operators.gd`）。环境：JDK 25.0.4、Xeon E5-2699 v4 @ 2.20GHz。
 - 测试分层与各类规模见 §7；已知限制与风险见 §11。
@@ -52,6 +52,8 @@
 - `GdTokenizer`：`GDScriptTokenizerText` 的移植，增量 `scan()`；注释 trivia 收集（§5.4）；缩进状态快照 push/pop（对齐 `push_expression_indented_block`，供 lambda 使用；空栈 pop 抛 `IllegalStateException`——Godot 为静默 no-op，此处按内部 bug 处理）。
 - `SourceTextIndex`（包内）：UTF-8 字节偏移 ↔ 行列换算、行起始表；以**物理字节游标**为 `Range` 的唯一事实源（0-based 行、字节列）；Godot 在 EOF 合成的 token 行列不参与换算，锚定物理 EOF（§5.1）。
 - `GdScriptParser`：递归下降 + Pratt，直接构建 `frontend.ast` 记录；内部持有诊断列表、panic 标志、multiline 栈、lambda 状态、嵌套深度预算（§9）。
+- `CompletionContext` / `CompletionContextAnalyzer` / `CompletionTokenStream`：补全 DTO、AST/token 分类与有效 multiline token 视图（§12）。
+- `GdScriptParserFacade.parseCompletionContext(String, long) -> CompletionContext`：容错 AST + token 分析入口，光标为 UTF-8 字节偏移，越界自动 clamp；不加载 native，分类与范围合同见 §12。
 - `GdScriptParserFacade`：公开入口——`parse(String) -> AstMappingResult`（容错）、`parseStrict(String) -> SourceFile`（遇首个 ERROR 诊断即抛 `IllegalStateException`，消息格式 `Parsing failed at <nodeType>: <message>`，语义对齐 `CstToAstMapper.mapStrict`；WARNING 不触发）、`tokenize(String) -> List<GdToken>`（**raw 扫描流**：无 parser 的 multiline 干预，可能含上下文相关的缩进诊断与结尾 EOF token，不作为合法源「零 ERROR」的判定依据；parser 实际消费的 token 流以 `parse` 内部为准）。Facade 无状态（每次调用创建 fresh parser/tokenizer），共享实例可安全并发。
 
 ### 4.2 数据流
@@ -174,14 +176,14 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 | 改造 | 负号吸收进数字字面量 | 不吸收，偏差 D1，§5.5 |
 | 改造 | 类体 `pass` 保留 `PassStatement`（Godot 不产出节点）；`PI`/`TAU`/`INF`/`NAN` 产出 `IdentifierExpression`（不折数值） | parity 适配，§5.2/§5.3 |
 | 改造 | `elif`（Godot 嵌套 `IfNode` → AST `ElifClause`）、后缀链（`SubscriptNode`/`CallNode` → `AttributeExpression`+steps/`CallExpression`/`SubscriptExpression`） | AST 形状适配，§5.2 |
-| 裁剪 | 语义分析、类型解析、常量折叠（含内置常数数值化）、符号表、补全、注解验证、警告、文档提取、依赖缓存、二进制路径 | 不移植 |
-| 保留不动 | tree-sitter 全链路、`frontend.cst`、`frontend.lowering`、`frontend.serialize` | 零行为变更 |
+| 裁剪 | 语义分析、类型解析、常量折叠（含内置常数数值化）、符号表、Godot 语义耦合补全钩子、注解验证、警告、文档提取、依赖缓存、二进制路径 | 不移植；另实现纯语法补全上下文分类 |
+| 保留 | tree-sitter 全链路、`frontend.cst`、`frontend.lowering`、`frontend.serialize` | 运行时行为不变；`infra.treesitter` 旧入口标注弃用 |
 
 裁剪明细（Godot parse 阶段携带但不移植的语义耦合）：
 
 - `GDScriptAnalyzer` 交互、`DataType` 解析、类型约束与 `resolved_type`、`reduced`/`reduced_value` 常量折叠。
 - `SuiteNode` 局部符号表、标识符 source 解析、成员索引重复检查（纯语法层面可判定的诊断除外，§5.6）。
-- 代码补全状态机与 `make_completion_context` 钩子、编辑器 cursor 跟踪。
+- Godot 代码补全状态机与 `make_completion_context` 钩子、编辑器 cursor 跟踪（本项目补全入口独立实现，见 §12）。
 - 注解名称/目标/参数个数验证与 `@tool`/`@icon` 等 parser-time 动作（仅解析注解语法）。
 - 警告系统、工具构建的文档注释提取、`GDScriptParserRef`/`GDScriptCache` 依赖解析、二进制 tokenizer 路径。
 
@@ -192,6 +194,7 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 - 语料：优先内联字符串；确需文件时放 `src/test/resources/gdscript` 并纳入动态遍历；tree-sitter 路径 AST 参照快照存于 `src/test/resources/gdparser-parity/*.sexp`。
 - 迭代纪律：迭代期只跑目标测试类（`script/run-gradle-targeted-tests.sh --tests <Class>`）；改动后跑既有前端测试回归（`CstToAstMapperTest`、`AstSexprSerdeTest` 等）确认 tree-sitter 路径零影响；PR 前全量 `./gradlew clean build --no-daemon --info --console=plain`。
 - 当前测试规模（`@Test` 计数，动态发现用例另计）：`GdTokenizerTest` 51、`SourceTextIndexTest` 12、`GdScriptParserTest` 234、`GdScriptParserErrorRecoveryTest` 79、`GdScriptParserRangeInvariantTest` 2、`GdParserParityTest` 22、`GdParityReferenceTest` 13、`GdScriptParserFacadeTest` 11。
+- 补全验收：`GdCompletionContextTest` 逐条编号映射旧补全 21 例，并覆盖受损链、类型/实参回退、有效 multiline/lambda 帧、CJK/emoji/CRLF、未闭合字符串、截断与并发；旧 `CompletionContextTest` 保持行为断言不变。
 - Godot 对照方法：本环境无编辑器二进制，以 vendor 源码追踪为基准（commit `c016f22`），行列号按 Godot 字符列口径；代表性错误场景的对照结论以注释记录在用例上。
 
 ## 8. Godot 官方实现机制摘要（维护参考）
@@ -256,7 +259,7 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 3. dedent 尾窗口混合缩进注释组归属差异（旧路径 scanner 启发式回填，上游 issue #85/#42 承认）——parity 差异（§5.4）。
 4. 跨行分组 continuation 行跳闸的作用域归属错误（仅 >256 层病态嵌套 + 跨行分组）——§9。
 5. 语义型 parse 检查暂缓（赋值目标类型、调用目标类型、隐式 `super()` 上下文）——留分析层（§5.6）。
-6. 补全能力仍由 tree-sitter 路径独占，新路径补全方案待评估。
+6. 补全入口只分类语法上下文与范围，不生成候选、不提供 signature-help DTO、不做增量解析；下游仍需迁移消费入口。
 
 风险登记：
 
@@ -269,7 +272,24 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 7. **parity 过度承诺**：非法源与 §5.7 (ii) 类语法不做 AST 一致承诺，避免被 tree-sitter 容错形状绑架。风险等级：低。
 8. **性能**：当前基线 ≈9.5 MB/s（§1.2），无回归阈值；如需阈值化可基于 fixtures 计时重测。风险等级：低。
 
-## 12. 参考资料
+## 12. 纯 Java 补全上下文合同
+
+- 入口：`GdScriptParserFacade.parseCompletionContext(String source, long byteOffset)`，每次创建独立 parser 与 token 视图，可并发共享 facade，不初始化 tree-sitter/native。
+- DTO：`frontend.gdscript.CompletionContext(kind, replaceableRange, receiverRange)`；kind 为 `MEMBER_ACCESS` / `IDENTIFIER` / `TYPE_POSITION` / `CALL_ARGUMENT` / `UNKNOWN`。仅成员访问携带 receiver；范围使用 UTF-8 字节偏移、0-based 行与字节列，光标 clamp 到物理源范围。
+- 替换范围覆盖光标下完整名字，而非仅已输入前缀；缺名成员的零宽范围锚定点号末端，空实参/类型槽锚定光标。receiver 覆盖点号左侧完整 primary/postfix 片段，包括分组括号、调用、下标与 get-node 路径。
+- 共享边界优先左侧名字：`node|.pa` 为 IDENTIFIER(`node`)，`a.b|.c` 补全 `b`，`Outer|.Inner` 补全类型名 `Outer`。字符串/注释起点之前仍在代码侧，`target(|"s")` 为 CALL_ARGUMENT；进入引号或字符串前缀后为 UNKNOWN，未闭合字符串末端仍 UNKNOWN。
+- get-node 回退支持普通字符串路径段、`/%` 段和独立 `%`；已有完整左操作数后的 `%` 为取模，不吸收到右侧 receiver。健康 AST 与目标链被丢弃两种状态均测试，避免幸存 extent 掩盖回退缺陷。
+- AST 存活时使用其类型/标识符与链 extent；AST 被恢复丢弃时按 token 回退，保留 `super.`、受损成员链、具名 callee、显式类型槽与 EOF 未闭合调用的上下文。点分类型名优先于成员名；标识符实参优先于外围调用实参区；缺名点号及其空首实参位优先于调用实参区。
+- token 视图跳过 ERROR token，但单独保留未闭合字符串区间；字符串和注释内返回 `UNKNOWN`。表达式/签名分组启用 multiline，类型容器括号仅继承；function/lambda 使用禁用帧与有效缩进边界，签名闭合后返回类型不继承签名的启用帧。
+- `as`/`is` 仅算符角色开启类型槽，`is not` 可跨 `not`；成员名/get-node 路径中的同名关键字不触发类型补全。函数体/字典冒号、推断标记 `:=`/`: =` 不视为显式类型槽；签名参数表不视为调用实参区。
+- `is` 的可选 `not` 只作用于紧随的首个非布局 token；类型替换范围仅包含自身属于类型槽的名字，`for x: Array[int]|in arr:` 不覆盖右侧 `in`。`func` 待开启参数表、返回类型/无体函数、INLINE/INDENTED body 分别维护生命周期；无效头重判当前 token，硬换行终止无体声明，所有函数帧退出恢复外层逻辑缩进。INLINE 显式续行不因物理行变化提前退出。
+- 类型状态区分完整类型与后续表达式：guard 的 `when` 不延续前面的 cast 类型；容器 cast 完成后可补成员或下标表达式，点分类型后的 `[` 亦是表达式下标。字符串 `extends` 的点分内部类仍为 TYPE_POSITION，字符串内部仍 UNKNOWN。
+- INDENTED 函数帧局部维护 match 模式头；模式逗号不退出 lambda，分支 body 尾逗号仍可恢复外层调用。硬换行或类型状态失效时清理连续非 multiline 类型帧，再处理 RETURN_TYPE 与当前 token，不清理签名内合法继承 multiline 的类型容器。
+- EOF 无最终换行的 `target(`、`target(1,`、`target(1` 均为 `CALL_ARGUMENT`；最后一项是相对旧 CST 分类器 `UNKNOWN` 的有意改进。
+- 旧 `infra.treesitter.GdParserFacade`、`CompletionContext`、`CompletionContextAnalyzer`、`GdParseSnapshot` 已标注弃用并保留迁移指引，运行时行为不变；CST/lowering 与旧补全/parity 测试继续保留，移除另排。
+- 已知恢复限制：错配闭合符作为 ERROR 被跳过时，独立 token 视图可能保留已被 parser 恢复退出的 multiline 帧。例如 `var bad = [1)` 后 `a.` 与下一行 `b` 可能错误拼成成员访问。涉及底层恢复所有权的调整暂缓；详见恢复与补全计划 §12.4。
+
+## 13. 参考资料
 
 - Godot 源码 vendor 副本（commit `c016f22009aa773f0b2e6fce72baec168746491f`）：`vendor/godot/gdscript_tokenizer.h`、`vendor/godot/gdscript_tokenizer.cpp`、`vendor/godot/gdscript_parser.h`、`vendor/godot/gdscript_parser.cpp`（上游路径：`modules/gdscript/`）
 - 仓库文档：`doc/architecture-overview.md`、`doc/tree-sitter-ng-gdscript-implementation-plan.md`

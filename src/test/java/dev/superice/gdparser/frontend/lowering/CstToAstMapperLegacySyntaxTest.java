@@ -18,6 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@SuppressWarnings("deprecation") // The legacy backend remains a regression reference.
 class CstToAstMapperLegacySyntaxTest {
 
     private static GdParserFacade parserFacade;

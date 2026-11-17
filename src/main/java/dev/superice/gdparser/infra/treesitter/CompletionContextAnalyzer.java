@@ -3,6 +3,7 @@ package dev.superice.gdparser.infra.treesitter;
 import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.Range;
 import dev.superice.gdparser.frontend.cst.CstNodeView;
+import dev.superice.gdparser.frontend.gdscript.GdScriptParserFacade;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
@@ -12,6 +13,9 @@ import java.util.List;
 /// snapshot. Both syntactically complete member access (cursor inside a member name prefix,
 /// e.g. `obj.pa|r`) and incomplete input surfaced as natural tree-sitter `ERROR`/missing
 /// placeholder structures (e.g. `obj.|` at end of file) are handled.
+///
+/// @deprecated Retained for the legacy CST facade; new consumers use [GdScriptParserFacade].
+@Deprecated
 final class CompletionContextAnalyzer {
 
     private static final String LINE_CONTINUATION_TYPE = "line_continuation";

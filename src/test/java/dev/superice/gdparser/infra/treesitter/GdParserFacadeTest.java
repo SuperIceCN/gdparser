@@ -23,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@SuppressWarnings("deprecation") // The legacy backend remains a regression reference.
 class GdParserFacadeTest {
 
     private static final Path TEST_RESOURCE_DIR = Path.of("tmp", "native").toAbsolutePath().normalize();

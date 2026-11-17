@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /// `AstSexprSerializer` to character-identical text (all ranges included). Registered
 /// divergence sets (operator-precedence divergences, Godot-only constructs) are NOT
 /// asserted through `assertParity` — they get dedicated Godot-structure assertions.
+@SuppressWarnings("deprecation") // The legacy backend remains a regression reference.
 abstract class GdParserParityTestSupport {
 
     /// GDScript fixture corpus shared with the tree-sitter test suites.

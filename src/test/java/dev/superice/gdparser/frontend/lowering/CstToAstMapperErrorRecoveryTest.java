@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// Error-recovery lowering behavior: partial attribute chains keep their analyzable prefix with
 /// an explicit missing-step marker, other CST `ERROR`/missing-placeholder structures become
 /// `Error*` nodes, sibling mapping continues, and diagnostics keep carrying the error spans.
+@SuppressWarnings("deprecation") // The legacy backend remains a regression reference.
 class CstToAstMapperErrorRecoveryTest {
 
     private static GdParserFacade parserFacade;
