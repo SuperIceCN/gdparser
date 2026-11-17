@@ -20,7 +20,7 @@ jobs:
           - windows-latest
           - ubuntu-latest
           - ubuntu-24.04-arm
-          - macos-14
+          - macos-latest
 
     steps:
       - name: Checkout
@@ -53,26 +53,12 @@ jobs:
         shell: bash
         run: ./gradlew classes --no-daemon --info --console=plain
 
-      - name: Run targeted tests (Windows)
+      - name: Run tests (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: >
-          .\gradlew.bat test
-          --tests dev.superice.gdparser.infra.treesitter.GdParserFacadeTest
-          --tests dev.superice.gdparser.frontend.cst.CstAdapterTest
-          --tests dev.superice.gdparser.frontend.cst.CstFixtureScriptsTest
-          --tests dev.superice.gdparser.frontend.lowering.CstToAstMapperTest
-          --tests dev.superice.gdparser.frontend.serialize.AstSexprSerdeTest
-          --no-daemon --info --console=plain
+        run: .\gradlew.bat test --no-daemon --info --console=plain
 
-      - name: Run targeted tests (Linux/macOS)
+      - name: Run tests (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
-        run: >
-          ./gradlew test
-          --tests dev.superice.gdparser.infra.treesitter.GdParserFacadeTest
-          --tests dev.superice.gdparser.frontend.cst.CstAdapterTest
-          --tests dev.superice.gdparser.frontend.cst.CstFixtureScriptsTest
-          --tests dev.superice.gdparser.frontend.lowering.CstToAstMapperTest
-          --tests dev.superice.gdparser.frontend.serialize.AstSexprSerdeTest
-          --no-daemon --info --console=plain
+        run: ./gradlew test --no-daemon --info --console=plain

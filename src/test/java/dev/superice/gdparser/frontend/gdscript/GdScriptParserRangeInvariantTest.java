@@ -97,7 +97,12 @@ class GdScriptParserRangeInvariantTest {
             "% ^ &\nvar good = 2\n",
             // The extentEnd() special case: a trailing lambda argument whose body end, not the
             // last consumed token, anchors the enclosing ranges.
-            "var x = f(, func(): return 1\n"
+            "var x = f(, func(): return 1\n",
+            // Unindented class/function bodies across LF, CRLF, and trailing header comments.
+            "class Inner:\r\nvar x = 1\r\n",
+            "class Inner: # c  \nvar x = 1\n",
+            "class Inner: # c  \r\nvar x = 1\r\n",
+            "func f():\r\nvar x = 1\r\n"
     );
 
     @Test

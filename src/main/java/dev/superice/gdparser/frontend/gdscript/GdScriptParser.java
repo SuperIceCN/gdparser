@@ -497,14 +497,17 @@ public final class GdScriptParser {
         }
     }
 
-    /// Discards only trailing (end-of-line) comments before the given byte offset. Whole-line
-    /// comments keep pending for the sequence that owns them. Used when entering a suite: a
-    /// comment trailing the header line (`if x: # c`) is dropped by both paths.
-    private void discardTrailingCommentsBefore(int byteOffset) {
+    /// Discards only trailing (end-of-line) comments before the given byte offset, returning the
+    /// end byte of the last discarded comment (`0` when none). Whole-line comments keep pending
+    /// for the sequence that owns them. Used when entering a suite: a comment trailing the header
+    /// line (`if x: # c`) is dropped by both paths.
+    private int discardTrailingCommentsBefore(int byteOffset) {
+        var floorByte = 0;
         while (commentCursor < comments.size() && !comments.get(commentCursor).wholeLine()
                 && comments.get(commentCursor).startByte() < byteOffset) {
-            commentCursor++;
+            floorByte = comments.get(commentCursor++).endByte();
         }
+        return floorByte;
     }
 
     /// Moves the pending comment prefix before `limitByte` out of the cursor stream (see the
@@ -569,11 +572,15 @@ public final class GdScriptParser {
     }
 
     /// Block-start anchor for indented suites/class bodies: the newline token's start, backed
-    /// over any immediately preceding spaces/tabs (trailing header whitespace belongs to the
-    /// block span on the reference path; a trailing header comment does not).
-    private int layoutBlockStart(@NotNull GdToken newlineToken) {
+    /// over an immediately preceding CRLF `\r` and spaces/tabs down to `minByte` (trailing header
+    /// whitespace belongs to the block span on the reference path; a trailing header comment does
+    /// not).
+    private int layoutBlockStart(@NotNull GdToken newlineToken, int minByte) {
         var start = newlineToken.startByte();
-        while (start > 0 && (sourceBytes[start - 1] == ' ' || sourceBytes[start - 1] == '\t')) {
+        if (start > minByte && sourceBytes[start - 1] == '\r') {
+            start--;
+        }
+        while (start > minByte && (sourceBytes[start - 1] == ' ' || sourceBytes[start - 1] == '\t')) {
             start--;
         }
         return start;
@@ -1188,15 +1195,18 @@ public final class GdScriptParser {
         var headerEnd = previous.endByte();
 
         var multiline = match(GdTokenType.NEWLINE);
-        var blockStart = multiline ? layoutBlockStart(previous) : current.startByte();
+        int blockStart;
         if (multiline) {
             // A comment trailing the class-header line (`class Inner: # c`) is dropped.
-            discardTrailingCommentsBefore(previous.startByte());
+            var commentEnd = discardTrailingCommentsBefore(previous.startByte());
+            blockStart = layoutBlockStart(previous, Math.max(headerEnd, commentEnd));
             if (!consume(GdTokenType.INDENT, "Expected indented block after class declaration.")) {
                 return new ClassDeclaration(name, extendsTarget,
                         new Block(List.of(), range(blockStart, blockStart)),
-                        range(start, headerEnd));
+                        range(start, Math.max(blockStart, headerEnd)));
             }
+        } else {
+            blockStart = current.startByte();
         }
 
         if (match(GdTokenType.EXTENDS)) {
@@ -1252,15 +1262,16 @@ public final class GdScriptParser {
     }
 
     private @NotNull Block parseSuiteImpl(String context, boolean forLambda) {
+        var headerEnd = previous != null ? previous.endByte() : 0;
         var multiline = match(GdTokenType.NEWLINE);
         int blockStart;
         var suiteIndent = -1;
         if (multiline) {
+            // A comment trailing the suite-header line (`if x: # c`) is dropped by both paths.
+            var commentEnd = discardTrailingCommentsBefore(previous.startByte());
             // The reference path spans the body from right after the header content: trailing
             // whitespace before the newline is included, a trailing comment is not.
-            blockStart = layoutBlockStart(previous);
-            // A comment trailing the suite-header line (`if x: # c`) is dropped by both paths.
-            discardTrailingCommentsBefore(previous.startByte());
+            blockStart = layoutBlockStart(previous, Math.max(headerEnd, commentEnd));
             if (!consume(GdTokenType.INDENT, "Expected indented block after %s.".formatted(context))) {
                 return new Block(List.of(), range(blockStart, blockStart));
             }

@@ -30,6 +30,12 @@ class GdParserParityTest extends GdParserParityTestSupport {
                 var source = Files.readString(fixture, StandardCharsets.UTF_8);
                 assertCleanParity(source);
             }));
+            tests.add(dynamicTest("fixture (CRLF): " + fixture.getFileName(), () -> {
+                var source = Files.readString(fixture, StandardCharsets.UTF_8)
+                        .replace("\r\n", "\n")
+                        .replace("\n", "\r\n");
+                assertCleanParity(source);
+            }));
         }
         return List.copyOf(tests);
     }
@@ -322,6 +328,10 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("func f():\n\tpass\n# mid\n\tpass\n");
         assertCleanParity("func f():\n\tif x: pass # c\n\tpass\n");
         assertCleanParity("func f(): # c\n\tpass\n");
+        assertCleanParity("func f(): # c  \n\tpass\n");
+        assertCleanParity("func f(): # c  \r\n\tpass\r\n");
+        assertCleanParity("func f():   \r\n\t# body comment\r\n\tpass\r\n");
+        assertCleanParity("class Inner:  \r\n\tpass\r\n");
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t# c\n\t\t1:\n\t\t\tpass\n");
         assertCleanParity("#regionfoo\nvar x = 1\n#endregion done\n# region\n#region\nvar y = 1\n");
         assertCleanParity("func f():\n\twhile x: # w\n\t\tbreak # b\n");
