@@ -4,6 +4,9 @@ import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AstMappingResult;
 import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
+import dev.superice.gdparser.frontend.ast.Point;
+import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.SourceFile;
 import dev.superice.gdparser.frontend.serialize.AstSexprSerializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -61,22 +64,34 @@ class GdScriptParserFacadeTest {
     }
 
     @Test
-    void parseStrictSkipsWarningsAndThrowsFirstError() {
-        // WARNING (key-only pattern) precedes the ERROR (missing initializer): strict mode must
-        // skip the warning and throw the first ERROR, not the first diagnostic.
-        var source = "func f(v):\n\tmatch v:\n\t\t{\"name\"}:\n\t\t\tpass\n\tvar x = \n";
-        var diagnostics = facade.parse(source).diagnostics();
-        assertEquals(AstDiagnosticSeverity.WARNING, diagnostics.getFirst().severity());
-        assertEquals(AstDiagnosticSeverity.ERROR, diagnostics.get(1).severity());
-        var exception = assertThrows(IllegalStateException.class, () -> facade.parseStrict(source));
-        assertEquals("Parsing failed at ERROR: Expected expression for variable initial value after \"=\".",
-                exception.getMessage());
+    void requireStrictSkipsWarningsAndThrowsFirstError() {
+        // WARNING precedes ERROR: strict mode must skip the warning and throw the first ERROR,
+        // not the first diagnostic.
+        var range = new Range(0, 1, new Point(0, 0), new Point(0, 1));
+        var ast = new SourceFile(List.of(), range);
+        var result = new AstMappingResult(ast, List.of(
+                new AstDiagnostic(AstDiagnosticSeverity.WARNING, "Synthetic warning.", "synthetic", range),
+                new AstDiagnostic(AstDiagnosticSeverity.ERROR, "Expected expression.", "expression", range)
+        ));
+        var exception = assertThrows(IllegalStateException.class, () -> GdScriptParserFacade.requireStrict(result));
+        assertEquals("Parsing failed at expression: Expected expression.", exception.getMessage());
     }
 
     @Test
-    void parseStrictDoesNotThrowOnWarningsOnly() {
-        // Key-only dictionary pattern: exactly one WARNING, zero ERRORs (registered AST gap).
-        var ast = facade.parseStrict("func f(v):\n\tmatch v:\n\t\t{\"name\"}:\n\t\t\tpass\n");
+    void requireStrictDoesNotThrowOnWarningsOnly() {
+        var range = new Range(0, 1, new Point(0, 0), new Point(0, 1));
+        var ast = new SourceFile(List.of(), range);
+        var result = new AstMappingResult(ast, List.of(
+                new AstDiagnostic(AstDiagnosticSeverity.WARNING, "Synthetic warning.", "synthetic", range)
+        ));
+        assertSame(ast, GdScriptParserFacade.requireStrict(result));
+    }
+
+    @Test
+    void parseStrictSucceedsWithZeroDiagnosticsForKeyOnlyDictionaryPattern() {
+        var source = "func f(v):\n\tmatch v:\n\t\t{\"name\"}:\n\t\t\tpass\n";
+        assertEquals(List.of(), facade.parse(source).diagnostics());
+        var ast = facade.parseStrict(source);
         assertEquals(1, ast.statements().size());
     }
 

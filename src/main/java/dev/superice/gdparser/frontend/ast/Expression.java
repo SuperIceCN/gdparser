@@ -20,6 +20,7 @@ public sealed interface Expression extends Node permits IdentifierExpression,
         LambdaExpression,
         AwaitExpression,
         PatternBindingExpression,
+        RecoveredInfixExpression,
         ErrorExpression,
         UnknownExpression {
 }

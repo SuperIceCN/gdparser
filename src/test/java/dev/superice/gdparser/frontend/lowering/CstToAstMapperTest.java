@@ -129,7 +129,7 @@ class CstToAstMapperTest {
         var source = """
                 func _expr(a, b):
                     var arr = [1, 2, 3]
-                    var dict = {"x": a, "y": b, ..}
+                    var dict = {"x": a, "y": b}
                     var sum = a + b
                     var neg = -sum
                     var call_result = foo(bar(1), arr[0])
@@ -155,7 +155,7 @@ class CstToAstMapperTest {
 
         var dictDecl = declarations.get(1);
         var dictExpr = assertInstanceOf(DictionaryExpression.class, dictDecl.value());
-        assertTrue(dictExpr.openEnded());
+        assertFalse(dictExpr.openEnded());
         assertEquals(2, dictExpr.entries().size());
 
         var sumDecl = declarations.get(2);
@@ -230,6 +230,239 @@ class CstToAstMapperTest {
         var dictionary = assertInstanceOf(DictionaryExpression.class, returnStatement.value());
         var key = assertInstanceOf(IdentifierExpression.class, dictionary.entries().getFirst().key());
         assertEquals("x", key.name());
+    }
+
+    @Test
+    void keyOnlyDictionaryMatchPatternsPreserveKeysWithZeroDiagnostics() {
+        var result = map("""
+                const CONST_KEY = "k"
+                func f(v):
+                    match v:
+                        {"name"}:
+                            pass
+                        {CONST_KEY}:
+                            pass
+                        {1 + 2}:
+                            pass
+                        [{"k"}]:
+                            pass
+                        {"a": {"b"}}:
+                            pass
+                        {"a": _}:
+                            pass
+                """);
+        assertTrue(result.diagnostics().isEmpty(), () -> "Unexpected diagnostics: " + result.diagnostics());
+
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().get(1));
+        var matchStmt = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        var sections = matchStmt.sections();
+        assertEquals(6, sections.size());
+
+        // {"name"}
+        var strDict = assertInstanceOf(DictionaryExpression.class, sections.get(0).patterns().getFirst());
+        assertEquals(1, strDict.entries().size());
+        assertInstanceOf(LiteralExpression.class, strDict.entries().getFirst().key());
+        assertEquals(null, strDict.entries().getFirst().value());
+
+        // {CONST_KEY}
+        var constDict = assertInstanceOf(DictionaryExpression.class, sections.get(1).patterns().getFirst());
+        assertInstanceOf(IdentifierExpression.class, constDict.entries().getFirst().key());
+        assertEquals(null, constDict.entries().getFirst().value());
+
+        // {1 + 2}
+        var binDict = assertInstanceOf(DictionaryExpression.class, sections.get(2).patterns().getFirst());
+        assertInstanceOf(BinaryExpression.class, binDict.entries().getFirst().key());
+        assertEquals(null, binDict.entries().getFirst().value());
+
+        // [{"k"}]
+        var nestedArray = assertInstanceOf(ArrayExpression.class, sections.get(3).patterns().getFirst());
+        var innerArrDict = assertInstanceOf(DictionaryExpression.class, nestedArray.elements().getFirst());
+        assertInstanceOf(LiteralExpression.class, innerArrDict.entries().getFirst().key());
+        assertEquals(null, innerArrDict.entries().getFirst().value());
+
+        // {"a": {"b"}}
+        var outerDict = assertInstanceOf(DictionaryExpression.class, sections.get(4).patterns().getFirst());
+        var innerDictVal = assertInstanceOf(DictionaryExpression.class, outerDict.entries().getFirst().value());
+        assertInstanceOf(LiteralExpression.class, innerDictVal.entries().getFirst().key());
+        assertEquals(null, innerDictVal.entries().getFirst().value());
+
+        // {"a": _} stays morphologically distinct from bare {"a"}
+        var wildcardDict = assertInstanceOf(DictionaryExpression.class, sections.get(5).patterns().getFirst());
+        var wildcardVal = assertInstanceOf(IdentifierExpression.class, wildcardDict.entries().getFirst().value());
+        assertEquals("_", wildcardVal.name());
+    }
+
+    @Test
+    void brokenPairAndNonPatternContextsNeverProduceNullDictEntryValue() {
+        // Broken pair {"a": } inside match pattern keeps a non-null ErrorExpression value
+        var brokenPair = map("""
+                func f(v):
+                    match v:
+                        {"a": }:
+                            pass
+                """);
+        assertTrue(hasErrors(brokenPair));
+        var matchStmt = assertInstanceOf(MatchStatement.class,
+                assertInstanceOf(FunctionDeclaration.class, brokenPair.ast().statements().getFirst())
+                        .body().statements().getFirst());
+        var dict = assertInstanceOf(DictionaryExpression.class, matchStmt.sections().getFirst().patterns().getFirst());
+        assertEquals(1, dict.entries().size());
+        assertInstanceOf(ErrorExpression.class, dict.entries().getFirst().value());
+
+        // Guard expression and ordinary dictionary literals never produce null DictEntry.value()
+        var guardAndLiteral = map("""
+                func f(v):
+                    var d = {"a"}
+                    match v:
+                        1 when {"a"}:
+                            pass
+                """);
+        var body = assertInstanceOf(FunctionDeclaration.class, guardAndLiteral.ast().statements().getFirst())
+                .body().statements();
+        var varDict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, body.getFirst()).value());
+        assertTrue(varDict.entries().stream().allMatch(e -> e.value() != null));
+        var guardMatch = assertInstanceOf(MatchStatement.class, body.get(1));
+        var guardDict = assertInstanceOf(DictionaryExpression.class, guardMatch.sections().getFirst().guard());
+        assertTrue(guardDict.entries().stream().allMatch(e -> e.value() != null));
+        assertFalse(guardAndLiteral.diagnostics().isEmpty());
+    }
+
+    @Test
+    void multilineKeyOnlyPatternWithCommentAndMalformedColonSegmentInMatch() {
+        var multiline = map("""
+                func f(v):
+                    match v:
+                        {
+                            # note
+                            "a"
+                        }:
+                            pass
+                """);
+        assertTrue(multiline.diagnostics().isEmpty(), () -> "Unexpected diagnostics: " + multiline.diagnostics());
+        var multilineFn = assertInstanceOf(FunctionDeclaration.class, multiline.ast().statements().getFirst());
+        var multilineMatch = assertInstanceOf(MatchStatement.class, multilineFn.body().statements().getFirst());
+        var multilineDict = assertInstanceOf(DictionaryExpression.class,
+                multilineMatch.sections().getFirst().patterns().getFirst());
+        assertEquals(1, multilineDict.entries().size());
+        var key = assertInstanceOf(LiteralExpression.class, multilineDict.entries().getFirst().key());
+        assertEquals("\"a\"", key.sourceText());
+        assertEquals(null, multilineDict.entries().getFirst().value());
+
+        // `{: 1}` has `:` / ERROR in the segment, so `1` must NOT be promoted to DictEntry(1, null).
+        var malformedColon = map("""
+                func f(v):
+                    match v:
+                        {: 1}:
+                            pass
+                """);
+        assertFalse(malformedColon.diagnostics().isEmpty());
+        var malformedFn = assertInstanceOf(FunctionDeclaration.class, malformedColon.ast().statements().getFirst());
+        var malformedMatch = assertInstanceOf(MatchStatement.class, malformedFn.body().statements().getFirst());
+        var malformedDict = assertInstanceOf(DictionaryExpression.class,
+                malformedMatch.sections().getFirst().patterns().getFirst());
+        assertTrue(malformedDict.entries().stream().noneMatch(entry -> entry.value() == null));
+    }
+
+    @Test
+    void openEndedRestPatternIsRejectedOutsideMatchPatternsAndAllowedInside() {
+        // Positive: `..` inside match array/dictionary patterns sets openEnded = true with 0 diagnostics.
+        var validPatterns = map("""
+                func f(v):
+                    match v:
+                        [1, ..]:
+                            pass
+                        {"a": 1, ..}:
+                            pass
+                """);
+        assertTrue(validPatterns.diagnostics().isEmpty(), () -> "Unexpected diagnostics: " + validPatterns.diagnostics());
+        var validFn = assertInstanceOf(FunctionDeclaration.class, validPatterns.ast().statements().getFirst());
+        var validMatch = assertInstanceOf(MatchStatement.class, validFn.body().statements().getFirst());
+        assertTrue(assertInstanceOf(ArrayExpression.class, validMatch.sections().get(0).patterns().getFirst()).openEnded());
+        assertTrue(assertInstanceOf(DictionaryExpression.class, validMatch.sections().get(1).patterns().getFirst()).openEnded());
+
+        // Negative 1: dictionary key inside match pattern `{{..}}` is parsed in expression mode.
+        var dictKeyRest = map("""
+                func f(v):
+                    match v:
+                        {{..}}:
+                            pass
+                """);
+        assertTrue(hasErrors(dictKeyRest));
+        var dictKeyFn = assertInstanceOf(FunctionDeclaration.class, dictKeyRest.ast().statements().getFirst());
+        var dictKeyMatch = assertInstanceOf(MatchStatement.class, dictKeyFn.body().statements().getFirst());
+        var outerDict = assertInstanceOf(DictionaryExpression.class, dictKeyMatch.sections().getFirst().patterns().getFirst());
+        var innerKeyDict = assertInstanceOf(DictionaryExpression.class, outerDict.entries().getFirst().key());
+        assertFalse(innerKeyDict.openEnded());
+
+        // Negative 2: match guard `when [..]` is parsed in expression mode.
+        var guardRest = map("""
+                func f(v):
+                    match v:
+                        1 when [..]:
+                            pass
+                """);
+        assertTrue(hasErrors(guardRest));
+        var guardFn = assertInstanceOf(FunctionDeclaration.class, guardRest.ast().statements().getFirst());
+        var guardMatch = assertInstanceOf(MatchStatement.class, guardFn.body().statements().getFirst());
+        var guardArr = assertInstanceOf(ArrayExpression.class, guardMatch.sections().getFirst().guard());
+        assertFalse(guardArr.openEnded());
+
+        // Negative 3: ordinary array and dictionary literals reject `..` and keep openEnded = false.
+        var literalRest = map("""
+                func f():
+                    var a = [1, ..]
+                    var d = {"a": 1, ..}
+                """);
+        assertTrue(hasErrors(literalRest));
+        var litBody = assertInstanceOf(FunctionDeclaration.class, literalRest.ast().statements().getFirst())
+                .body().statements();
+        var litArr = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, litBody.get(0)).value());
+        var litDict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, litBody.get(1)).value());
+        assertFalse(litArr.openEnded());
+        assertFalse(litDict.openEnded());
+    }
+
+    @Test
+    void multiKeyDictionaryPatternWithMixedPairsAndCommentsLowersInSinglePassWithZeroDiagnostics() {
+        var sourceBuilder = new StringBuilder("func f(v):\n    match v:\n        {\n");
+        var expectedKeys = 120;
+        for (var i = 0; i < expectedKeys; i++) {
+            if (i % 10 == 0) {
+                sourceBuilder.append("            # section ").append(i).append("\n");
+            }
+            if (i % 4 == 0) {
+                sourceBuilder.append("            \"p").append(i).append("\": ").append(i);
+            } else {
+                sourceBuilder.append("            \"k").append(i).append("\"");
+            }
+            if (i + 1 < expectedKeys) {
+                sourceBuilder.append(",");
+            }
+            sourceBuilder.append("\n");
+        }
+        sourceBuilder.append("        }:\n            pass\n");
+
+        var result = map(sourceBuilder.toString());
+        assertTrue(result.diagnostics().isEmpty(), () -> "Unexpected diagnostics: " + result.diagnostics());
+
+        var fn = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var match = assertInstanceOf(MatchStatement.class, fn.body().statements().getFirst());
+        var dict = assertInstanceOf(DictionaryExpression.class, match.sections().getFirst().patterns().getFirst());
+        assertEquals(expectedKeys, dict.entries().size());
+        for (var i = 0; i < expectedKeys; i++) {
+            var entry = dict.entries().get(i);
+            var key = assertInstanceOf(LiteralExpression.class, entry.key());
+            if (i % 4 == 0) {
+                assertEquals("\"p" + i + "\"", key.sourceText());
+                assertInstanceOf(LiteralExpression.class, entry.value());
+            } else {
+                assertEquals("\"k" + i + "\"", key.sourceText());
+                assertEquals(null, entry.value());
+            }
+        }
     }
 
     @Test

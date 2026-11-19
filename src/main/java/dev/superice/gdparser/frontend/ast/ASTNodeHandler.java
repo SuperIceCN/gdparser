@@ -207,6 +207,10 @@ public interface ASTNodeHandler {
         return handleNode(node);
     }
 
+    default FrontendASTTraversalDirective handleRecoveredInfixExpression(RecoveredInfixExpression node) {
+        return handleNode(node);
+    }
+
     default FrontendASTTraversalDirective handleUnknownExpression(UnknownExpression node) {
         return handleNode(node);
     }

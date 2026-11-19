@@ -1,7 +1,6 @@
 package dev.superice.gdparser.frontend.gdscript;
 
 import dev.superice.gdparser.frontend.ast.AssertStatement;
-import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AttributeCallStep;
 import dev.superice.gdparser.frontend.ast.AttributeExpression;
 import dev.superice.gdparser.frontend.ast.AttributePropertyStep;
@@ -16,6 +15,7 @@ import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
 import dev.superice.gdparser.frontend.ast.IdentifierExpression;
 import dev.superice.gdparser.frontend.ast.IfStatement;
 import dev.superice.gdparser.frontend.ast.LiteralExpression;
+import dev.superice.gdparser.frontend.ast.MatchStatement;
 import dev.superice.gdparser.frontend.ast.PassStatement;
 import dev.superice.gdparser.frontend.ast.RegionDirectiveStatement;
 import dev.superice.gdparser.frontend.ast.Statement;
@@ -252,13 +252,18 @@ class GdParityReferenceTest extends GdParserParityTestSupport {
     }
 
     @Test
-    void keyOnlyDictionaryPatternDropsKeyWithWarning() {
+    void keyOnlyDictionaryPatternPreservesKeyWithNullValueAndNoDiagnostics() {
         var result = parseViaTreeSitter(CORPUS.get("key_only_dict_pattern"));
-        // Documented AST expressiveness gap: the key is dropped and exactly one WARNING
-        // is emitted (no errors, no unrelated diagnostics).
-        assertEquals(List.of(AstDiagnosticSeverity.WARNING),
-                result.diagnostics().stream().map(d -> d.severity()).toList());
-        assertEquals("string", result.diagnostics().getFirst().nodeType());
+        assertTrue(result.diagnostics().isEmpty(), () -> "Unexpected diagnostics: " + result.diagnostics());
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        var dictionary = assertInstanceOf(DictionaryExpression.class,
+                match.sections().getFirst().patterns().getFirst());
+        assertEquals(1, dictionary.entries().size());
+        var key = assertInstanceOf(LiteralExpression.class, dictionary.entries().getFirst().key());
+        assertEquals("string", key.kind());
+        assertEquals("\"name\"", key.sourceText());
+        assertNull(dictionary.entries().getFirst().value());
     }
 
     @Test
@@ -287,11 +292,8 @@ class GdParityReferenceTest extends GdParserParityTestSupport {
     }
 
     @Test
-    void corpusSamplesOtherThanRegisteredGapHaveNoDiagnostics() {
+    void allCorpusSamplesHaveNoDiagnostics() {
         for (var entry : CORPUS.entrySet()) {
-            if (entry.getKey().equals("key_only_dict_pattern")) {
-                continue; // Documented WARNING gap, asserted by its own test.
-            }
             var result = parseViaTreeSitter(entry.getValue());
             assertTrue(result.diagnostics().isEmpty(),
                     () -> entry.getKey() + " diagnostics: " + result.diagnostics());

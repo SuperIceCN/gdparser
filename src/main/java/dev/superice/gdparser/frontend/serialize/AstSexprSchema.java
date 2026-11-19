@@ -46,6 +46,7 @@ import dev.superice.gdparser.frontend.ast.PatternBindingExpression;
 import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.PreloadExpression;
 import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.RecoveredInfixExpression;
 import dev.superice.gdparser.frontend.ast.RegionDirectiveStatement;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
 import dev.superice.gdparser.frontend.ast.SelfExpression;
@@ -135,6 +136,7 @@ final class AstSexprSchema {
         register(LambdaExpression.class);
         register(AwaitExpression.class);
         register(PatternBindingExpression.class);
+        register(RecoveredInfixExpression.class);
         register(ErrorExpression.class);
         register(UnknownExpression.class);
     }

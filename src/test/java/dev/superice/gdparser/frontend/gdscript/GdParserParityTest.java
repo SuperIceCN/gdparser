@@ -277,9 +277,8 @@ class GdParserParityTest extends GdParserParityTestSupport {
     }
 
     /// Match sections and every pattern form. Branch-level `pass` is excluded (the reference path
-    /// rejects it — a registered parity divergence); key-only dictionary patterns and
-    /// `@warning_ignore` are kept: both paths drop the same information, so the ASTs still match
-    /// byte-identically.
+    /// rejects it — a registered parity divergence); `@warning_ignore` is kept because both paths
+    /// drop it identically. Key-only dictionary patterns are preserved on both paths with `value = null`.
     @Test
     void matchParity() {
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t1:\n\t\t\tpass\n\t\tvar a:\n\t\t\tpass\n\t\t_:\n\t\t\tpass\n");
@@ -288,6 +287,8 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t[..]:\n\t\t\tpass\n");
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t{\"k\": 1, \"j\": var b, ..}:\n\t\t\tpass\n");
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t{\"name\"}:\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t[{\"k\"}]:\n\t\t\tpass\n");
+        assertCleanParity("func f(v):\n\tmatch v:\n\t\t{\"a\": {\"b\"}}:\n\t\t\tpass\n");
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t[{\"k\": _}, [..]]:\n\t\t\tpass\n");
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t1 + 2:\n\t\t\tpass\n\t\tCONST:\n\t\t\tpass\n\t\t'y':\n\t\t\tpass\n");
         assertCleanParity("func f(v):\n\tmatch v:\n\t\t1: pass\n\t\t_: pass\n");

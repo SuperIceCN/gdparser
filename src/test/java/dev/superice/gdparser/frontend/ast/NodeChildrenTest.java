@@ -1,5 +1,6 @@
 package dev.superice.gdparser.frontend.ast;
 
+import dev.superice.gdparser.frontend.cst.CstIssueKind;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.ParameterizedType;
@@ -62,6 +63,29 @@ class NodeChildrenTest {
                 UnsupportedOperationException.class,
                 () -> sourceFile.getChildren().add(new PassStatement(RANGE))
         );
+    }
+
+    @Test
+    void dictEntryAndRecoveredInfixExpressionChildrenAndNullGuards() {
+        var key = new LiteralExpression("string", "\"k\"", RANGE);
+        var value = new IdentifierExpression("v", RANGE);
+        var keyOnlyEntry = new DictEntry(key, null, RANGE);
+        var pairedEntry = new DictEntry(key, value, RANGE);
+
+        assertEquals(List.of(key), keyOnlyEntry.getChildren());
+        assertEquals(List.of(key, value), pairedEntry.getChildren());
+        assertThrows(UnsupportedOperationException.class, () -> keyOnlyEntry.getChildren().add(value));
+        assertThrows(NullPointerException.class, () -> new DictEntry(null, value, RANGE));
+        assertThrows(NullPointerException.class, () -> new DictEntry(key, null, null));
+
+        var problem = new ErrorExpression(CstIssueKind.MISSING, "cast.type", "", RANGE);
+        var recovered = new RecoveredInfixExpression(key, "as", problem, RANGE);
+        assertEquals(List.of(key, problem), recovered.getChildren());
+        assertThrows(UnsupportedOperationException.class, () -> recovered.getChildren().add(value));
+        assertThrows(NullPointerException.class, () -> new RecoveredInfixExpression(null, "as", problem, RANGE));
+        assertThrows(NullPointerException.class, () -> new RecoveredInfixExpression(key, null, problem, RANGE));
+        assertThrows(NullPointerException.class, () -> new RecoveredInfixExpression(key, "as", null, RANGE));
+        assertThrows(NullPointerException.class, () -> new RecoveredInfixExpression(key, "as", problem, null));
     }
 
     private static List<Class<? extends Node>> concreteNodeTypes() {

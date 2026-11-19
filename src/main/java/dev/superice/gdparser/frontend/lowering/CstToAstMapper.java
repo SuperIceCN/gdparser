@@ -491,7 +491,7 @@ public final class CstToAstMapper {
                     }
                     continue;
                 }
-                patterns.add(mapExpression(child));
+                patterns.add(mapMatchPattern(child));
             }
 
             return new MatchSection(
@@ -580,8 +580,8 @@ public final class CstToAstMapper {
                 case "unary_operator" -> mapUnaryExpression(node);
                 case "conditional_expression" -> mapConditionalExpression(node);
                 case "assignment", "augmented_assignment" -> mapAssignmentExpression(node);
-                case "array" -> mapArrayExpression(node);
-                case "dictionary" -> mapDictionaryExpression(node);
+                case "array" -> mapArrayExpression(node, false);
+                case "dictionary" -> mapDictionaryExpression(node, false);
                 case "lambda" -> mapLambdaExpression(node);
                 case "await_expression" -> mapAwaitExpression(node);
                 case "pattern_binding" -> mapPatternBindingExpression(node);
@@ -590,6 +590,31 @@ public final class CstToAstMapper {
                     warn("Unsupported expression node: " + node.type(), node);
                     yield AstFactory.unknownExpression(node, text(node));
                 }
+            };
+        }
+
+        /// Maps a `match` section pattern node. Only array/dictionary patterns and pattern
+        /// bindings participate in pattern-specific rules (such as key-only dictionary entries and
+        /// `..` open-ending); keys, guards, and ordinary expressions continue through `mapExpression`.
+        private @NotNull Expression mapMatchPattern(CstNodeView node) {
+            if (node.isError()) {
+                return AstFactory.errorExpression(CstIssueKind.ERROR, node, text(node));
+            }
+            if (CstErrorDetector.isMissingPlaceholder(node)) {
+                return AstFactory.errorExpression(CstIssueKind.MISSING, node, text(node));
+            }
+
+            var legacyMessage = legacyExpressionMessage(node);
+            if (legacyMessage != null) {
+                error(legacyMessage, node);
+                return AstFactory.unknownExpression(node, text(node));
+            }
+
+            return switch (node.type()) {
+                case "array" -> mapArrayExpression(node, true);
+                case "dictionary" -> mapDictionaryExpression(node, true);
+                case "pattern_binding" -> mapPatternBindingExpression(node);
+                default -> mapExpression(node);
             };
         }
 
@@ -774,24 +799,35 @@ public final class CstToAstMapper {
             );
         }
 
-        private @NotNull ArrayExpression mapArrayExpression(CstNodeView node) {
+        private @NotNull ArrayExpression mapArrayExpression(CstNodeView node, boolean inMatchPattern) {
             var elements = new ArrayList<Expression>();
             var openEnded = false;
             for (var child : significantNamedChildren(node)) {
+                if (isContainerTrivia(child)) {
+                    continue;
+                }
                 if (child.type().equals("pattern_open_ending")) {
-                    openEnded = true;
+                    if (inMatchPattern) {
+                        openEnded = true;
+                    } else {
+                        error("The \"..\" pattern is only allowed in match patterns.", child);
+                    }
                 } else {
-                    elements.add(mapExpression(child));
+                    elements.add(inMatchPattern ? mapMatchPattern(child) : mapExpression(child));
                 }
             }
             return new ArrayExpression(List.copyOf(elements), openEnded, AstFactory.range(node.range()));
         }
 
-        private @NotNull DictionaryExpression mapDictionaryExpression(CstNodeView node) {
+        private @NotNull DictionaryExpression mapDictionaryExpression(CstNodeView node, boolean inMatchPattern) {
             var entries = new ArrayList<DictEntry>();
             var openEnded = false;
             String lockedStyle = null;
+            var healthyKeyOnlyKeys = inMatchPattern ? collectHealthyKeyOnlyPatternKeys(node) : Set.<CstNodeView>of();
             for (var child : significantNamedChildren(node)) {
+                if (isContainerTrivia(child)) {
+                    continue;
+                }
                 if (child.type().equals("pair")) {
                     var leftNode = child.childByField("left");
                     var valueNode = child.childByField("value");
@@ -803,9 +839,16 @@ public final class CstToAstMapper {
                             error("Mixing dictionary styles is not allowed.", child);
                         }
                     }
-                    entries.add(mapDictionaryEntry(child, style));
+                    entries.add(mapDictionaryEntry(child, style, inMatchPattern));
                 } else if (child.type().equals("pattern_open_ending")) {
-                    openEnded = true;
+                    if (inMatchPattern) {
+                        openEnded = true;
+                    } else {
+                        error("The \"..\" pattern is only allowed in match patterns.", child);
+                    }
+                } else if (inMatchPattern && healthyKeyOnlyKeys.contains(child)) {
+                    // Key-only dictionary pattern entry without a `:` value slot.
+                    entries.add(new DictEntry(mapExpression(child), null, AstFactory.range(child.range())));
                 } else {
                     warn("Unsupported dictionary child node: " + child.type(), child);
                 }
@@ -813,7 +856,7 @@ public final class CstToAstMapper {
             return new DictionaryExpression(List.copyOf(entries), openEnded, AstFactory.range(node.range()));
         }
 
-        private @NotNull DictEntry mapDictionaryEntry(CstNodeView node, @Nullable String style) {
+        private @NotNull DictEntry mapDictionaryEntry(CstNodeView node, @Nullable String style, boolean inMatchPattern) {
             var leftNode = node.childByField("left");
             var valueNode = node.childByField("value");
             var resolvedStyle = style != null ? style : dictionaryEntryStyle(leftNode, valueNode);
@@ -822,7 +865,9 @@ public final class CstToAstMapper {
                     : "=".equals(resolvedStyle)
                     ? mapLuaStyleDictionaryKey(leftNode)
                     : mapExpression(leftNode);
-            var value = valueNode == null ? mapRequiredExpression(node, "value") : mapExpression(valueNode);
+            var value = valueNode == null
+                    ? mapRequiredExpression(node, "value")
+                    : inMatchPattern ? mapMatchPattern(valueNode) : mapExpression(valueNode);
             return new DictEntry(key, value, AstFactory.range(node.range()));
         }
 
@@ -1316,8 +1361,12 @@ public final class CstToAstMapper {
                 case NONE -> new ExpressionStatement(chain, chain.range());
                 case RETURN -> new ReturnStatement(chain, rangeFromTo(children.get(tail.startIndex()), dot));
                 case ASSIGN -> {
-                    var left = buildChainExpression(tail.aux());
-                    var range = rangeFromTo(tail.aux().getFirst(), dot);
+                    var leftParts = tail.aux();
+                    if (leftParts == null || leftParts.isEmpty()) {
+                        yield new ExpressionStatement(chain, chain.range());
+                    }
+                    var left = buildChainExpression(leftParts);
+                    var range = rangeFromTo(leftParts.getFirst(), dot);
                     yield new ExpressionStatement(new AssignmentExpression("=", left, chain, range), range);
                 }
                 case VARIABLE -> {
@@ -1325,10 +1374,11 @@ public final class CstToAstMapper {
                     var keyword = children.get(keywordIndex);
                     var nameNode = children.get(keywordIndex + 1);
                     var isConst = keyword.type().equals("const");
+                    var typeNodes = tail.aux();
                     yield new VariableDeclaration(
                             isConst ? DeclarationKind.CONST : DeclarationKind.VAR,
                             textTrimmed(nameNode),
-                            tail.aux() == null ? null : mapTypeRef(tail.aux().getFirst()),
+                            typeNodes == null || typeNodes.isEmpty() ? null : mapTypeRef(typeNodes.getFirst()),
                             chain,
                             tail.isStatic(),
                             isConst ? "const_statement" : "variable_statement",
@@ -1534,6 +1584,58 @@ public final class CstToAstMapper {
 
         private boolean isLineContinuation(CstNodeView node) {
             return node.type().equals(LINE_CONTINUATION_TYPE);
+        }
+
+        private boolean isContainerTrivia(CstNodeView node) {
+            return switch (node.type()) {
+                case "comment", "region_start", "region_end", LINE_CONTINUATION_TYPE -> true;
+                default -> false;
+            };
+        }
+
+        /// Performs a single pass over `dictionaryNode.children()` to collect every candidate key
+        /// that sits alone (ignoring trivia) inside a healthy `{`/`,` ... `,`/`}` segment.
+        private @NotNull Set<CstNodeView> collectHealthyKeyOnlyPatternKeys(CstNodeView dictionaryNode) {
+            var healthyKeys = Collections.newSetFromMap(new IdentityHashMap<CstNodeView, Boolean>());
+            CstNodeView candidate = null;
+            var segmentValid = true;
+            for (var child : dictionaryNode.children()) {
+                var type = child.type();
+                if (type.equals("{")) {
+                    candidate = null;
+                    segmentValid = true;
+                    continue;
+                }
+                if (type.equals(",") || type.equals("}")) {
+                    if (segmentValid && isEligibleKeyOnlyCandidate(candidate)) {
+                        healthyKeys.add(candidate);
+                    }
+                    candidate = null;
+                    segmentValid = true;
+                    continue;
+                }
+                if (isContainerTrivia(child)) {
+                    continue;
+                }
+                if (candidate == null) {
+                    candidate = child;
+                } else {
+                    segmentValid = false;
+                }
+            }
+            if (segmentValid && isEligibleKeyOnlyCandidate(candidate)) {
+                healthyKeys.add(candidate);
+            }
+            return healthyKeys;
+        }
+
+        private static boolean isEligibleKeyOnlyCandidate(@Nullable CstNodeView candidate) {
+            return candidate != null
+                    && !candidate.isError()
+                    && !candidate.hasError()
+                    && !CstErrorDetector.isMissingPlaceholder(candidate)
+                    && !candidate.type().equals("pair")
+                    && !candidate.type().equals("pattern_open_ending");
         }
 
         /// Named children with `line_continuation` extras removed. Continuations carry no

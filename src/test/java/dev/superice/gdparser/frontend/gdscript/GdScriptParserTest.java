@@ -2327,22 +2327,52 @@ class GdScriptParserTest {
     }
 
     @Test
-    void matchKeyOnlyDictionaryPatternDropsKeyWithWarning() {
-        var result = parse("func f(v):\n\tmatch v:\n\t\t{\"name\"}:\n\t\t\tpass\n");
-        // Registered AST expressiveness gap: exactly one WARNING, no errors; the entry is dropped.
-        var errors = errorMessages(result);
-        assertEquals(List.of(), errors);
-        var warnings = result.diagnostics().stream()
-                .filter(d -> d.severity() == AstDiagnosticSeverity.WARNING).toList();
-        assertEquals(1, warnings.size());
-        assertEquals("Key-only dictionary pattern drops the key (the AST cannot represent it).",
-                warnings.getFirst().message());
-        assertEquals("string", warnings.getFirst().nodeType());
+    void matchKeyOnlyDictionaryPatternPreservesKeyWithNullValue() {
+        var result = parse("""
+                func f(v):
+                \tmatch v:
+                \t\t{"name"}:
+                \t\t\tpass
+                \t\t[{"k"}]:
+                \t\t\tpass
+                \t\t{"a": {"b"}}:
+                \t\t\tpass
+                \t\t{"a": _}:
+                \t\t\tpass
+                """);
+        assertTrue(result.diagnostics().isEmpty(), () -> "Unexpected diagnostics: " + result.diagnostics());
         var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
         var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
-        var dictionary = assertInstanceOf(DictionaryExpression.class,
-                match.sections().getFirst().patterns().getFirst());
-        assertEquals(0, dictionary.entries().size());
+        assertEquals(4, match.sections().size());
+
+        var dict = assertInstanceOf(DictionaryExpression.class, match.sections().get(0).patterns().getFirst());
+        assertEquals(1, dict.entries().size());
+        var key = assertInstanceOf(LiteralExpression.class, dict.entries().getFirst().key());
+        assertEquals("\"name\"", key.sourceText());
+        assertNull(dict.entries().getFirst().value());
+
+        var arrPattern = assertInstanceOf(ArrayExpression.class, match.sections().get(1).patterns().getFirst());
+        var nestedDict = assertInstanceOf(DictionaryExpression.class, arrPattern.elements().getFirst());
+        assertNull(nestedDict.entries().getFirst().value());
+
+        var outerDict = assertInstanceOf(DictionaryExpression.class, match.sections().get(2).patterns().getFirst());
+        var innerDictVal = assertInstanceOf(DictionaryExpression.class, outerDict.entries().getFirst().value());
+        assertNull(innerDictVal.entries().getFirst().value());
+
+        // `{"a": _}` remains distinct from key-only `{"a"}`.
+        var wildcardDict = assertInstanceOf(DictionaryExpression.class, match.sections().get(3).patterns().getFirst());
+        var wildcardVal = assertInstanceOf(IdentifierExpression.class, wildcardDict.entries().getFirst().value());
+        assertEquals("_", wildcardVal.name());
+
+        // A broken pair `{"a": }` in match pattern still reports an error with a non-null ErrorExpression value.
+        var broken = parse("func f(v):\n\tmatch v:\n\t\t{\"a\": }:\n\t\t\tpass\n");
+        assertFalse(errorMessages(broken).isEmpty());
+        var brokenMatch = assertInstanceOf(MatchStatement.class,
+                assertInstanceOf(FunctionDeclaration.class, broken.ast().statements().getFirst())
+                        .body().statements().getFirst());
+        var brokenDict = assertInstanceOf(DictionaryExpression.class,
+                brokenMatch.sections().getFirst().patterns().getFirst());
+        assertInstanceOf(ErrorExpression.class, brokenDict.entries().getFirst().value());
     }
 
     @Test

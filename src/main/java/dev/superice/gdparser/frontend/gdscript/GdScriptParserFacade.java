@@ -32,7 +32,11 @@ public final class GdScriptParserFacade {
     ///
     /// @throws IllegalStateException with message `Parsing failed at <nodeType>: <message>`
     public @NotNull SourceFile parseStrict(@NotNull String source) {
-        var result = parse(source);
+        return requireStrict(parse(source));
+    }
+
+    static @NotNull SourceFile requireStrict(@NotNull AstMappingResult result) {
+        Objects.requireNonNull(result, "result must not be null");
         var firstError = result.diagnostics().stream()
                 .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
                 .findFirst();

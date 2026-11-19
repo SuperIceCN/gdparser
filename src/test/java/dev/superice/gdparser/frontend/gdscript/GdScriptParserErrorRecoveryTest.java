@@ -1594,4 +1594,105 @@ class GdScriptParserErrorRecoveryTest {
             assertEquals(ast, restored, () -> "serde round-trip mismatch for: " + source);
         }
     }
+
+    @Test
+    void missingSlotDiagnosticsBindToTheirOwningNodesAndFacets() {
+        var varResult = recoverableParse("var x =\n");
+        var varDiag = findErrorByCode(varResult, DiagnosticCodes.SLOT_VARIABLE_INITIALIZER);
+        var varNode = assertInstanceOf(VariableDeclaration.class, varResult.ast().statements().getFirst());
+        assertNotNull(varDiag.recovery());
+        assertSame(varNode, varDiag.recovery().owner());
+        assertEquals("variable.initializer", varDiag.recovery().facet());
+
+        var constResult = recoverableParse("const X =\n");
+        var constDiag = findErrorByCode(constResult, DiagnosticCodes.SLOT_CONSTANT_VALUE);
+        var constNode = assertInstanceOf(VariableDeclaration.class, constResult.ast().statements().getFirst());
+        assertNotNull(constDiag.recovery());
+        assertSame(constNode, constDiag.recovery().owner());
+        assertEquals("constant.value", constDiag.recovery().facet());
+
+        var paramResult = recoverableParse("func f(a =):\n\tpass\n");
+        var paramDiag = findErrorByCode(paramResult, DiagnosticCodes.SLOT_PARAMETER_DEFAULT);
+        var paramNode = onlyFunction(paramResult).parameters().getFirst();
+        assertNotNull(paramDiag.recovery());
+        assertSame(paramNode, paramDiag.recovery().owner());
+        assertEquals("parameter.default", paramDiag.recovery().facet());
+
+        var enumResult = recoverableParse("enum E { A =\n");
+        var enumDiag = findErrorByCode(enumResult, DiagnosticCodes.SLOT_ENUM_VALUE);
+        var enumNode = assertInstanceOf(EnumDeclaration.class, enumResult.ast().statements().getFirst());
+        assertNotNull(enumDiag.recovery());
+        assertSame(enumNode.members().getFirst(), enumDiag.recovery().owner());
+        assertEquals("enum.value", enumDiag.recovery().facet());
+
+        var ifResult = recoverableParse("func f():\n\tif:\n\t\tpass\n");
+        var ifDiag = findErrorByCode(ifResult, DiagnosticCodes.SLOT_IF_CONDITION);
+        var ifNode = assertInstanceOf(IfStatement.class, onlyFunction(ifResult).body().statements().getFirst());
+        assertNotNull(ifDiag.recovery());
+        assertSame(ifNode, ifDiag.recovery().owner());
+        assertEquals("if.condition", ifDiag.recovery().facet());
+
+        var elifResult = recoverableParse("func f():\n\tif true:\n\t\tpass\n\telif:\n\t\tpass\n");
+        var elifDiag = findErrorByCode(elifResult, DiagnosticCodes.SLOT_ELIF_CONDITION);
+        var outerIf = assertInstanceOf(IfStatement.class, onlyFunction(elifResult).body().statements().getFirst());
+        assertNotNull(elifDiag.recovery());
+        assertSame(outerIf.elifClauses().getFirst(), elifDiag.recovery().owner());
+        assertEquals("elif.condition", elifDiag.recovery().facet());
+
+        var whileResult = recoverableParse("func f():\n\twhile:\n\t\tpass\n");
+        var whileDiag = findErrorByCode(whileResult, DiagnosticCodes.SLOT_WHILE_CONDITION);
+        var whileNode = assertInstanceOf(WhileStatement.class, onlyFunction(whileResult).body().statements().getFirst());
+        assertNotNull(whileDiag.recovery());
+        assertSame(whileNode, whileDiag.recovery().owner());
+        assertEquals("while.condition", whileDiag.recovery().facet());
+
+        var forResult = recoverableParse("func f():\n\tfor i in:\n\t\tpass\n");
+        var forDiag = findErrorByCode(forResult, DiagnosticCodes.SLOT_FOR_ITERABLE);
+        var forNode = assertInstanceOf(ForStatement.class, onlyFunction(forResult).body().statements().getFirst());
+        assertNotNull(forDiag.recovery());
+        assertSame(forNode, forDiag.recovery().owner());
+        assertEquals("for.iterable", forDiag.recovery().facet());
+
+        var assertCondResult = recoverableParse("func f():\n\tassert(\n");
+        var assertCondDiag = findErrorByCode(assertCondResult, DiagnosticCodes.SLOT_ASSERT_CONDITION);
+        var assertCondNode = assertInstanceOf(AssertStatement.class, onlyFunction(assertCondResult).body().statements().getFirst());
+        assertNotNull(assertCondDiag.recovery());
+        assertSame(assertCondNode, assertCondDiag.recovery().owner());
+        assertEquals("assert.condition", assertCondDiag.recovery().facet());
+
+        var assertMsgResult = recoverableParse("func f():\n\tassert(true,\n");
+        var assertMsgDiag = findErrorByCode(assertMsgResult, DiagnosticCodes.SLOT_ASSERT_MESSAGE);
+        var assertMsgNode = assertInstanceOf(AssertStatement.class, onlyFunction(assertMsgResult).body().statements().getFirst());
+        assertNotNull(assertMsgDiag.recovery());
+        assertSame(assertMsgNode, assertMsgDiag.recovery().owner());
+        assertEquals("assert.message", assertMsgDiag.recovery().facet());
+
+        var matchValResult = recoverableParse("func f():\n\tmatch:\n\t\t1:\n\t\t\tpass\n");
+        var matchValDiag = findErrorByCode(matchValResult, DiagnosticCodes.SLOT_MATCH_VALUE);
+        var matchNode = assertInstanceOf(MatchStatement.class, onlyFunction(matchValResult).body().statements().getFirst());
+        assertNotNull(matchValDiag.recovery());
+        assertSame(matchNode, matchValDiag.recovery().owner());
+        assertEquals("match.value", matchValDiag.recovery().facet());
+
+        var guardResult = recoverableParse("func f():\n\tmatch x:\n\t\t1 when:\n\t\t\tpass\n");
+        var guardDiag = findErrorByCode(guardResult, DiagnosticCodes.SLOT_MATCH_GUARD);
+        var guardMatch = assertInstanceOf(MatchStatement.class, onlyFunction(guardResult).body().statements().getFirst());
+        assertNotNull(guardDiag.recovery());
+        assertSame(guardMatch.sections().getFirst(), guardDiag.recovery().owner());
+        assertEquals("match.guard", guardDiag.recovery().facet());
+
+        var groupingResult = recoverableParse("var g = ()\n");
+        var groupingDiag = findErrorByCode(groupingResult, DiagnosticCodes.SLOT_GROUPING);
+        var groupingNode = assertInstanceOf(VariableDeclaration.class, groupingResult.ast().statements().getFirst());
+        assertNotNull(groupingDiag.recovery());
+        assertSame(groupingNode, groupingDiag.recovery().owner());
+        assertEquals("variable.initializer", groupingDiag.recovery().facet());
+    }
+
+    private static AstDiagnostic findErrorByCode(AstMappingResult result, String code) {
+        return errorsOf(result).stream()
+                .filter(d -> code.equals(d.code()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("Missing diagnostic " + code + " in: " + errorsOf(result)));
+    }
 }

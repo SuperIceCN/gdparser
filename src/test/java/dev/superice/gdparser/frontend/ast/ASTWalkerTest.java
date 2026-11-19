@@ -1,5 +1,6 @@
 package dev.superice.gdparser.frontend.ast;
 
+import dev.superice.gdparser.frontend.cst.CstIssueKind;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -95,6 +96,58 @@ class ASTWalkerTest {
         assertThrows(NullPointerException.class, () -> new ASTWalker(new ASTNodeHandler() {
         }).walk(null));
         assertThrows(NullPointerException.class, () -> walker.walk(new PassStatement(RANGE)));
+    }
+
+    @Test
+    void walkShouldVisitNullableDictEntryAndRecoveredInfixExpression() {
+        var keyOnlyEntry = new DictEntry(new LiteralExpression("string", "\"name\"", RANGE), null, RANGE);
+        var dictVisited = new ArrayList<String>();
+        new ASTWalker(new ASTNodeHandler() {
+            @Override
+            public FrontendASTTraversalDirective handleNode(Node node) {
+                dictVisited.add(node.getClass().getSimpleName());
+                return FrontendASTTraversalDirective.CONTINUE;
+            }
+        }).walk(keyOnlyEntry);
+        assertEquals(List.of("DictEntry", "LiteralExpression"), dictVisited);
+
+        var recovered = new RecoveredInfixExpression(
+                new IdentifierExpression("x", RANGE),
+                "is",
+                new ErrorExpression(CstIssueKind.MISSING, "type_test.type", "", RANGE),
+                RANGE
+        );
+
+        // Fallback to handleNode when handleRecoveredInfixExpression is not overridden
+        var fallbackVisited = new ArrayList<String>();
+        new ASTWalker(new ASTNodeHandler() {
+            @Override
+            public FrontendASTTraversalDirective handleNode(Node node) {
+                fallbackVisited.add("fallback:" + node.getClass().getSimpleName());
+                return FrontendASTTraversalDirective.CONTINUE;
+            }
+        }).walk(recovered);
+        assertEquals(
+                List.of("fallback:RecoveredInfixExpression", "fallback:IdentifierExpression", "fallback:ErrorExpression"),
+                fallbackVisited
+        );
+
+        // Specific handler dispatch + SKIP_CHILDREN pruning
+        var specificVisited = new ArrayList<String>();
+        new ASTWalker(new ASTNodeHandler() {
+            @Override
+            public FrontendASTTraversalDirective handleNode(Node node) {
+                specificVisited.add("generic:" + node.getClass().getSimpleName());
+                return FrontendASTTraversalDirective.CONTINUE;
+            }
+
+            @Override
+            public FrontendASTTraversalDirective handleRecoveredInfixExpression(RecoveredInfixExpression node) {
+                specificVisited.add("specific:" + node.operator());
+                return FrontendASTTraversalDirective.SKIP_CHILDREN;
+            }
+        }).walk(recovered);
+        assertEquals(List.of("specific:is"), specificVisited);
     }
 
     private static SourceFile sampleTree() {

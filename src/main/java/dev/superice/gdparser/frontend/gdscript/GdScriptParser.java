@@ -4,8 +4,6 @@ import dev.superice.gdparser.frontend.ast.AnnotationStatement;
 import dev.superice.gdparser.frontend.ast.ArrayExpression;
 import dev.superice.gdparser.frontend.ast.AssertStatement;
 import dev.superice.gdparser.frontend.ast.AssignmentExpression;
-import dev.superice.gdparser.frontend.ast.AstDiagnostic;
-import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AstMappingResult;
 import dev.superice.gdparser.frontend.ast.AttributeCallStep;
 import dev.superice.gdparser.frontend.ast.AttributeExpression;
@@ -51,7 +49,6 @@ import dev.superice.gdparser.frontend.ast.PassStatement;
 import dev.superice.gdparser.frontend.ast.PatternBindingExpression;
 import dev.superice.gdparser.frontend.ast.PreloadExpression;
 import dev.superice.gdparser.frontend.ast.Range;
-import dev.superice.gdparser.frontend.ast.RecoveryLink;
 import dev.superice.gdparser.frontend.ast.RegionDirectiveStatement;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
 import dev.superice.gdparser.frontend.ast.SelfExpression;
@@ -120,14 +117,8 @@ public final class GdScriptParser {
     /// Deferred comment prefixes of enclosing lambda bodies, innermost last. Restored to the
     /// cursor head when each body finishes (see {@link #deferCommentsBefore}).
     private final Deque<List<GdComment>> deferredCommentStack = new ArrayDeque<>();
-    private final List<AstDiagnostic> diagnostics = new ArrayList<>();
+    private final RecoveryTransactionTracker recoveryTracker = new RecoveryTransactionTracker();
     private boolean panicMode;
-
-    /// Stack of owner contexts for recovery-link binding, innermost last. A context opens when a
-    /// survivable construct starts parsing a facet that can hold a damaged expression (variable
-    /// initializer, parameter default, return value, …) and closes when the facet's parse ends;
-    /// the stashed frame is bound to the owning node once that node is built.
-    private final Deque<RecoveryOwnerFrame> recoveryOwnerStack = new ArrayDeque<>();
 
     /// Annotations parsed but not yet flushed into a statement sequence. They flush (in source
     /// order) right before the next dispatched statement, and the flushed run that sits on the
@@ -205,8 +196,7 @@ public final class GdScriptParser {
         index = tokenizer.sourceTextIndex();
         multilineStack.clear();
         multilineStartStack.clear();
-        diagnostics.clear();
-        recoveryOwnerStack.clear();
+        recoveryTracker.reset();
         pendingAnnotations.clear();
         panicMode = false;
         lastStatementWasNull = false;
@@ -229,7 +219,14 @@ public final class GdScriptParser {
         var token = tokenizer.scan();
         while (token.isError() || token.type() == GdTokenType.NEWLINE) {
             if (token.isError()) {
-                pushError(token.errorMessage(), token);
+                panicMode = true;
+                recoveryTracker.emitError(
+                        token.errorMessage(),
+                        tokenRange(token),
+                        DiagnosticCodes.LEXICAL_ERROR,
+                        RecoveryTransactionTracker.AttributionPolicy.STANDALONE,
+                        null
+                );
                 // Queued errors drain LIFO, so keep the furthest physical end line seen so far.
                 lastLeadingErrorLine = Math.max(lastLeadingErrorLine, token.endLine());
             } else {
@@ -253,57 +250,33 @@ public final class GdScriptParser {
         if (!multilineStack.isEmpty() || !multilineStartStack.isEmpty()) {
             throw new IllegalStateException("GDScript parser bug: unbalanced multiline stack at end of parse.");
         }
+        if (!recoveryTracker.isBalanced()) {
+            throw new IllegalStateException("GDScript parser bug: unbalanced recovery frame stack at end of parse.");
+        }
         var fileRange = statements.isEmpty()
                 ? range(index.utf8Length(), index.utf8Length())
                 : range(0, index.utf8Length());
         var ast = new SourceFile(statements, fileRange);
-        // A recovery link is only meaningful while its owner is part of the returned AST: a
-        // discarded construct (dropped statement, duplicate/!rebuilt parameter) may have had
-        // links bound to nodes inside it before the drop.
-        unlinkOrphanedRecovery(ast);
-        return new AstMappingResult(ast, List.copyOf(diagnostics));
-    }
-
-    /// Clears the `recovery` link of every diagnostic whose owner node is not reachable from the
-    /// final AST (identity comparison, not structural equality). Code/range/message are kept.
-    private void unlinkOrphanedRecovery(@NotNull SourceFile ast) {
-        var hasLinks = false;
-        for (var d : diagnostics) {
-            if (d.recovery() != null) {
-                hasLinks = true;
-                break;
-            }
-        }
-        if (!hasLinks) {
-            return;
-        }
-        var reachable = Collections.newSetFromMap(new IdentityHashMap<Node, Boolean>());
-        var work = new ArrayDeque<Node>();
-        work.add(ast);
-        while (!work.isEmpty()) {
-            var node = work.poll();
-            if (reachable.add(node)) {
-                work.addAll(node.getChildren());
-            }
-        }
-        for (var i = 0; i < diagnostics.size(); i++) {
-            var d = diagnostics.get(i);
-            if (d.recovery() != null && !reachable.contains(d.recovery().owner())) {
-                diagnostics.set(i, d.withRecovery(null));
-            }
-        }
+        // Resolve provisional recovery links against surviving AST owners by object identity.
+        return new AstMappingResult(ast, recoveryTracker.finalizeDiagnostics(ast));
     }
 
     // ---------------------------------------------------------------------------------------------
     // Cursor, diagnostics and recovery — port of the cursor block in gdscript_parser.cpp.
     // ---------------------------------------------------------------------------------------------
 
-    /// Scans until a non-ERROR token, converting each ERROR token into a diagnostic (the parser
-    /// never observes ERROR tokens, mirroring the error-skip loop of `GDScriptParser::advance`).
+    /// Scans until a non-ERROR token, converting each ERROR token into a staged lexical diagnostic
+    /// (the parser never observes ERROR tokens, mirroring `GDScriptParser::advance`). Staging
+    /// prevents lookahead errors from binding to a still-open previous-statement frame.
     private GdToken scanSkippingErrors() {
         var token = tokenizer.scan();
         while (token.isError()) {
-            pushError(token.errorMessage(), token);
+            panicMode = true;
+            recoveryTracker.stageLexicalError(
+                    token.errorMessage(),
+                    tokenRange(token),
+                    DiagnosticCodes.LEXICAL_ERROR
+            );
             token = tokenizer.scan();
         }
         return token;
@@ -397,33 +370,21 @@ public final class GdScriptParser {
 
     private void pushError(String message, GdToken origin, @Nullable String code) {
         panicMode = true;
-        diagnostics.add(new AstDiagnostic(
-                AstDiagnosticSeverity.ERROR,
-                message,
-                DIAGNOSTIC_NODE_TYPE,
-                tokenRange(origin),
-                code,
-                null
-        ));
+        recoveryTracker.emitLegacyError(message, tokenRange(origin), code);
     }
 
     /// Missing-closer diagnostic: zero-width at the failure point (`extentEnd()`), recorded in the
-    /// innermost open owner frame so it can be bound to the surviving construct once built.
+    /// innermost open provisional recovery frame so it can be bound to the surviving construct once built.
     private void pushMissingCloser(String message, String code) {
         panicMode = true;
         var point = extentEnd();
-        diagnostics.add(new AstDiagnostic(
-                AstDiagnosticSeverity.ERROR,
+        recoveryTracker.emitError(
                 message,
-                DIAGNOSTIC_NODE_TYPE,
                 range(point, point),
                 code,
+                RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
                 null
-        ));
-        var frame = recoveryOwnerStack.peekLast();
-        if (frame != null) {
-            frame.pendingDiagnostics().add(diagnostics.size() - 1);
-        }
+        );
     }
 
     /// Marker for an opened expression slot whose parse produced no node: a zero-width MISSING
@@ -454,58 +415,37 @@ public final class GdScriptParser {
             case ParseOutcome.Ok<Expression>(var node) -> node;
             case ParseOutcome.Damaged<Expression>(var node) -> node;
             case ParseOutcome.Missing<Expression> _ -> {
-                pushError(contextMessage, slotCode(slotName));
+                panicMode = true;
+                recoveryTracker.emitError(
+                        contextMessage,
+                        tokenRange(previous),
+                        DiagnosticCodes.slotCode(slotName),
+                        RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                        null
+                );
                 yield slotMarker(outcome, slotStartByte, slotName);
             }
             case ParseOutcome.Failed<Expression> _ -> slotMarker(outcome, slotStartByte, slotName);
         };
     }
 
-    /// Diagnostic code of an expression slot, derived from its dotted slot name
-    /// (`variable.initializer` → `parse.missing_expression.variable_initializer`). The derivation
-    /// keeps the marker/facet vocabulary and the `DiagnosticCodes.SLOT_*` constants in lockstep —
-    /// a renamed slot must keep its derived code aligned with the registered constant.
-    private static @NotNull String slotCode(@NotNull String slotName) {
-        return "parse.missing_expression." + slotName.replace('.', '_');
-    }
-
     /// Opens an owner context for a facet that may hold a damaged expression.
     private void pushRecoveryOwner(String facet) {
-        recoveryOwnerStack.addLast(new RecoveryOwnerFrame(facet));
+        recoveryTracker.pushFrame(facet);
     }
 
     /// Closes the innermost owner context and returns it for later binding. The frame is popped
     /// right after its facet's expression parse (before any suite runs), so closer diagnostics
     /// from a following body cannot mis-bind to this facet.
-    private @NotNull RecoveryOwnerFrame popRecoveryOwner() {
-        var frame = recoveryOwnerStack.pollLast();
-        if (frame == null) {
-            throw new IllegalStateException("GDScript parser bug: recovery owner stack underflow.");
-        }
-        return frame;
+    private @NotNull RecoveryTransactionTracker.ProvisionalFrame popRecoveryOwner() {
+        return recoveryTracker.popFrame();
     }
 
-    /// Binds a stashed frame's recorded closer diagnostics to the built owner node. Frames whose
-    /// owner is never built are simply dropped; their diagnostics keep code and range and stay
-    /// consumable via range correlation, and the end-of-parse reachability sweep unlinks any
-    /// whose owner stopped being part of the final AST.
-    private void bindRecoveryOwner(@NotNull RecoveryOwnerFrame frame, @NotNull Node owner) {
-        for (var i : frame.pendingDiagnostics()) {
-            diagnostics.set(i, diagnostics.get(i).withRecovery(new RecoveryLink(owner, frame.facet())));
-        }
-    }
-
-    /// Mutable per-open-slot owner context; see {@link #recoveryOwnerStack}.
-    private record RecoveryOwnerFrame(String facet, List<Integer> pendingDiagnostics) {
-        private RecoveryOwnerFrame(String facet) {
-            this(facet, new ArrayList<>());
-        }
-    }
-
-    /// A non-fatal diagnostic (does not set the panic flag). `nodeType` mirrors the reference
-    /// path's CST-derived tag where one exists, so diagnostics stay comparable across paths.
-    private void pushWarning(String message, String nodeType, Range range) {
-        diagnostics.add(new AstDiagnostic(AstDiagnosticSeverity.WARNING, message, nodeType, range));
+    /// Commits a stashed frame to the built owner node. Frames whose owner is never built are
+    /// abandoned or fall back via their authorized parent chain; unreachable links are swept at
+    /// the end of parsing.
+    private void bindRecoveryOwner(@NotNull RecoveryTransactionTracker.ProvisionalFrame frame, @NotNull Node owner) {
+        recoveryTracker.commit(frame, owner);
     }
 
     /// Advances the comment cursor past every trivia comment starting before the current token
@@ -1437,7 +1377,7 @@ public final class GdScriptParser {
             case RETURN -> {
                 advance();
                 Expression returnValue = null;
-                RecoveryOwnerFrame valueFrame = null;
+                RecoveryTransactionTracker.ProvisionalFrame valueFrame = null;
                 if (!isStatementEnd()) {
                     // Ported vendor check: a constructor (`_init`/`_static_init`) may not
                     // return a value. The error is reported before parsing the value, like Godot.
@@ -1574,11 +1514,11 @@ public final class GdScriptParser {
         var conditionStart = current.startByte();
         pushRecoveryOwner("if.condition");
         var conditionOutcome = parseExpression(false);
+        var condition = absorbSlot(conditionOutcome, conditionStart, "if.condition",
+                "Expected conditional expression after \"if\".");
         // Pop before the suite runs so closer diagnostics inside the body cannot mis-bind to the
         // header facet; the stashed frame binds once the statement is built.
         var conditionFrame = popRecoveryOwner();
-        var condition = absorbSlot(conditionOutcome, conditionStart, "if.condition",
-                "Expected conditional expression after \"if\".");
         if (!match(GdTokenType.COLON)) {
             pushError("Expected \":\" after \"if\" condition, found \"%s\" instead."
                     .formatted(current.type().displayName()));
@@ -1592,9 +1532,9 @@ public final class GdScriptParser {
             var elifConditionStart = current.startByte();
             pushRecoveryOwner("elif.condition");
             var elifConditionOutcome = parseExpression(false);
-            var elifConditionFrame = popRecoveryOwner();
             var elifCondition = absorbSlot(elifConditionOutcome, elifConditionStart, "elif.condition",
                     "Expected conditional expression after \"elif\".");
+            var elifConditionFrame = popRecoveryOwner();
             if (!match(GdTokenType.COLON)) {
                 pushError("Expected \":\" after \"elif\" condition, found \"%s\" instead."
                         .formatted(current.type().displayName()));
@@ -1628,9 +1568,9 @@ public final class GdScriptParser {
         var conditionStart = current.startByte();
         pushRecoveryOwner("while.condition");
         var conditionOutcome = parseExpression(false);
-        var conditionFrame = popRecoveryOwner();
         var condition = absorbSlot(conditionOutcome, conditionStart, "while.condition",
                 "Expected conditional expression after \"while\".");
+        var conditionFrame = popRecoveryOwner();
         if (!match(GdTokenType.COLON)) {
             pushError("Expected \":\" after \"while\" condition, found \"%s\" instead."
                     .formatted(current.type().displayName()));
@@ -1676,9 +1616,9 @@ public final class GdScriptParser {
         var iterableStart = current.startByte();
         pushRecoveryOwner("for.iterable");
         var iterableOutcome = parseExpression(false);
-        var iterableFrame = popRecoveryOwner();
         var iterable = absorbSlot(iterableOutcome, iterableStart, "for.iterable",
                 "Expected iterable after \"in\".");
+        var iterableFrame = popRecoveryOwner();
         if (!match(GdTokenType.COLON)) {
             pushError("Expected \":\" after \"for\" condition, found \"%s\" instead."
                     .formatted(current.type().displayName()));
@@ -1717,19 +1657,19 @@ public final class GdScriptParser {
         var conditionStart = current.startByte();
         pushRecoveryOwner("assert.condition");
         var conditionOutcome = parseExpression(false);
-        var conditionFrame = popRecoveryOwner();
         var condition = absorbSlot(conditionOutcome, conditionStart, "assert.condition",
                 "Expected expression to assert.");
+        var conditionFrame = popRecoveryOwner();
 
         Expression message = null;
-        RecoveryOwnerFrame messageFrame = null;
+        RecoveryTransactionTracker.ProvisionalFrame messageFrame = null;
         if (match(GdTokenType.COMMA) && !check(GdTokenType.PARENTHESIS_CLOSE)) {
             var messageStart = current.startByte();
             pushRecoveryOwner("assert.message");
             var messageOutcome = parseExpression(false);
-            messageFrame = popRecoveryOwner();
             message = absorbSlot(messageOutcome, messageStart, "assert.message",
                     "Expected error message for assert after \",\".");
+            messageFrame = popRecoveryOwner();
             match(GdTokenType.COMMA);
         }
 
@@ -1772,9 +1712,9 @@ public final class GdScriptParser {
         var valueStart = current.startByte();
         pushRecoveryOwner("match.value");
         var valueOutcome = parseExpression(false);
-        var valueFrame = popRecoveryOwner();
         var value = absorbSlot(valueOutcome, valueStart, "match.value",
                 "Expected expression to test after \"match\".");
+        var valueFrame = popRecoveryOwner();
         consume(GdTokenType.COLON, "Expected \":\" after \"match\" expression.");
         if (match(GdTokenType.NEWLINE)) {
             // A comment trailing the match-header line is dropped by both paths.
@@ -1890,15 +1830,15 @@ public final class GdScriptParser {
         }
 
         Expression guard = null;
-        RecoveryOwnerFrame guardFrame = null;
+        RecoveryTransactionTracker.ProvisionalFrame guardFrame = null;
         var hasGuard = match(GdTokenType.WHEN);
         if (hasGuard) {
             var guardStart = current.startByte();
             pushRecoveryOwner("match.guard");
             var guardOutcome = parseExpression(false);
-            guardFrame = popRecoveryOwner();
             guard = absorbSlot(guardOutcome, guardStart, "match.guard",
                     "Expected expression for pattern guard after \"when\".");
+            guardFrame = popRecoveryOwner();
         }
 
         Block body;
@@ -2020,14 +1960,12 @@ public final class GdScriptParser {
                 range(start, previous.endByte())), false);
     }
 
-    /// Dictionary pattern: `key: pattern` entries, the `..` rest marker, and key-only entries.
-    /// A key-only entry drops its key with a WARNING (registered AST expressiveness gap — the
-    /// reference path does the same via its unsupported-child warning). A failed key keeps a
-    /// marker in its entry when a `: sub-pattern` carrier survives; when no carrier exists
-    /// (no colon, a dropped sub-pattern, or a `..`-misuse branch that drops the entry), the
-    /// damaged key would be homeless, so the whole dictionary pattern degrades to an ERROR
-    /// fragment covering the consumed prefix (`DictEntry` cannot hold a null side, and no
-    /// key-only shape exists for a damaged key — healthy sibling entries are lost with it).
+    /// Dictionary pattern: `key: pattern` entries, the `..` rest marker, and healthy key-only
+    /// entries (`DictEntry(key, null, range)` with zero diagnostics). A failed key keeps a marker
+    /// in its entry when a `: sub-pattern` carrier survives; when no carrier exists (no colon,
+    /// a dropped sub-pattern, or a `..`-misuse branch that drops the entry), the damaged key would
+    /// be homeless, so the whole dictionary pattern degrades to an ERROR fragment covering the
+    /// consumed prefix.
     private @NotNull MatchPattern parseDictionaryMatchPattern() {
         var start = current.startByte();
         pushMultiline();
@@ -2074,8 +2012,9 @@ public final class GdScriptParser {
                 // A damaged key without a `: value` carrier has no representable home.
                 homelessDamagedKey = true;
             } else {
-                pushWarning("Key-only dictionary pattern drops the key (the AST cannot represent it).",
-                        patternKeyNodeType(key), key.range());
+                entries.add(new DictEntry(key, null,
+                        range(Math.min(keyStart, key.range().startByte()),
+                                Math.max(key.range().endByte(), extentEnd()))));
             }
         } while (match(GdTokenType.COMMA));
 
@@ -2088,23 +2027,6 @@ public final class GdScriptParser {
         }
         return new MatchPattern(new DictionaryExpression(List.copyOf(entries), openEnded,
                 range(start, previous.endByte())), false);
-    }
-
-    /// CST-style node tag for the key-only-pattern warning, mirroring the reference path's tags
-    /// (`"string"` for a string literal key, `"identifier"` for an identifier key, etc.).
-    private static @NotNull String patternKeyNodeType(@NotNull Expression key) {
-        return switch (key) {
-            case LiteralExpression literal -> literal.kind();
-            case IdentifierExpression ignored -> "identifier";
-            case BinaryExpression ignored -> "binary_operator";
-            case UnaryExpression ignored -> "unary_operator";
-            case CallExpression ignored -> "call";
-            case AttributeExpression ignored -> "attribute";
-            case SubscriptExpression ignored -> "subscript";
-            case ArrayExpression ignored -> "array";
-            case DictionaryExpression ignored -> "dictionary";
-            default -> DIAGNOSTIC_NODE_TYPE;
-        };
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2122,7 +2044,7 @@ public final class GdScriptParser {
 
         var arguments = new ArrayList<Expression>();
         var end = atToken.endByte();
-        RecoveryOwnerFrame argumentsFrame = null;
+        RecoveryTransactionTracker.ProvisionalFrame argumentsFrame = null;
         if (check(GdTokenType.PARENTHESIS_OPEN)) {
             pushMultiline();
             advance();
@@ -2252,7 +2174,7 @@ public final class GdScriptParser {
 
         TypeRef type = null;
         Expression value = null;
-        RecoveryOwnerFrame valueFrame = null;
+        RecoveryTransactionTracker.ProvisionalFrame valueFrame = null;
         if (match(GdTokenType.COLON)) {
             var colonToken = previous;
             if (check(GdTokenType.NEWLINE)) {
@@ -2282,9 +2204,9 @@ public final class GdScriptParser {
             var valueStart = current.startByte();
             pushRecoveryOwner("variable.initializer");
             var valueOutcome = parseExpression(false);
-            valueFrame = popRecoveryOwner();
             value = absorbSlot(valueOutcome, valueStart, "variable.initializer",
                     "Expected expression for variable initial value after \"=\".");
+            valueFrame = popRecoveryOwner();
         }
 
         if (allowProperty && match(GdTokenType.COLON)) {
@@ -2465,9 +2387,9 @@ public final class GdScriptParser {
         var valueStart = current.startByte();
         pushRecoveryOwner("constant.value");
         var valueOutcome = parseExpression(false);
-        var valueFrame = popRecoveryOwner();
         var value = absorbSlot(valueOutcome, valueStart, "constant.value",
                 "Expected initializer expression for constant.");
+        var valueFrame = popRecoveryOwner();
 
         var constant = new VariableDeclaration(DeclarationKind.CONST, named.name(), named.type(), value, false,
                 "const_statement", range(start, extentEnd()));
@@ -2492,14 +2414,14 @@ public final class GdScriptParser {
         var named = parseNameAndType();
 
         Expression defaultValue = null;
-        RecoveryOwnerFrame defaultFrame = null;
+        RecoveryTransactionTracker.ProvisionalFrame defaultFrame = null;
         if (match(GdTokenType.EQUAL)) {
             var defaultStart = current.startByte();
             pushRecoveryOwner("parameter.default");
             var defaultOutcome = parseExpression(false);
-            defaultFrame = popRecoveryOwner();
             defaultValue = absorbSlot(defaultOutcome, defaultStart, "parameter.default",
                     "Expected expression for parameter default value after \"=\".");
+            defaultFrame = popRecoveryOwner();
         }
         var parameter = new Parameter(named.name(), named.type(), defaultValue, false,
                 range(start, extentEnd()));
@@ -2509,7 +2431,7 @@ public final class GdScriptParser {
     /// A parsed parameter plus the owner frame of its default value (null when no `=` was
     /// written); see {@link #parseParameter} for the delayed-binding contract.
     private record ParsedParameter(@NotNull Parameter parameter,
-                                   @Nullable RecoveryOwnerFrame defaultFrame) {
+                                   @Nullable RecoveryTransactionTracker.ProvisionalFrame defaultFrame) {
     }
 
     /// Port of `GDScriptParser::parse_signal`, including the purely syntactic duplicate-name and
@@ -2586,14 +2508,14 @@ public final class GdScriptParser {
                 var memberEnd = previous.endByte();
 
                 Expression value = null;
-                RecoveryOwnerFrame valueFrame = null;
+                RecoveryTransactionTracker.ProvisionalFrame valueFrame = null;
                 if (match(GdTokenType.EQUAL)) {
                     var valueStart = current.startByte();
                     pushRecoveryOwner("enum.value");
                     var valueOutcome = parseExpression(false);
-                    valueFrame = popRecoveryOwner();
                     value = absorbSlot(valueOutcome, valueStart, "enum.value",
                             "Expected expression value after \"=\".");
+                    valueFrame = popRecoveryOwner();
                     // The member range extends over the value slot, including a marker's end.
                     memberEnd = extentEnd();
                 }
@@ -2700,6 +2622,9 @@ public final class GdScriptParser {
                 if (declaredNames.contains(parameter.name())) {
                     pushError("Parameter with name \"%s\" was already declared for this function."
                             .formatted(parameter.name()));
+                    if (parsed.defaultFrame() != null) {
+                        recoveryTracker.abandon(parsed.defaultFrame());
+                    }
                     // A dropped duplicate never gets its frame bound; its closer diagnostics keep
                     // code and range and stay consumable via range correlation.
                 } else if (isRest) {
@@ -3079,7 +3004,14 @@ public final class GdScriptParser {
             }
             default -> {
                 if (grouped instanceof ParseOutcome.Missing<Expression>) {
-                    pushError("Expected grouping expression.", DiagnosticCodes.SLOT_GROUPING);
+                    panicMode = true;
+                    recoveryTracker.emitError(
+                            "Expected grouping expression.",
+                            tokenRange(previous),
+                            DiagnosticCodes.SLOT_GROUPING,
+                            RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                            null
+                    );
                 }
                 return ParseOutcome.damaged(slotMarker(grouped, innerStart, "grouping"));
             }
@@ -3201,7 +3133,11 @@ public final class GdScriptParser {
                 // the entry even though the unwrapped key node starts inside it, and a zero-width
                 // marker side anchors at its failure point (envelope-safe by construction).
                 var entryStart = Math.min(keyExtentStart, key.range().startByte());
-                entries.add(new DictEntry(normalizedKey, value, range(entryStart, extentEnd())));
+                entries.add(new DictEntry(
+                        normalizedKey,
+                        Objects.requireNonNull(value, "dictionary literal entry value must not be null"),
+                        range(entryStart, extentEnd())
+                ));
             } while (match(GdTokenType.COMMA) && !isAtEnd());
         }
         popMultiline();

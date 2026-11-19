@@ -90,6 +90,8 @@ public final class ASTWalker {
             case TypeRef typeRef -> handler.handleTypeRef(typeRef);
             case TypeTestExpression typeTestExpression -> handler.handleTypeTestExpression(typeTestExpression);
             case UnaryExpression unaryExpression -> handler.handleUnaryExpression(unaryExpression);
+            case RecoveredInfixExpression recoveredInfixExpression ->
+                    handler.handleRecoveredInfixExpression(recoveredInfixExpression);
             case ErrorExpression errorExpression -> handler.handleErrorExpression(errorExpression);
             case UnknownExpression unknownExpression -> handler.handleUnknownExpression(unknownExpression);
             case AttributeCallStep attributeCallStep -> handler.handleAttributeCallStep(attributeCallStep);

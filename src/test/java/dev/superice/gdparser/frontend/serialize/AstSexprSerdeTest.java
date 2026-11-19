@@ -23,11 +23,14 @@ import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
 import dev.superice.gdparser.frontend.ast.IdentifierExpression;
 import dev.superice.gdparser.frontend.ast.LambdaExpression;
 import dev.superice.gdparser.frontend.ast.LiteralExpression;
+import dev.superice.gdparser.frontend.ast.MatchSection;
+import dev.superice.gdparser.frontend.ast.MatchStatement;
 import dev.superice.gdparser.frontend.ast.MissingAttributeStep;
 import dev.superice.gdparser.frontend.ast.Parameter;
 import dev.superice.gdparser.frontend.ast.PassStatement;
 import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.RecoveredInfixExpression;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
 import dev.superice.gdparser.frontend.ast.SourceFile;
 import dev.superice.gdparser.frontend.ast.Statement;
@@ -85,7 +88,7 @@ class AstSexprSerdeTest {
                 
                 func _ready(delta: float) -> void:
                     var values = [1, 2, 3]
-                    var data = {"x": delta, ..}
+                    var data = {"x": delta}
                     if delta > 0:
                         print(values[0])
                     else:
@@ -219,6 +222,127 @@ class AstSexprSerdeTest {
 
         assertThrows(IllegalArgumentException.class, () -> deserializer.deserialize(invalidInt));
         assertThrows(IllegalArgumentException.class, () -> deserializer.deserialize(invalidList));
+    }
+
+    @Test
+    void shouldRoundTripKeyOnlyDictEntryAndRecoveredInfixExpressionInBothFormats() {
+        var tiny = span(1, 2);
+        var keyOnlyDict = new DictionaryExpression(
+                List.of(new DictEntry(new LiteralExpression("string", "\"name\"", tiny), null, tiny)),
+                false,
+                tiny
+        );
+        var matchPatternStmt = new MatchStatement(
+                new IdentifierExpression("d", tiny),
+                List.of(new MatchSection(
+                        List.of(keyOnlyDict),
+                        null,
+                        new Block(List.of(new PassStatement(tiny)), tiny),
+                        tiny
+                )),
+                tiny
+        );
+        var recoveredInfix = new RecoveredInfixExpression(
+                new IdentifierExpression("x", tiny),
+                "as",
+                new ErrorExpression(CstIssueKind.MISSING, "cast.type", "", tiny),
+                tiny
+        );
+        var ast = new SourceFile(
+                List.of(
+                        matchPatternStmt,
+                        new VariableDeclaration(
+                                DeclarationKind.VAR,
+                                "casted",
+                                null,
+                                recoveredInfix,
+                                false,
+                                "variable_statement",
+                                tiny
+                        )
+                ),
+                span(0, 10)
+        );
+
+        var compact = serializer.serialize(ast);
+        var pretty = serializer.serializePretty(ast);
+
+        assertTrue(compact.contains("(match-statement "));
+        assertTrue(compact.contains("(dict-entry (key (literal-expression (kind \"string\") (sourceText \"\\\"name\\\"\")"));
+        assertTrue(compact.contains("(value nil)"));
+        assertTrue(pretty.contains("(value nil)"));
+        assertTrue(compact.contains("(recovered-infix-expression "));
+        assertTrue(pretty.contains("(recovered-infix-expression\n"));
+
+        assertEquals(ast, deserializer.deserialize(compact));
+        assertEquals(ast, deserializer.deserialize(pretty));
+        assertEquals(compact, serializer.serialize(deserializer.deserialize(pretty)));
+    }
+
+    @Test
+    void shouldRejectMissingDictEntryValueAndMalformedRecoveredInfixExpression() {
+        var tiny = span(0, 1);
+        var validDictAst = new SourceFile(
+                List.of(new ExpressionStatement(
+                        new DictionaryExpression(
+                                List.of(new DictEntry(new IdentifierExpression("k", tiny), null, tiny)),
+                                false,
+                                tiny
+                        ),
+                        tiny
+                )),
+                tiny
+        );
+        var validDictSexp = serializer.serialize(validDictAst);
+        var missingDictEntryValue = validDictSexp.replace(" (value nil)", "");
+        assertNotEquals(validDictSexp, missingDictEntryValue);
+        var missingValueEx = assertThrows(IllegalArgumentException.class,
+                () -> deserializer.deserialize(missingDictEntryValue));
+        assertTrue(missingValueEx.getMessage().contains("Missing field 'value'"),
+                () -> "Unexpected error message: " + missingValueEx.getMessage());
+
+        var validRecoveredAst = new SourceFile(
+                List.of(new ExpressionStatement(
+                        new RecoveredInfixExpression(
+                                new IdentifierExpression("x", tiny),
+                                "as",
+                                new ErrorExpression(CstIssueKind.MISSING, "cast.type", "", tiny),
+                                tiny
+                        ),
+                        tiny
+                )),
+                tiny
+        );
+        var validRecoveredSexp = serializer.serialize(validRecoveredAst);
+        var problemFragment = " (problem (error-expression (kind MISSING) (nodeType \"cast.type\") (sourceText \"\") (range (range (startByte 0) (endByte 1) (startPoint (point (row 0) (column 0))) (endPoint (point (row 0) (column 1)))))))";
+        assertTrue(validRecoveredSexp.contains(problemFragment));
+
+        var missingProblem = validRecoveredSexp.replace(problemFragment, "");
+        var missingProblemEx = assertThrows(IllegalArgumentException.class,
+                () -> deserializer.deserialize(missingProblem));
+        assertTrue(missingProblemEx.getMessage().contains("Missing field 'problem'"),
+                () -> "Unexpected error message: " + missingProblemEx.getMessage());
+
+        var wrongProblemType = validRecoveredSexp.replace(
+                problemFragment,
+                " (problem (identifier-expression (name \"y\") (range (range (startByte 0) (endByte 1) (startPoint (point (row 0) (column 0))) (endPoint (point (row 0) (column 1)))))))"
+        );
+        var wrongTypeEx = assertThrows(IllegalArgumentException.class,
+                () -> deserializer.deserialize(wrongProblemType));
+        assertTrue(wrongTypeEx.getMessage().contains("is not assignable to expected type"),
+                () -> "Unexpected error message: " + wrongTypeEx.getMessage());
+
+        var duplicateField = validRecoveredSexp.replace("(operator \"as\")", "(operator \"as\") (operator \"is\")");
+        var duplicateEx = assertThrows(IllegalArgumentException.class,
+                () -> deserializer.deserialize(duplicateField));
+        assertTrue(duplicateEx.getMessage().contains("Duplicate field 'operator'"),
+                () -> "Unexpected error message: " + duplicateEx.getMessage());
+
+        var unknownField = validRecoveredSexp.replace("(operator \"as\")", "(operator \"as\") (extra \"bad\")");
+        var unknownEx = assertThrows(IllegalArgumentException.class,
+                () -> deserializer.deserialize(unknownField));
+        assertTrue(unknownEx.getMessage().contains("Unknown field 'extra'"),
+                () -> "Unexpected error message: " + unknownEx.getMessage());
     }
 
     @TestFactory
