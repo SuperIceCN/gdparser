@@ -50,13 +50,14 @@ public final class GdScriptParserFacade {
         return CompletionContextAnalyzer.analyze(source, parse(source).ast(), byteOffset);
     }
 
-    /// Raw token stream from `GdTokenizer.scan()` up to and including the EOF token.
+    /// Standalone token stream from `GdTokenizer.scan()` up to and including the EOF token.
     ///
-    /// Unlike `parse`, no parser drives the tokenizer here, so multiline mode is never pushed:
-    /// NEWLINE/INDENT/DEDENT tokens appear inside groupings, and indentation lines that are
-    /// legal for the parser may surface context-dependent ERROR tokens (e.g. an unindent
-    /// mismatch inside brackets). Consequently a non-empty ERROR count in this stream is NOT a
-    /// validity criterion for the source — judge legality via `parse` diagnostics instead.
+    /// Standalone tokenization suppresses `NEWLINE`, `INDENT`, and `DEDENT` layout tokens
+    /// as well as indentation checks inside unclosed `(`, `[`, and `{` brackets via the
+    /// tokenizer's bracket stack, and emits lexical bracket-mismatch `ERROR` tokens on
+    /// invalid closers. Because standalone tokenization does not perform syntactic parsing,
+    /// it does not recognize parenthesized multiline lambda suites — judge syntactic legality
+    /// via `parse` instead.
     public @NotNull List<GdToken> tokenize(@NotNull String source) {
         Objects.requireNonNull(source, "source must not be null");
         var tokenizer = new GdTokenizer(source);

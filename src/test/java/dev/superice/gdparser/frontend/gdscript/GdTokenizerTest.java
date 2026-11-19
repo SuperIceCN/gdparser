@@ -20,12 +20,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
-/// Behavior tests for `GdTokenizer`, anchored to Godot's tokenizer semantics.
-///
-/// Most single-token sources end without a trailing newline, so Godot's EOF hook
-/// synthesizes a final `NEWLINE`; expected sequences therefore read
-/// `[<tokens>, NEWLINE, EOF]`. Multibyte/newline/indent edge cases assert byte offsets
-/// (the `Range` truth source) and Godot's 1-based diagnostic coordinates separately.
+/// Behavior tests for `GdTokenizer` covering token dispatch, physical 1-based line/column
+/// coordinates, UTF-8 byte offsets, standalone vs managed layout suppression, and bracket closer
+/// error handling. Most non-empty lines without a trailing newline emit a zero-width EOF
+/// `NEWLINE` anchored at physical EOF unless multiline mode suppresses it.
 class GdTokenizerTest {
 
     private static final Path FIXTURE_DIR = Path.of("src", "test", "resources", "gdscript");
@@ -45,6 +43,19 @@ class GdTokenizerTest {
             }
         }
         return fail("tokenizer did not reach EOF within 100k scans");
+    }
+
+    private static List<GdToken> tokenizeManaged(String source) {
+        var tokenizer = GdTokenizer.managed(source);
+        var tokens = new ArrayList<GdToken>();
+        for (var i = 0; i < 100_000; i++) {
+            var token = tokenizer.scan();
+            tokens.add(token);
+            if (token.type() == GdTokenType.EOF) {
+                return List.copyOf(tokens);
+            }
+        }
+        return fail("managed tokenizer did not reach EOF within 100k scans");
     }
 
     private static List<GdTokenType> typesOf(List<GdToken> tokens) {
@@ -237,10 +248,24 @@ class GdTokenizerTest {
     void tripleQuotedStringsSpanLinesWithoutNewlineTokens() {
         var tokens = tokenize("\"\"\"a\nb\"\"\"");
         assertEquals(List.of(GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
-        assertEquals("\"\"\"a\nb\"\"\"", tokens.getFirst().source());
-        // The internal newline bumps to line 2, and Godot's EOF hook (fired when the
-        // closing quote is consumed) bumps once more, so EOF lands on line 3.
-        assertEquals(3, tokens.getLast().startLine());
+        var literal = tokens.getFirst();
+        assertEquals("\"\"\"a\nb\"\"\"", literal.source());
+        assertEquals(1, literal.startLine());
+        assertEquals(1, literal.startColumn());
+        assertEquals(2, literal.endLine());
+        assertEquals(5, literal.endColumn());
+
+        var newline = tokens.get(1);
+        assertEquals(2, newline.startLine());
+        assertEquals(5, newline.startColumn());
+        assertEquals(2, newline.endLine());
+        assertEquals(5, newline.endColumn());
+
+        var eof = tokens.getLast();
+        assertEquals(2, eof.startLine());
+        assertEquals(5, eof.startColumn());
+        assertEquals(2, eof.endLine());
+        assertEquals(5, eof.endColumn());
 
         assertTypes("\"\"\"\"\"\"", GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF);
         assertTypes("\"\"", GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF);
@@ -304,14 +329,14 @@ class GdTokenizerTest {
                 Map.entry("..", GdTokenType.PERIOD_PERIOD), Map.entry("...", GdTokenType.PERIOD_PERIOD_PERIOD),
                 Map.entry(":", GdTokenType.COLON), Map.entry("$", GdTokenType.DOLLAR),
                 Map.entry("->", GdTokenType.FORWARD_ARROW), Map.entry("_", GdTokenType.UNDERSCORE),
-                Map.entry("?", GdTokenType.QUESTION_MARK), Map.entry("`", GdTokenType.BACKTICK),
-                // Unmatched closers are ERROR tokens (covered by the bracket tests below);
-                // matched brackets are covered by matchedBracketsProduceTokens.
-                Map.entry("[", GdTokenType.BRACKET_OPEN), Map.entry("{", GdTokenType.BRACE_OPEN),
-                Map.entry("(", GdTokenType.PARENTHESIS_OPEN));
+                Map.entry("?", GdTokenType.QUESTION_MARK), Map.entry("`", GdTokenType.BACKTICK));
         for (var entry : operators.entrySet()) {
             assertTypes(entry.getKey(), entry.getValue(), GdTokenType.NEWLINE, GdTokenType.EOF);
         }
+        // Standalone openers keep parenStack non-empty, which suppresses the trailing EOF NEWLINE.
+        assertTypes("[", GdTokenType.BRACKET_OPEN, GdTokenType.EOF);
+        assertTypes("{", GdTokenType.BRACE_OPEN, GdTokenType.EOF);
+        assertTypes("(", GdTokenType.PARENTHESIS_OPEN, GdTokenType.EOF);
     }
 
     @Test
@@ -336,14 +361,87 @@ class GdTokenizerTest {
     @Test
     void closingBracketsMustMatchOpeners() {
         assertSingleError(")", "Closing \")\" doesn't have an opening counterpart.");
+        assertSingleError("]", "Closing \"]\" doesn't have an opening counterpart.");
+        assertSingleError("}", "Closing \"}\" doesn't have an opening counterpart.");
 
-        var tokens = tokenize("([)]");
+        // Non-ancestor mismatch `[)`: pops `[` and reports it; layout resumes on following lines.
+        var nonAncestor = tokenize("[)");
+        assertEquals(List.of(GdTokenType.BRACKET_OPEN, GdTokenType.ERROR,
+                GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(nonAncestor));
+        assertEquals("Closing \")\" doesn't match the opening \"[\".", nonAncestor.get(1).errorMessage());
+
+        var resumedLayout = tokenize("var x = [1)\nvar y = 1\n");
+        assertEquals(List.of("Closing \")\" doesn't match the opening \"[\"."),
+                errorsOf(resumedLayout).stream().map(GdToken::errorMessage).toList());
+        assertEquals(List.of(
+                GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL,
+                GdTokenType.BRACKET_OPEN, GdTokenType.LITERAL, GdTokenType.ERROR, GdTokenType.NEWLINE,
+                GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL, GdTokenType.LITERAL, GdTokenType.NEWLINE,
+                GdTokenType.EOF), typesOf(resumedLayout));
+
+        // Non-ancestor mismatch `((]`: pops only the inner `(`, keeping outer `(` multiline active.
+        var nestedNonAncestor = tokenize("((]");
+        assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.PARENTHESIS_OPEN, GdTokenType.ERROR,
+                GdTokenType.EOF), typesOf(nestedNonAncestor));
+        assertEquals("Closing \"]\" doesn't match the opening \"(\".", nestedNonAncestor.get(2).errorMessage());
+
+        var keepsOuterMultiline = tokenize("((]\n1)");
+        assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.PARENTHESIS_OPEN, GdTokenType.ERROR,
+                GdTokenType.LITERAL, GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
+                typesOf(keepsOuterMultiline));
+        assertEquals("Closing \"]\" doesn't match the opening \"(\".", keepsOuterMultiline.get(2).errorMessage());
+
+        // Ancestor mismatch `([)]`: `)` names the skipped `[` and unwinds back through matching `(`.
+        var ancestor = tokenize("([)]");
         assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN,
-                GdTokenType.ERROR, GdTokenType.ERROR, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
-        // Godot's pop_paren removes the mismatched opener before make_paren_error reports,
-        // so the message names the next opener on the stack ("(" here).
-        assertEquals("Closing \")\" doesn't match the opening \"(\".", tokens.get(2).errorMessage());
-        assertEquals("Closing \"]\" doesn't have an opening counterpart.", tokens.get(3).errorMessage());
+                GdTokenType.ERROR, GdTokenType.ERROR, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(ancestor));
+        assertEquals("Closing \")\" skips unclosed \"[\".", ancestor.get(2).errorMessage());
+        assertEquals("Closing \"]\" doesn't have an opening counterpart.", ancestor.get(3).errorMessage());
+
+        // Multi-opener ancestor mismatch `([{)`: `)` names every skipped opener in opening order.
+        var multiSkipped = tokenize("([{)");
+        assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN,
+                GdTokenType.BRACE_OPEN, GdTokenType.ERROR, GdTokenType.NEWLINE, GdTokenType.EOF),
+                typesOf(multiSkipped));
+        assertEquals("Closing \")\" skips unclosed \"[\", \"{\".", multiSkipped.get(3).errorMessage());
+
+        // Deep non-ancestor mismatch `([}])`: `}` pops `[`, leaving `(` for `]`, leaving empty for `)`.
+        var deep = tokenize("([}])");
+        assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN, GdTokenType.ERROR,
+                GdTokenType.ERROR, GdTokenType.ERROR, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(deep));
+        assertEquals("Closing \"}\" doesn't match the opening \"[\".", deep.get(2).errorMessage());
+        assertEquals("Closing \"]\" doesn't match the opening \"(\".", deep.get(3).errorMessage());
+        assertEquals("Closing \")\" doesn't have an opening counterpart.", deep.get(4).errorMessage());
+    }
+
+    @Test
+    void managedTokenizerAlwaysEmitsRealCloserTokensWithoutLexicalCloserErrors() {
+        var orphan = tokenizeManaged(")");
+        assertEquals(List.of(GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
+                typesOf(orphan));
+        assertTrue(errorsOf(orphan).isEmpty());
+
+        var nonAncestor = tokenizeManaged("[)");
+        assertEquals(List.of(GdTokenType.BRACKET_OPEN, GdTokenType.PARENTHESIS_CLOSE,
+                GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(nonAncestor));
+        assertTrue(errorsOf(nonAncestor).isEmpty());
+
+        var ancestor = tokenizeManaged("([)]");
+        assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN,
+                GdTokenType.PARENTHESIS_CLOSE, GdTokenType.BRACKET_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
+                typesOf(ancestor));
+        assertTrue(errorsOf(ancestor).isEmpty());
+
+        var deep = tokenizeManaged("([}])");
+        assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN, GdTokenType.BRACE_CLOSE,
+                GdTokenType.BRACKET_CLOSE, GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
+                typesOf(deep));
+        assertTrue(errorsOf(deep).isEmpty());
+
+        var multiSkipped = tokenizeManaged("([{)");
+        assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN, GdTokenType.BRACE_OPEN,
+                GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(multiSkipped));
+        assertTrue(errorsOf(multiSkipped).isEmpty());
     }
 
     @Test
@@ -434,10 +532,18 @@ class GdTokenizerTest {
     }
 
     @Test
-    void newlineOnlyFileStillGetsEofSynthesizedNewline() {
-        // Mid-file empty lines never emit NEWLINE, but consuming the final '\n' triggers
-        // Godot's EOF hook, which synthesizes one pending NEWLINE regardless.
-        assertTypes("\n\n", GdTokenType.NEWLINE, GdTokenType.EOF);
+    void newlineAndWhitespaceOnlyFilesProduceOnlyEof() {
+        assertTypes("", GdTokenType.EOF);
+        assertTypes("\n", GdTokenType.EOF);
+        assertTypes("\n\n", GdTokenType.EOF);
+        assertTypes("\r\n", GdTokenType.EOF);
+        assertTypes("   \t  ", GdTokenType.EOF);
+
+        var eof = tokenize("\n\n").getFirst();
+        assertEquals(2, eof.startByte());
+        assertEquals(2, eof.endByte());
+        assertEquals(3, eof.startLine());
+        assertEquals(1, eof.startColumn());
     }
 
     // --- Comments (trivia) ------------------------------------------------------------------
@@ -509,9 +615,10 @@ class GdTokenizerTest {
     @Test
     void regionStyleCommentsArePlainTriviaAtTokenizerLevel() {
         var tokenizer = new GdTokenizer("#region foo\n# x\n#endregion");
-        // Consuming the final comment character triggers the EOF hook, hence the NEWLINE.
-        assertEquals(GdTokenType.NEWLINE, tokenizer.scan().type());
-        assertEquals(GdTokenType.EOF, tokenizer.scan().type());
+        var eof = tokenizer.scan();
+        assertEquals(GdTokenType.EOF, eof.type());
+        assertEquals(3, eof.startLine());
+        assertEquals(11, eof.startColumn());
         var texts = tokenizer.getComments().stream().map(GdComment::text).toList();
         assertEquals(List.of("#region foo", "# x", "#endregion"), texts);
     }
@@ -535,16 +642,15 @@ class GdTokenizerTest {
         }
         assertEquals(List.of(GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL,
                 GdTokenType.LITERAL, GdTokenType.PLUS, GdTokenType.LITERAL,
-                GdTokenType.EOF), types);
-        // Godot quirk (kept): `line_continuation` is still set when consuming the last
-        // character, so the EOF hook does not synthesize a final NEWLINE here.
+                GdTokenType.NEWLINE, GdTokenType.EOF), types);
         assertEquals(2, secondLiteralLine);
         assertEquals(List.of(2), tokenizer.getContinuationLines());
+        assertTypes("\\\n", GdTokenType.EOF);
     }
 
     @Test
     void continuationSkipsCommentLines() {
-        // Godot GH-89403: whitespace and comment lines after `\` are skipped.
+        // Whitespace and comment lines after `\` are skipped without emitting NEWLINE.
         var tokenizer = new GdTokenizer("a = 1 +\\\n# c\n 2");
         var types = new ArrayList<GdTokenType>();
         for (var i = 0; i < 10_000; i++) {
@@ -555,7 +661,7 @@ class GdTokenizerTest {
             }
         }
         assertEquals(List.of(GdTokenType.IDENTIFIER, GdTokenType.EQUAL, GdTokenType.LITERAL,
-                GdTokenType.PLUS, GdTokenType.LITERAL, GdTokenType.EOF), types);
+                GdTokenType.PLUS, GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF), types);
         assertEquals(List.of(3), tokenizer.getContinuationLines());
         assertEquals("# c", tokenizer.getComments().getFirst().text());
         assertTrue(tokenizer.getComments().getFirst().wholeLine());
@@ -580,39 +686,90 @@ class GdTokenizerTest {
         assertEquals("Expected new line after \"\\\".", errorsOf(tokens).getFirst().errorMessage());
     }
 
+    private static void assertSpan(GdToken token, int startByte, int endByte,
+                                   int startLine, int startColumn, int endLine, int endColumn) {
+        assertEquals(startByte, token.startByte(), () -> "startByte of " + token);
+        assertEquals(endByte, token.endByte(), () -> "endByte of " + token);
+        assertEquals(startLine, token.startLine(), () -> "startLine of " + token);
+        assertEquals(startColumn, token.startColumn(), () -> "startColumn of " + token);
+        assertEquals(endLine, token.endLine(), () -> "endLine of " + token);
+        assertEquals(endColumn, token.endColumn(), () -> "endColumn of " + token);
+    }
+
     // --- Multiline mode -----------------------------------------------------------------------
 
     @Test
     void multilineModeSuppressesNewlinesAndIndentation() {
-        // Raw stream (no parser multiline intervention) treats the line break inside
-        // brackets as a real newline plus indent — this is why `tokenize` output must not
-        // be used as a legality criterion for bracketed constructs.
+        // Standalone mode suppresses NEWLINE/INDENT/DEDENT while parenStack is non-empty and
+        // resumes normal layout tracking once brackets close.
         assertTypes("(1 +\n 2)",
                 GdTokenType.PARENTHESIS_OPEN, GdTokenType.LITERAL, GdTokenType.PLUS,
-                GdTokenType.NEWLINE, GdTokenType.INDENT, GdTokenType.LITERAL,
-                GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.DEDENT,
+                GdTokenType.LITERAL, GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE,
                 GdTokenType.EOF);
 
-        // With multiline mode enabled after the open paren (as the parser would), the
-        // newline and indentation disappear from the stream.
-        var tokenizer = new GdTokenizer("(1 +\n 2)");
+        var bracketed = tokenize("var xs = [\n\t\t1,\n\t2\n]\nvar ys = {\n  \"a\":\n\t1\n}\n");
+        assertTrue(errorsOf(bracketed).isEmpty());
+        assertFalse(typesOf(bracketed).contains(GdTokenType.INDENT));
+        assertFalse(typesOf(bracketed).contains(GdTokenType.DEDENT));
+
+        var resumed = tokenize("if a:\n\tvar xs = [\n\t\t1\n\t]\n\treturn xs\n");
+        assertTrue(errorsOf(resumed).isEmpty());
+        assertEquals(1, resumed.stream().filter(t -> t.type() == GdTokenType.INDENT).count());
+        assertEquals(1, resumed.stream().filter(t -> t.type() == GdTokenType.DEDENT).count());
+
+        // Misaligned dedent outside brackets still reports an indentation error.
+        var badAfterBracket = tokenize("var xs = [\n\t1\n]\nif a:\n    pass\n  pass\n");
+        assertEquals(List.of("Unindent doesn't match the previous indentation level."),
+                errorsOf(badAfterBracket).stream().map(GdToken::errorMessage).toList());
+    }
+
+    @Test
+    void managedExplicitMultilineModeOverridesParenStackForLambdaSuites() {
+        // Simulates parser-driven multiline control around `foo(func():\n\tvar a = 1\n\treturn a\n)`.
+        var source = "foo(func():\n\tvar a = 1\n\treturn a\n)";
+        var tokenizer = GdTokenizer.managed(source);
         var types = new ArrayList<GdTokenType>();
+        var inCallArgs = false;
+        var inLambdaSignature = false;
+        var inLambdaBody = false;
         for (var i = 0; i < 10_000; i++) {
             var token = tokenizer.scan();
             types.add(token.type());
             if (token.type() == GdTokenType.PARENTHESIS_OPEN) {
-                tokenizer.setMultilineMode(true);
-            }
-            if (token.type() == GdTokenType.PARENTHESIS_CLOSE) {
+                if (!inCallArgs) {
+                    inCallArgs = true;
+                    tokenizer.setMultilineMode(true);
+                } else {
+                    inLambdaSignature = true;
+                    tokenizer.setMultilineMode(true);
+                }
+            } else if (token.type() == GdTokenType.FUNC) {
+                inLambdaBody = true;
                 tokenizer.setMultilineMode(false);
+            } else if (token.type() == GdTokenType.PARENTHESIS_CLOSE) {
+                if (inLambdaSignature) {
+                    inLambdaSignature = false;
+                    tokenizer.setMultilineMode(false);
+                } else if (inLambdaBody) {
+                    inLambdaBody = false;
+                    tokenizer.setMultilineMode(false);
+                }
             }
             if (token.type() == GdTokenType.EOF) {
                 break;
             }
         }
-        assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.LITERAL, GdTokenType.PLUS,
-                GdTokenType.LITERAL, GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE,
-                GdTokenType.EOF), types);
+        assertTrue(types.contains(GdTokenType.INDENT), () -> "expected INDENT inside lambda body: " + types);
+        assertTrue(types.contains(GdTokenType.DEDENT), () -> "expected DEDENT after lambda body: " + types);
+        assertEquals(List.of(
+                GdTokenType.IDENTIFIER, GdTokenType.PARENTHESIS_OPEN,
+                GdTokenType.FUNC, GdTokenType.PARENTHESIS_OPEN, GdTokenType.PARENTHESIS_CLOSE,
+                GdTokenType.COLON, GdTokenType.NEWLINE,
+                GdTokenType.INDENT,
+                GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL, GdTokenType.LITERAL, GdTokenType.NEWLINE,
+                GdTokenType.RETURN, GdTokenType.IDENTIFIER, GdTokenType.NEWLINE,
+                GdTokenType.DEDENT,
+                GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF), types);
     }
 
     // --- CRLF and stray carriage returns --------------------------------------------------------
@@ -626,9 +783,20 @@ class GdTokenizerTest {
                 typesOf(tokens));
         assertTrue(errorsOf(tokens).isEmpty());
         // The NEWLINE token covers only the '\n' byte; '\r' stays on the previous row.
-        var newline = tokens.stream().filter(t -> t.type() == GdTokenType.NEWLINE).findFirst().orElseThrow();
-        assertEquals(10, newline.startByte());
-        assertEquals(11, newline.endByte());
+        assertSpan(tokens.get(4), 10, 11, 1, 11, 2, 1);
+        assertSpan(tokens.get(5), 11, 14, 2, 1, 2, 4);
+        assertSpan(tokens.get(9), 21, 22, 2, 11, 3, 1);
+        assertSpan(tokens.getLast(), 22, 22, 3, 1, 3, 1);
+    }
+
+    @Test
+    void escapedCrlfInsideStringAdvancesLineOnce() {
+        var tokens = tokenize("\"a\\\r\nb\"");
+        assertEquals(List.of(GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
+        assertTrue(errorsOf(tokens).isEmpty());
+        assertSpan(tokens.get(0), 0, 7, 1, 1, 2, 3);
+        assertSpan(tokens.get(1), 7, 7, 2, 3, 2, 3);
+        assertSpan(tokens.get(2), 7, 7, 2, 3, 2, 3);
     }
 
     @Test
@@ -638,9 +806,19 @@ class GdTokenizerTest {
                 GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
         var error = errorsOf(tokens).getFirst();
         assertEquals("Stray carriage return character in source code.", error.errorMessage());
-        // Whitespace-phase errors are anchored to the offending character.
-        assertEquals(1, error.startByte());
-        assertEquals(2, error.endByte());
+        assertSpan(error, 1, 2, 1, 2, 1, 3);
+        assertSpan(tokens.get(2), 2, 3, 1, 3, 1, 4);
+
+        var bolStray = tokenize("\ra");
+        assertEquals(List.of(GdTokenType.ERROR, GdTokenType.IDENTIFIER, GdTokenType.NEWLINE, GdTokenType.EOF),
+                typesOf(bolStray));
+        assertSpan(bolStray.get(0), 0, 1, 1, 1, 1, 2);
+        assertSpan(bolStray.get(1), 1, 2, 1, 2, 1, 3);
+
+        var indentedStray = tokenize("  \ra");
+        assertEquals(List.of(GdTokenType.ERROR, GdTokenType.INDENT, GdTokenType.IDENTIFIER,
+                GdTokenType.NEWLINE, GdTokenType.DEDENT, GdTokenType.EOF), typesOf(indentedStray));
+        assertSpan(indentedStray.get(0), 2, 3, 1, 3, 1, 4);
     }
 
     // --- EOF coordinate anchoring -----------------------------------------------------------------
@@ -649,53 +827,45 @@ class GdTokenizerTest {
     void eofSynthesizedNewlineAnchorsToPhysicalEofWithoutTrailingNewline() {
         var tokens = tokenize("pass");
         assertEquals(List.of(GdTokenType.PASS, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
-
-        // The synthesized NEWLINE is zero-width at the physical EOF byte offset, while its
-        // Godot coordinates (kept for diagnostic parity) cover the last consumed column.
-        var newline = tokens.get(1);
-        assertEquals(4, newline.startByte());
-        assertEquals(4, newline.endByte());
-        assertEquals(1, newline.startLine());
-        assertEquals(4, newline.startColumn());
-        assertEquals(5, newline.endColumn());
-
-        var eof = tokens.get(2);
-        assertEquals(4, eof.startByte());
-        assertEquals(4, eof.endByte());
-        assertEquals(2, eof.startLine());
+        assertSpan(tokens.get(0), 0, 4, 1, 1, 1, 5);
+        assertSpan(tokens.get(1), 4, 4, 1, 5, 1, 5);
+        assertSpan(tokens.get(2), 4, 4, 1, 5, 1, 5);
     }
 
     @Test
-    void trailingNewlineBumpsLineCounterTwiceAtEof() {
-        // Godot quirk, kept for coordinate fidelity: the EOF hook inside advance() and the
-        // explicit newline() call both increment the line counter for a trailing newline,
-        // so EOF lands on a non-physical row. Byte offsets stay anchored to physical EOF.
+    void trailingNewlineAdvancesLineOnceAtEof() {
         var tokens = tokenize("pass\n");
-        var newline = tokens.get(1);
-        assertEquals(4, newline.startByte());
-        assertEquals(5, newline.endByte());
-        assertEquals(1, newline.startLine());
-
-        var eof = tokens.get(2);
-        assertEquals(5, eof.startByte());
-        assertEquals(5, eof.endByte());
-        assertEquals(3, eof.startLine());
-        assertEquals(1, eof.startColumn());
+        assertEquals(List.of(GdTokenType.PASS, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
+        assertSpan(tokens.get(0), 0, 4, 1, 1, 1, 5);
+        assertSpan(tokens.get(1), 4, 5, 1, 5, 2, 1);
+        assertSpan(tokens.get(2), 5, 5, 2, 1, 2, 1);
     }
 
     @Test
     void pendingDedentsFlushBeforeEofAndAnchorToPhysicalEof() {
-        var tokens = tokenize("if a:\n\tpass");
+        var noNewline = tokenize("if a:\n\tpass");
         assertEquals(List.of(GdTokenType.IF, GdTokenType.IDENTIFIER, GdTokenType.COLON,
                 GdTokenType.NEWLINE, GdTokenType.INDENT, GdTokenType.PASS, GdTokenType.NEWLINE,
-                GdTokenType.DEDENT, GdTokenType.EOF), typesOf(tokens));
+                GdTokenType.DEDENT, GdTokenType.EOF), typesOf(noNewline));
+        assertSpan(noNewline.get(6), 11, 11, 2, 6, 2, 6);
+        assertSpan(noNewline.get(7), 11, 11, 2, 6, 2, 6);
+        assertSpan(noNewline.get(8), 11, 11, 2, 6, 2, 6);
 
-        var dedent = tokens.get(7);
-        assertEquals(11, dedent.startByte());
-        assertEquals(11, dedent.endByte());
-        var eof = tokens.get(8);
-        assertEquals(11, eof.startByte());
-        assertEquals(11, eof.endByte());
+        var withNewline = tokenize("if a:\n\tpass\n");
+        assertEquals(List.of(GdTokenType.IF, GdTokenType.IDENTIFIER, GdTokenType.COLON,
+                GdTokenType.NEWLINE, GdTokenType.INDENT, GdTokenType.PASS, GdTokenType.NEWLINE,
+                GdTokenType.DEDENT, GdTokenType.EOF), typesOf(withNewline));
+        assertSpan(withNewline.get(6), 11, 12, 2, 6, 3, 1);
+        assertSpan(withNewline.get(7), 12, 12, 3, 1, 3, 1);
+        assertSpan(withNewline.get(8), 12, 12, 3, 1, 3, 1);
+
+        var trailingComment = tokenize("if a:\n\tpass\n\t# c");
+        assertEquals(List.of(GdTokenType.IF, GdTokenType.IDENTIFIER, GdTokenType.COLON,
+                GdTokenType.NEWLINE, GdTokenType.INDENT, GdTokenType.PASS, GdTokenType.NEWLINE,
+                GdTokenType.DEDENT, GdTokenType.EOF), typesOf(trailingComment));
+        assertSpan(trailingComment.get(6), 11, 12, 2, 6, 3, 1);
+        assertSpan(trailingComment.get(7), 16, 16, 3, 5, 3, 5);
+        assertSpan(trailingComment.get(8), 16, 16, 3, 5, 3, 5);
     }
 
     // --- Indentation state snapshots -------------------------------------------------------------
@@ -735,7 +905,6 @@ class GdTokenizerTest {
     @Test
     void poppingEmptyIndentSnapshotThrows() {
         var tokenizer = new GdTokenizer("pass");
-        // Godot silently no-ops here (ERR_FAIL_COND); this port treats it as an internal bug.
         assertThrows(IllegalStateException.class, tokenizer::popExpressionIndentedBlock);
     }
 
@@ -749,11 +918,10 @@ class GdTokenizerTest {
 
     @Test
     void manyConsecutiveContinuationsDoNotOverflowTheStack() {
-        // Godot recurses scan() per continuation; this port loops (bounded stack usage).
         var tokens = tokenize("\\\n".repeat(10_000) + "x");
         var types = typesOf(tokens);
-        assertEquals(List.of(GdTokenType.IDENTIFIER, GdTokenType.EOF),
-                types.subList(types.size() - 2, types.size()));
+        assertEquals(List.of(GdTokenType.IDENTIFIER, GdTokenType.NEWLINE, GdTokenType.EOF),
+                types.subList(types.size() - 3, types.size()));
     }
 
     @Test
@@ -778,58 +946,279 @@ class GdTokenizerTest {
         assertEquals(List.of(GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL,
                 GdTokenType.LITERAL, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
 
-        var literal = tokens.get(3);
-        assertEquals(8, literal.startByte());
-        assertEquals(utf8Length, literal.endByte());
-        assertEquals(GdLiteralKind.STRING, literal.literalKind());
-
-        // Synthesized tokens are zero-width at the physical EOF offset.
-        var newline = tokens.get(4);
-        assertEquals(utf8Length, newline.startByte());
-        assertEquals(utf8Length, newline.endByte());
-        var eof = tokens.get(5);
-        assertEquals(utf8Length, eof.startByte());
-        assertEquals(utf8Length, eof.endByte());
+        assertSpan(tokens.get(3), 8, utf8Length, 1, 9, 2, 7);
+        assertEquals(GdLiteralKind.STRING, tokens.get(3).literalKind());
+        assertSpan(tokens.get(4), utf8Length, utf8Length, 2, 7, 2, 7);
+        assertSpan(tokens.get(5), utf8Length, utf8Length, 2, 7, 2, 7);
     }
 
     @Test
     void unpairedUtf16SurrogatesCountAsOneReplacementByte() {
-        // The tree-sitter path parses the JDK UTF-8 encoding, where an unpaired surrogate
-        // becomes a single '?' byte; token byte offsets follow the same encoding.
         var tokens = tokenize("a\uD800b");
         assertEquals(List.of(GdTokenType.IDENTIFIER, GdTokenType.ERROR, GdTokenType.IDENTIFIER,
                 GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
         assertTrue(errorsOf(tokens).getFirst().errorMessage().contains("(U+D800)"));
-        var after = tokens.get(2);
-        assertEquals(2, after.startByte());
-        assertEquals(3, after.endByte());
+        assertSpan(tokens.get(1), 1, 2, 1, 2, 1, 3);
+        assertSpan(tokens.get(2), 2, 3, 1, 3, 1, 4);
     }
 
     // --- Token position conventions -----------------------------------------------------------------
 
     @Test
-    void tokenByteOffsetsAndGodotColumnsStayConsistent() {
+    void tokenByteOffsetsAndCodePointColumnsStayConsistent() {
         var tokens = tokenize("var x = 1");
-        var expectedBytes = new int[][]{{0, 3}, {4, 5}, {6, 7}, {8, 9}};
-        var expectedColumns = new int[][]{{1, 4}, {5, 6}, {7, 8}, {9, 10}};
-        for (var i = 0; i < 4; i++) {
-            var token = tokens.get(i);
-            assertEquals(expectedBytes[i][0], token.startByte(), () -> "token " + token);
-            assertEquals(expectedBytes[i][1], token.endByte(), () -> "token " + token);
-            assertEquals(expectedColumns[i][0], token.startColumn(), () -> "token " + token);
-            assertEquals(1, token.startLine());
-            if (i < 3) {
-                assertEquals(expectedColumns[i][1], token.endColumn(), () -> "token " + token);
-                assertEquals(1, token.endLine(), () -> "token " + token);
+        assertSpan(tokens.get(0), 0, 3, 1, 1, 1, 4);
+        assertSpan(tokens.get(1), 4, 5, 1, 5, 1, 6);
+        assertSpan(tokens.get(2), 6, 7, 1, 7, 1, 8);
+        assertSpan(tokens.get(3), 8, 9, 1, 9, 1, 10);
+        assertSpan(tokens.get(4), 9, 9, 1, 10, 1, 10);
+        assertSpan(tokens.get(5), 9, 9, 1, 10, 1, 10);
+    }
+
+    @Test
+    void codePointColumnsDistinguishCjkEmojiAndTabsFromUtf8Bytes() {
+        // CJK (`变量` = 2 code points, 6 UTF-8 bytes) and emoji (`😀` = 1 code point, 4 UTF-8 bytes).
+        var source = "\tvar 变量 = \"😀\"";
+        var tokens = tokenize(source);
+        assertEquals(List.of(GdTokenType.INDENT, GdTokenType.VAR, GdTokenType.IDENTIFIER,
+                GdTokenType.EQUAL, GdTokenType.LITERAL, GdTokenType.NEWLINE,
+                GdTokenType.DEDENT, GdTokenType.EOF), typesOf(tokens));
+        assertSpan(tokens.get(0), 0, 1, 1, 1, 1, 2);
+        assertSpan(tokens.get(1), 1, 4, 1, 2, 1, 5);
+        assertSpan(tokens.get(2), 5, 11, 1, 6, 1, 8);
+        assertSpan(tokens.get(3), 12, 13, 1, 9, 1, 10);
+        assertSpan(tokens.get(4), 14, 20, 1, 11, 1, 14);
+        assertSpan(tokens.get(5), 20, 20, 1, 14, 1, 14);
+        assertSpan(tokens.get(6), 20, 20, 1, 14, 1, 14);
+        assertSpan(tokens.get(7), 20, 20, 1, 14, 1, 14);
+    }
+
+    @Test
+    void longSingleLineKeepsExactPhysicalEndColumnAndEof() {
+        var ident = "a".repeat(4100);
+        var source = "var " + ident;
+        var tokens = tokenize(source);
+        assertEquals(List.of(GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.NEWLINE, GdTokenType.EOF),
+                typesOf(tokens));
+        assertSpan(tokens.get(1), 4, 4104, 1, 5, 1, 4105);
+        assertSpan(tokens.get(2), 4104, 4104, 1, 4105, 1, 4105);
+        assertSpan(tokens.get(3), 4104, 4104, 1, 4105, 1, 4105);
+    }
+
+    @Test
+    void lexicalErrorsProduceValidPhysicalCoordinatesAndByteRanges() {
+        var errorInputs = List.of(
+                "\u0001",
+                "\u2003",
+                "0x",
+                "1__2",
+                "1.2.3",
+                "12abc",
+                "\"\\q\"",
+                "\"\\uD800\"",
+                "\"abc",
+                "if a:\n    pass\n  pass\n",
+                "[)",
+                ")"
+        );
+        for (var source : errorInputs) {
+            var utf8Length = source.getBytes(StandardCharsets.UTF_8).length;
+            var errors = errorsOf(tokenize(source));
+            assertFalse(errors.isEmpty(), () -> "expected error for: " + source);
+            for (var error : errors) {
+                assertTrue(error.startByte() >= 0 && error.startByte() <= error.endByte()
+                        && error.endByte() <= utf8Length, () -> "invalid bytes for " + error);
+                assertTrue(error.startLine() >= 1 && error.startLine() <= error.endLine(),
+                        () -> "invalid lines for " + error);
+                assertTrue(error.startColumn() >= 1 && error.endColumn() >= 1,
+                        () -> "invalid columns for " + error);
+                assertTrue(error.startLine() < error.endLine() || error.startColumn() <= error.endColumn(),
+                        () -> "inverted coordinates for " + error);
             }
         }
-        // Godot quirk (kept for diagnostic parity): consuming the last character fires the
-        // EOF hook, which bumps the line counter before the token is created, so the final
-        // real token's end coordinates land on the non-physical next line. Byte offsets
-        // are unaffected and remain the Range truth source.
-        var lastLiteral = tokens.get(3);
-        assertEquals(2, lastLiteral.endLine());
-        assertEquals(1, lastLiteral.endColumn());
+    }
+
+    @Test
+    void physicalCoordinatesAlwaysMatchTokenByteRangesAcrossValidAndErrorInputs() {
+        var inputs = List.of(
+                "pass\n",
+                "pass\r\n",
+                "pass",
+                "var x = 1",
+                "\"\"\"a\nb\"\"\"",
+                "0x",
+                "0x_FF",
+                "1__2",
+                "1.2.3",
+                "1e",
+                "1e\n",
+                "\"a\\qb\"",
+                "\"\\u123g\"",
+                "\"\\u123\n\"",
+                "\"\\uD800x\"",
+                "\"\\uD800\\uD800\"",
+                "\"\\uDC00\"",
+                "\"a\u200Eb\"",
+                "var x = \"\\\n",
+                "var x = \"\\\r\n",
+                "a\rb",
+                "pass\n\r \n",
+                "if a:\n\tpass",
+                "if a:\n\tpass\n",
+                "if a:\n\t\tpass\n\tpass",
+                "func f():\n\t\tpass\n\tpass\n",
+                "if a:\n    pass\n  pass\n",
+                "if a:\n\t  pass\n",
+                "if a:\n\tpass\nif b:\n  pass\n",
+                "\tvar 变量 = \"😀\"",
+                "var " + "a".repeat(4100),
+                "([)]",
+                "((]",
+                "[)",
+                ")"
+        );
+        for (var source : inputs) {
+            assertPhysicalCoordinatesMatchBytes(source, tokenize(source));
+            assertPhysicalCoordinatesMatchBytes(source, tokenizeManaged(source));
+        }
+
+        var lfNewline = tokenize("pass\n").get(1);
+        assertEquals(GdTokenType.NEWLINE, lfNewline.type());
+        assertSpan(lfNewline, 4, 5, 1, 5, 2, 1);
+
+        var crlfNewline = tokenize("pass\r\n").get(1);
+        assertEquals(GdTokenType.NEWLINE, crlfNewline.type());
+        assertSpan(crlfNewline, 5, 6, 1, 6, 2, 1);
+    }
+
+    @Test
+    void eofContinuationAndIndentedBlocksEmitNewlineBeforeDedent() {
+        for (var source : List.of("func f():\n\tpass\\\n", "func f():\n\tpass\\\r\n")) {
+            var tokens = tokenize(source);
+            assertEquals(List.of(
+                    GdTokenType.FUNC, GdTokenType.IDENTIFIER, GdTokenType.PARENTHESIS_OPEN,
+                    GdTokenType.PARENTHESIS_CLOSE, GdTokenType.COLON, GdTokenType.NEWLINE,
+                    GdTokenType.INDENT, GdTokenType.PASS, GdTokenType.NEWLINE,
+                    GdTokenType.DEDENT, GdTokenType.EOF), typesOf(tokens), () -> "source: " + source);
+            assertTrue(errorsOf(tokens).isEmpty());
+        }
+
+        for (var source : List.of("if a:\n\tpass\n", "if a:\n\tpass", "if a:\n\tpass\n\t# comment")) {
+            var types = typesOf(tokenize(source));
+            assertEquals(List.of(
+                    GdTokenType.IF, GdTokenType.IDENTIFIER, GdTokenType.COLON, GdTokenType.NEWLINE,
+                    GdTokenType.INDENT, GdTokenType.PASS, GdTokenType.NEWLINE,
+                    GdTokenType.DEDENT, GdTokenType.EOF), types, () -> "source: " + source);
+        }
+    }
+
+    @Test
+    void unterminatedStringAfterEscapedNewlineEndsAtPhysicalLineTwoColumnOne() {
+        for (var source : List.of("var x = \"\\\n", "var x = \"\\\r\n")) {
+            var tokens = tokenize(source);
+            var utf8Length = source.getBytes(StandardCharsets.UTF_8).length;
+            assertEquals(List.of(GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL,
+                    GdTokenType.ERROR, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(tokens));
+            var error = tokens.get(3);
+            assertEquals("Unterminated string.", error.errorMessage());
+            assertSpan(error, 8, utf8Length, 1, 9, 2, 1);
+            assertSpan(tokens.getLast(), utf8Length, utf8Length, 2, 1, 2, 1);
+        }
+    }
+
+    @Test
+    void strayCarriageReturnInTrailingWhitespaceLineDoesNotCreateSpuriousEofNewline() {
+        var trailingCrLine = tokenize("pass\n\r \n");
+        assertEquals(List.of(GdTokenType.PASS, GdTokenType.NEWLINE, GdTokenType.ERROR, GdTokenType.EOF),
+                typesOf(trailingCrLine));
+        assertEquals("Stray carriage return character in source code.", trailingCrLine.get(2).errorMessage());
+
+        var inlineCrAtEof = tokenize("a\r");
+        assertEquals(List.of(GdTokenType.IDENTIFIER, GdTokenType.ERROR, GdTokenType.NEWLINE, GdTokenType.EOF),
+                typesOf(inlineCrAtEof));
+        assertEquals("Stray carriage return character in source code.", inlineCrAtEof.get(1).errorMessage());
+
+        for (var source : List.of(
+                "func f():\n\tpass\n\t\t\r",
+                "func f():\n\tpass\n\t\t\r ",
+                "func f():\n\tpass\n\t\t\r \n")) {
+            var tokens = tokenize(source);
+            assertEquals(List.of(
+                    GdTokenType.FUNC, GdTokenType.IDENTIFIER, GdTokenType.PARENTHESIS_OPEN,
+                    GdTokenType.PARENTHESIS_CLOSE, GdTokenType.COLON, GdTokenType.NEWLINE,
+                    GdTokenType.INDENT, GdTokenType.PASS, GdTokenType.NEWLINE,
+                    GdTokenType.ERROR, GdTokenType.DEDENT, GdTokenType.EOF), typesOf(tokens), () -> "source: " + source);
+            assertEquals(List.of("Stray carriage return character in source code."),
+                    errorsOf(tokens).stream().map(GdToken::errorMessage).toList());
+            assertPhysicalCoordinatesMatchBytes(source, tokens);
+        }
+
+        var leadingCrBeforeStatement = "if a:\n\tpass\n\rpass";
+        var leadingCrTokens = tokenize(leadingCrBeforeStatement);
+        assertEquals(List.of(
+                GdTokenType.IF, GdTokenType.IDENTIFIER, GdTokenType.COLON, GdTokenType.NEWLINE,
+                GdTokenType.INDENT, GdTokenType.PASS, GdTokenType.NEWLINE,
+                GdTokenType.ERROR, GdTokenType.DEDENT, GdTokenType.PASS, GdTokenType.NEWLINE,
+                GdTokenType.EOF), typesOf(leadingCrTokens));
+        assertEquals(List.of("Stray carriage return character in source code."),
+                errorsOf(leadingCrTokens).stream().map(GdToken::errorMessage).toList());
+        assertPhysicalCoordinatesMatchBytes(leadingCrBeforeStatement, leadingCrTokens);
+    }
+
+    @Test
+    void unmatchedCloserStormScalesLinearlyInStandaloneAndManagedModes() {
+        var count = 20_000;
+        var source = "[".repeat(count) + ")".repeat(count);
+
+        var standalone = tokenize(source);
+        assertEquals(count * 2 + 2, standalone.size());
+        assertEquals(GdTokenType.BRACKET_OPEN, standalone.getFirst().type());
+        assertEquals(GdTokenType.ERROR, standalone.get(count).type());
+        assertEquals("Closing \")\" doesn't match the opening \"[\".", standalone.get(count).errorMessage());
+        assertEquals(GdTokenType.NEWLINE, standalone.get(count * 2).type());
+        assertEquals(GdTokenType.EOF, standalone.getLast().type());
+
+        var managed = tokenizeManaged(source);
+        assertEquals(count * 2 + 2, managed.size());
+        assertTrue(errorsOf(managed).isEmpty());
+        assertEquals(GdTokenType.BRACKET_OPEN, managed.getFirst().type());
+        assertEquals(GdTokenType.PARENTHESIS_CLOSE, managed.get(count).type());
+        assertEquals(GdTokenType.NEWLINE, managed.get(count * 2).type());
+        assertEquals(GdTokenType.EOF, managed.getLast().type());
+    }
+
+    private static void assertPhysicalCoordinatesMatchBytes(String source, List<GdToken> tokens) {
+        var utf8Length = source.getBytes(StandardCharsets.UTF_8).length;
+        var lines = new int[utf8Length + 1];
+        var columns = new int[utf8Length + 1];
+        var line = 1;
+        var column = 1;
+        var byteOffset = 0;
+        lines[0] = line;
+        columns[0] = column;
+        for (var i = 0; i < source.length(); ) {
+            var codePoint = source.codePointAt(i);
+            i += Character.charCount(codePoint);
+            byteOffset += SourceTextIndex.utf8Length(codePoint);
+            if (codePoint == '\n') {
+                line++;
+                column = 1;
+            } else {
+                column++;
+            }
+            lines[byteOffset] = line;
+            columns[byteOffset] = column;
+        }
+        for (var token : tokens) {
+            assertTrue(token.startByte() >= 0 && token.startByte() <= token.endByte()
+                    && token.endByte() <= utf8Length, () -> "out-of-bounds byte span: " + token);
+            assertTrue(lines[token.startByte()] > 0, () -> "startByte not on code-point boundary: " + token);
+            assertTrue(lines[token.endByte()] > 0, () -> "endByte not on code-point boundary: " + token);
+            assertEquals(lines[token.startByte()], token.startLine(), () -> "startLine mismatch: " + token);
+            assertEquals(columns[token.startByte()], token.startColumn(), () -> "startColumn mismatch: " + token);
+            assertEquals(lines[token.endByte()], token.endLine(), () -> "endLine mismatch: " + token);
+            assertEquals(columns[token.endByte()], token.endColumn(), () -> "endColumn mismatch: " + token);
+        }
     }
 
     // --- Fixture corpus ---------------------------------------------------------------------------------

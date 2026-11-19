@@ -3,10 +3,8 @@ package dev.superice.gdparser.frontend.gdscript;
 import dev.superice.gdparser.frontend.ast.Range;
 import org.jetbrains.annotations.Nullable;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 
 /// A recovery-independent token view. Layout remains a boundary unless the enclosing
@@ -70,6 +68,9 @@ final class CompletionTokenStream {
     private final List<Entry> entries = new ArrayList<>();
     private final List<Integer> partners = new ArrayList<>();
     private final List<Frame> frames = new ArrayList<>();
+    private final List<Integer> openParenFrames = new ArrayList<>();
+    private final List<Integer> openBracketFrames = new ArrayList<>();
+    private final List<Integer> openBraceFrames = new ArrayList<>();
     private final List<GdComment> comments;
     private final List<Range> incompleteStrings = new ArrayList<>();
     private final SourceTextIndex index;
@@ -80,7 +81,7 @@ final class CompletionTokenStream {
     private final List<Integer> continuationLines;
 
     CompletionTokenStream(String source) {
-        var tokenizer = new GdTokenizer(source);
+        var tokenizer = GdTokenizer.managed(source);
         continuationLines = tokenizer.getContinuationLines();
         index = tokenizer.sourceTextIndex();
         lineIndents = new int[index.lineCount()];
@@ -97,37 +98,16 @@ final class CompletionTokenStream {
                 leading = false;
             }
         }
-        var errors = new ArrayList<GdToken>();
-        var literalStarts = new HashSet<Integer>();
         GdToken token;
         do {
             token = tokenizer.scan();
             if (token.type() != GdTokenType.ERROR) {
                 accept(token);
-                if (token.type() == GdTokenType.LITERAL) {
-                    literalStarts.add(token.startByte());
-                }
-            } else {
-                errors.add(token);
+            } else if (GdTokenizer.UNTERMINATED_STRING_ERROR.equals(token.errorMessage())) {
+                incompleteStrings.add(index.rangeOf(token.startByte(), token.endByte()));
             }
         } while (token.type() != GdTokenType.EOF);
         comments = tokenizer.getComments();
-        if (!errors.isEmpty()) {
-            var bytes = source.getBytes(StandardCharsets.UTF_8);
-            for (var error : errors) {
-                var start = error.startByte();
-                if (start < bytes.length && !literalStarts.contains(start)) {
-                    var quote = start;
-                    if ((bytes[start] == 'r' || bytes[start] == '&' || bytes[start] == '^')
-                            && start + 1 < bytes.length) {
-                        quote++;
-                    }
-                    if (bytes[quote] == '"' || bytes[quote] == '\'') {
-                        incompleteStrings.add(index.rangeOf(start, error.endByte()));
-                    }
-                }
-            }
-        }
     }
 
     List<Entry> entries() {
@@ -225,7 +205,7 @@ final class CompletionTokenStream {
             case PARENTHESIS_OPEN -> signature ? Role.SIGNATURE
                     : isCalleeEnd(entries.size() - 1) ? Role.CALL : Role.GROUP;
             case BRACKET_OPEN -> inType ? Role.TYPE
-                    : isPrimaryEnd(previous) ? Role.SUBSCRIPT : Role.CONTAINER;
+                    : isPrimaryEnd(entries.size() - 1) ? Role.SUBSCRIPT : Role.CONTAINER;
             case BRACE_OPEN -> Role.CONTAINER;
             default -> Role.OTHER;
         };
@@ -245,7 +225,7 @@ final class CompletionTokenStream {
             frames.add(frame);
             typeState = TypeState.NONE;
         } else if (isOpen(type)) {
-            frames.add(new Frame(position, role, role == Role.TYPE ? multiline() : true, 0));
+            pushDelimiterFrame(position, type, role);
             if (role != Role.TYPE) {
                 typeState = TypeState.NONE;
             }
@@ -298,7 +278,7 @@ final class CompletionTokenStream {
     /// Non-multiline type containers cannot outlive a failed type atom or a hard newline.
     private void discardIncompleteTypes() {
         while (!frames.isEmpty() && frames.getLast().role == Role.TYPE && !frames.getLast().multiline) {
-            frames.removeLast();
+            removeFramesFrom(frames.size() - 1);
         }
     }
 
@@ -323,9 +303,8 @@ final class CompletionTokenStream {
     }
 
     private void finishBodiesBefore(GdToken token) {
-        while (topFunction() != null) {
-            var frame = topFunction();
-            var type = token.type();
+        var type = token.type();
+        for (var frame = topFunction(); frame != null; frame = topFunction()) {
             if (isPendingSignature(frame)) {
                 if (type == GdTokenType.PARENTHESIS_OPEN
                         || frame.body == Body.PREFIX && isIdentifier(token)) {
@@ -421,22 +400,20 @@ final class CompletionTokenStream {
 
     private void close(int position) {
         var type = entries.get(position).token().type();
-        for (var i = frames.size() - 1; i >= 0; i--) {
-            var frame = frames.get(i);
-            if (frame.isFunction()) {
-                continue;
-            }
-            var opener = entries.get(frame.opener).token().type();
-            if (!matches(opener, type)) {
-                continue;
-            }
-            partners.set(frame.opener, position);
-            partners.set(position, frame.opener);
-            removeFramesFrom(i);
-            if (frame.role == Role.SIGNATURE && topFunction() != null) {
-                topFunction().body = Body.RETURN_TYPE;
-            }
+        var stack = openFramesFor(type);
+        if (stack == null || stack.isEmpty()) {
             return;
+        }
+        var frameIndex = stack.getLast();
+        var frame = frames.get(frameIndex);
+        partners.set(frame.opener, position);
+        partners.set(position, frame.opener);
+        removeFramesFrom(frameIndex);
+        if (frame.role == Role.SIGNATURE) {
+            var enclosingFunction = topFunction();
+            if (enclosingFunction != null) {
+                enclosingFunction.body = Body.RETURN_TYPE;
+            }
         }
     }
 
@@ -445,13 +422,37 @@ final class CompletionTokenStream {
                 || frame.body == Body.NAMED_OPEN;
     }
 
-    /// Reverse unwinding also restores the outermost saved baseline on bulk recovery.
+    private void pushDelimiterFrame(int position, GdTokenType type, Role role) {
+        var frameIndex = frames.size();
+        frames.add(new Frame(position, role, role != Role.TYPE || multiline(), 0));
+        var stack = openFramesFor(type);
+        if (stack != null) {
+            stack.add(frameIndex);
+        }
+    }
+
+    private @Nullable List<Integer> openFramesFor(GdTokenType type) {
+        return switch (type) {
+            case PARENTHESIS_OPEN, PARENTHESIS_CLOSE -> openParenFrames;
+            case BRACKET_OPEN, BRACKET_CLOSE -> openBracketFrames;
+            case BRACE_OPEN, BRACE_CLOSE -> openBraceFrames;
+            default -> null;
+        };
+    }
+
+    /// Reverse unwinding also restores the outermost saved baseline and keeps per-kind opener
+    /// frame indices synchronized with `frames`.
     private void removeFramesFrom(int first) {
         for (var i = frames.size() - 1; i >= first; i--) {
             var frame = frames.removeLast();
             if (frame.isFunction()) {
                 effectiveIndent = frame.indent;
                 typeState = TypeState.NONE;
+            } else {
+                var stack = openFramesFor(entries.get(frame.opener).token().type());
+                if (stack != null) {
+                    stack.removeLast();
+                }
             }
         }
     }
@@ -492,7 +493,8 @@ final class CompletionTokenStream {
             return isNodeName(token);
         }
         return isIdentifier(token) || switch (token.type()) {
-            case PARENTHESIS_CLOSE, BRACKET_CLOSE, PERIOD, SUPER, PRELOAD -> true;
+            case PARENTHESIS_CLOSE, BRACKET_CLOSE -> partners.get(position) >= 0;
+            case PERIOD, SUPER, PRELOAD -> true;
             default -> false;
         };
     }
@@ -521,11 +523,16 @@ final class CompletionTokenStream {
         };
     }
 
-    static boolean isPrimaryEnd(@Nullable GdToken token) {
-        return token != null && (isNodeName(token) || switch (token.type()) {
-            case LITERAL, PARENTHESIS_CLOSE, BRACKET_CLOSE, BRACE_CLOSE -> true;
+    boolean isPrimaryEnd(int position) {
+        if (position < 0 || position >= entries.size()) {
+            return false;
+        }
+        var token = entries.get(position).token();
+        return isNodeName(token) || switch (token.type()) {
+            case LITERAL -> true;
+            case PARENTHESIS_CLOSE, BRACKET_CLOSE, BRACE_CLOSE -> partners.get(position) >= 0;
             default -> false;
-        });
+        };
     }
 
     static boolean isLayout(GdTokenType type) {

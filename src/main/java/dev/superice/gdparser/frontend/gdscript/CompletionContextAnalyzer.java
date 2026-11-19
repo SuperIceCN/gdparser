@@ -98,7 +98,7 @@ final class CompletionContextAnalyzer {
                 break;
             }
             if (CompletionTokenStream.isNodeName(token)) {
-                if (token.startByte() <= offset && offset < token.endByte()) {
+                if (offset < token.endByte()) {
                     return i;
                 }
                 if (token.endByte() == offset) {
@@ -149,7 +149,7 @@ final class CompletionContextAnalyzer {
     }
 
     private @Nullable Range receiverBefore(int dot) {
-        if (dot == 0 || !CompletionTokenStream.isPrimaryEnd(token(dot - 1))) {
+        if (dot == 0 || !stream.isPrimaryEnd(dot - 1)) {
             return null;
         }
         var end = token(dot - 1).endByte();
@@ -185,11 +185,11 @@ final class CompletionContextAnalyzer {
                 var role = entries.get(open).role();
                 position = open;
                 if ((role == CompletionTokenStream.Role.CALL || role == CompletionTokenStream.Role.SUBSCRIPT)
-                        && position > 0 && CompletionTokenStream.isPrimaryEnd(token(position - 1))) {
+                        && position > 0 && stream.isPrimaryEnd(position - 1)) {
                     position--;
                     continue;
                 }
-            } else if (!CompletionTokenStream.isPrimaryEnd(token)) {
+            } else if (!stream.isPrimaryEnd(position)) {
                 break;
             }
             if (isPathSegment(token)) {
@@ -197,7 +197,7 @@ final class CompletionContextAnalyzer {
                 start = token(position).startByte();
             }
             if (position >= 2 && token(position - 1).type() == GdTokenType.PERIOD
-                    && CompletionTokenStream.isPrimaryEnd(token(position - 2))) {
+                    && stream.isPrimaryEnd(position - 2)) {
                 position -= 2;
                 continue;
             }
@@ -222,10 +222,10 @@ final class CompletionContextAnalyzer {
                     return prefix ? left : standalone;
                 }
             }
-            if (left > 0 && token(left - 1).type() == GdTokenType.DOLLAR) {
+            if (token(left - 1).type() == GdTokenType.DOLLAR) {
                 return left - 1;
             }
-            if (left == 0 || token(left - 1).type() != GdTokenType.SLASH) {
+            if (token(left - 1).type() != GdTokenType.SLASH) {
                 break;
             }
             left--;

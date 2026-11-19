@@ -23,6 +23,7 @@ import static dev.superice.gdparser.frontend.gdscript.CompletionContext.Kind.MEM
 import static dev.superice.gdparser.frontend.gdscript.CompletionContext.Kind.TYPE_POSITION;
 import static dev.superice.gdparser.frontend.gdscript.CompletionContext.Kind.UNKNOWN;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -569,6 +570,37 @@ class GdCompletionContextTest {
                 assertTrue(context.replaceableRange().endByte() <= end, prefix);
             }
         }
+    }
+
+    @Test
+    @Timeout(15)
+    void orphanAndPairedClosersControlCallArgumentDetectionAndStayLinear() {
+        for (var source : List.of("var x = )(", "var x = ](")) {
+            var context = FACADE.parseCompletionContext(source, source.length());
+            assertNotEquals(CALL_ARGUMENT, context.kind(), source);
+        }
+
+        assertCase(plain("var x = get_fn()(|", CALL_ARGUMENT, ""));
+        assertCase(plain("var x = arr[0](|", CALL_ARGUMENT, ""));
+
+        var storm = "[".repeat(20_000) + ")".repeat(20_000);
+        var stormContext = FACADE.parseCompletionContext(storm, storm.length());
+        assertNotNull(stormContext.kind());
+        assertNotEquals(CALL_ARGUMENT, stormContext.kind());
+    }
+
+    @Test
+    void malformedClosedStringStillAllowsCompletionWhileUnterminatedStringSuppressesIt() {
+        assertCase(plain("var x = f(\"\\u123\"|", CALL_ARGUMENT, ""));
+        assertCase(plain("var x = f(\"\\u123|", UNKNOWN, ""));
+    }
+
+    @Test
+    void orphanClosersAreRejectedAsPrimaryReceiversWhilePairedClosersRemainValid() {
+        assertCase(plain("var x = ).|", UNKNOWN, ""));
+        assertCase(member("var x = ][0].|", "", "[0]"));
+        assertCase(member("var x = (a).|", "", "(a)"));
+        assertCase(member("var x = arr[0].|", "", "arr[0]"));
     }
 
     private static Case member(String marked, String replacement, String receiver) {

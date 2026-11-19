@@ -156,18 +156,143 @@ class GdScriptParserTest {
 
     @Test
     void emptyAndWhitespaceOnlyFiles() {
-        var empty = cleanAst("");
-        assertTrue(empty.statements().isEmpty());
-        assertEquals(new Range(0, 0, new Point(0, 0), new Point(0, 0)), empty.range());
+        var facade = new GdScriptParserFacade();
+        var emptyCases = List.of("", "\n", "\n\n", "\r\n", "\r\n\r\n", "   \t  ", "   \n\t \n");
+        for (var source : emptyCases) {
+            var ast = cleanAst(source);
+            assertTrue(ast.statements().isEmpty(), () -> "expected empty AST for: " + source);
+            var index = SourceTextIndex.of(source);
+            var eof = index.utf8Length();
+            assertEquals(index.rangeOf(eof, eof), ast.range(), () -> "expected zero-width EOF range for: " + source);
+            assertTrue(facade.parseStrict(source).statements().isEmpty());
+        }
+    }
 
-        // A newline-only source takes Godot's EOF quirk path: consuming the final '\n' fires
-        // the tokenizer's EOF hook, which synthesizes a pending NEWLINE; the class-body dispatch
-        // has no NEWLINE case, so Godot reports it as unexpected. The AST itself is still an
-        // empty source file with a zero-width range at the physical EOF (parity holds).
-        var result = parse("\n");
-        assertTrue(result.ast().statements().isEmpty());
-        assertEquals(new Range(1, 1, new Point(1, 0), new Point(1, 0)), result.ast().range());
-        assertEquals(List.of("Unexpected \"Newline\" in class body."), errorMessages(result));
+    @Test
+    void commentAndRegionOnlyFilesParseCleanlyAndPreserveTriviaNodes() {
+        var facade = new GdScriptParserFacade();
+
+        var singleComment = facade.parseStrict("# comment");
+        assertEquals(1, singleComment.statements().size());
+        assertEquals("# comment", assertInstanceOf(CommentStatement.class, singleComment.statements().getFirst()).text());
+
+        var crlfComments = facade.parseStrict("# c1\r\n# c2\r\n");
+        assertEquals(2, crlfComments.statements().size());
+        assertInstanceOf(CommentStatement.class, crlfComments.statements().get(0));
+        assertInstanceOf(CommentStatement.class, crlfComments.statements().get(1));
+
+        var regionOnly = facade.parseStrict("#region foo\n# x\n#endregion\n");
+        assertEquals(3, regionOnly.statements().size());
+        var start = assertInstanceOf(RegionDirectiveStatement.class, regionOnly.statements().get(0));
+        assertEquals("start", start.directive());
+        assertEquals("foo", start.label());
+        assertEquals("# x", assertInstanceOf(CommentStatement.class, regionOnly.statements().get(1)).text());
+        var end = assertInstanceOf(RegionDirectiveStatement.class, regionOnly.statements().get(2));
+        assertEquals("end", end.directive());
+
+        var regionNoTrailingNewline = facade.parseStrict("#region foo\n#endregion");
+        assertEquals(2, regionNoTrailingNewline.statements().size());
+    }
+
+    @Test
+    void leadingLexicalErrorBeforeNewlineIsReportedWithoutCascadingClassBodyNewlineError() {
+        var invalidWhitespace = parse("\u2003\n");
+        assertEquals(List.of("Invalid white space character U+2003."), errorMessages(invalidWhitespace));
+
+        var invalidChar = parse("\u0001\n");
+        assertEquals(1, errorMessages(invalidChar).size());
+        assertTrue(errorMessages(invalidChar).getFirst().contains("U+0001"));
+
+        var strayCr = parse("\ra\n");
+        assertEquals(List.of("Stray carriage return character in source code."), errorMessages(strayCr));
+
+        var strayCrBeforeDecl = parse("\r\nvar a = 1\n");
+        assertEquals(List.of(), errorMessages(strayCrBeforeDecl));
+        assertEquals(1, strayCrBeforeDecl.ast().statements().size());
+        assertInstanceOf(VariableDeclaration.class, strayCrBeforeDecl.ast().statements().getFirst());
+
+        // Leading lexical error on a blank line resets panic mode before parsing declarations
+        // outside the synchronization set.
+        var enumAfterLeadingError = parse("\u2003\nenum E { A }\n");
+        assertEquals(List.of("Invalid white space character U+2003."), errorMessages(enumAfterLeadingError));
+        var survivingEnum = assertInstanceOf(EnumDeclaration.class,
+                enumAfterLeadingError.ast().statements().getFirst());
+        assertEquals("E", survivingEnum.name());
+
+        var passAfterLeadingError = parse("\u2003\npass\n");
+        assertEquals(List.of("Invalid white space character U+2003."), errorMessages(passAfterLeadingError));
+        assertInstanceOf(PassStatement.class, passAfterLeadingError.ast().statements().getFirst());
+
+        // Malformed blank lines skipped by the tokenizer emit no NEWLINE token, so leading
+        // stray-CR errors on earlier lines must not suppress declarations on subsequent lines.
+        var enumAfterLeadingStrayCrBlankLine = parse("\r \nenum E { A }\n");
+        assertEquals(List.of("Stray carriage return character in source code."),
+                errorMessages(enumAfterLeadingStrayCrBlankLine));
+        var enumAfterCr = assertInstanceOf(EnumDeclaration.class,
+                enumAfterLeadingStrayCrBlankLine.ast().statements().getFirst());
+        assertEquals("E", enumAfterCr.name());
+
+        var passAfterLeadingStrayCrBlankLine = parse("\r \npass\n");
+        assertEquals(List.of("Stray carriage return character in source code."),
+                errorMessages(passAfterLeadingStrayCrBlankLine));
+        assertInstanceOf(PassStatement.class, passAfterLeadingStrayCrBlankLine.ast().statements().getFirst());
+
+        var lifoStrayCrErrorsSameLineIdentifier = parse("\r \n\ra\n");
+        assertEquals(List.of("Stray carriage return character in source code.",
+                        "Stray carriage return character in source code."),
+                errorMessages(lifoStrayCrErrorsSameLineIdentifier));
+
+        var strayCrTrailingWhitespaceLine = parse("a\n\r \n");
+        assertEquals(List.of("Unexpected identifier \"a\" in class body.",
+                        "Stray carriage return character in source code."),
+                errorMessages(strayCrTrailingWhitespaceLine));
+
+        var strayCrAfterValidDecl = parse("var a = 1\n\r \n");
+        assertEquals(List.of("Stray carriage return character in source code."),
+                errorMessages(strayCrAfterValidDecl));
+    }
+
+    @Test
+    void trailingBackslashContinuationAtEofInIndentedBlockParsesCleanly() {
+        var facade = new GdScriptParserFacade();
+        for (var source : List.of("func f():\n\tpass\\\n", "func f():\n\tpass\\\r\n")) {
+            var ast = facade.parseStrict(source);
+            var fn = assertInstanceOf(FunctionDeclaration.class, ast.statements().getFirst());
+            assertEquals("f", fn.name());
+            assertInstanceOf(PassStatement.class, fn.body().statements().getFirst());
+        }
+    }
+
+    @Test
+    void trailingIndentedStrayCarriageReturnAtEofDoesNotEmitSpuriousSuiteErrors() {
+        for (var source : List.of(
+                "func f():\n\tpass\n\t\t\r",
+                "func f():\n\tpass\n\t\t\r ",
+                "func f():\n\tpass\n\t\t\r \n")) {
+            var result = parse(source);
+            assertEquals(List.of("Stray carriage return character in source code."),
+                    errorMessages(result), () -> "source: " + source);
+            var fn = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            assertEquals("f", fn.name());
+            assertInstanceOf(PassStatement.class, fn.body().statements().getFirst());
+        }
+    }
+
+    @Test
+    void commentOnlyFunctionAndClassBodiesStillReportMissingIndentedBlockAndKeepSiblings() {
+        var funcResult = parse("func f():\n\t# comment\nfunc g():\n\tpass\n");
+        assertTrue(errorMessages(funcResult).contains("Expected indented block after function declaration."));
+        var functions = funcResult.ast().statements().stream()
+                .filter(FunctionDeclaration.class::isInstance)
+                .map(FunctionDeclaration.class::cast)
+                .toList();
+        assertEquals(List.of("f", "g"), functions.stream().map(FunctionDeclaration::name).toList());
+
+        var classResult = parse("class Inner:\n\t# comment\nvar ok = 1\n");
+        assertTrue(errorMessages(classResult).contains("Expected indented block after class declaration."));
+        assertTrue(classResult.ast().statements().stream().anyMatch(ClassDeclaration.class::isInstance));
+        assertTrue(classResult.ast().statements().stream()
+                .anyMatch(s -> s instanceof VariableDeclaration v && v.name().equals("ok")));
     }
 
     @Test

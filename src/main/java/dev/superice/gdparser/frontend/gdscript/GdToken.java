@@ -9,9 +9,9 @@ import java.util.Objects;
 ///
 /// Byte offsets are the authoritative position carrier: they always refer to physical
 /// UTF-8 positions and are later converted to `Range` via `SourceTextIndex`. The 1-based
-/// line/column fields follow Godot's diagnostic conventions (columns count characters,
-/// tab counts one) and may point past the physical end for EOF-synthesized tokens
-/// (`NEWLINE`/`DEDENT`/`EOF`); they are aligned with Godot error messages, not with `Range`.
+/// line/column fields track physical lines and consumed Unicode code points (tab counts
+/// one; CRLF advances line once); EOF-synthesized layout tokens (`NEWLINE`, `DEDENT`,
+/// `EOF`) anchor as zero-width spans at the physical EOF coordinate `(eofLine, eofColumn)`.
 ///
 /// @param type token type
 /// @param source raw source slice of the token; empty for `ERROR`, `NEWLINE` and `EOF`
@@ -56,7 +56,7 @@ public record GdToken(
     }
 
     @Override
-    public String toString() {
+    public @NotNull String toString() {
         var builder = new StringBuilder(type.name());
         if (type == GdTokenType.ERROR) {
             builder.append("(\"").append(errorMessage).append("\")");

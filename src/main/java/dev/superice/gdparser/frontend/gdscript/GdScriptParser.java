@@ -103,7 +103,7 @@ public final class GdScriptParser {
     /// of the reference path).
     private static final String DIAGNOSTIC_NODE_TYPE = "ERROR";
 
-    private GdTokenizer tokenizer = new GdTokenizer();
+    private GdTokenizer tokenizer = GdTokenizer.managed("");
     private byte[] sourceBytes = new byte[0];
     private SourceTextIndex index;
     private GdToken current;
@@ -200,7 +200,7 @@ public final class GdScriptParser {
     ///
     /// @return the mapped AST plus all accumulated diagnostics (tokenizer and parser errors).
     public @NotNull AstMappingResult parse(@NotNull String source) {
-        tokenizer = new GdTokenizer(source);
+        tokenizer = GdTokenizer.managed(source);
         sourceBytes = source.getBytes(StandardCharsets.UTF_8);
         index = tokenizer.sourceTextIndex();
         multilineStack.clear();
@@ -225,7 +225,27 @@ public final class GdScriptParser {
         nestingBudgetExceeded = false;
         poisonedLineIndent = 0;
         previous = new GdToken(GdTokenType.EMPTY, "", GdLiteralKind.NONE, null, 0, 0, 1, 1, 1, 1);
-        current = scanSkippingErrors();
+        var lastLeadingErrorLine = 0;
+        var token = tokenizer.scan();
+        while (token.isError() || token.type() == GdTokenType.NEWLINE) {
+            if (token.isError()) {
+                pushError(token.errorMessage(), token);
+                // Queued errors drain LIFO, so keep the furthest physical end line seen so far.
+                lastLeadingErrorLine = Math.max(lastLeadingErrorLine, token.endLine());
+            } else {
+                // Discarding a leading newline ends the offending leading line.
+                panicMode = false;
+                lastLeadingErrorLine = 0;
+            }
+            token = tokenizer.scan();
+        }
+        if (lastLeadingErrorLine > 0 && token.type() != GdTokenType.EOF
+                && token.startLine() > lastLeadingErrorLine) {
+            // Leading lexical errors occurred only on earlier blank/trivia lines; do not let them
+            // suppress the first healthy declaration on a subsequent physical line.
+            panicMode = false;
+        }
+        current = token;
 
         var statements = parseProgram();
         // Vendor invariant (debug-only there): the multiline stack must be balanced by the end

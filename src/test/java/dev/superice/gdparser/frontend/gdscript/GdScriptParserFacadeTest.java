@@ -15,10 +15,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 /// Facade-level contract tests: entry semantics (tolerant/strict/tokenize raw stream) and the
 /// shared-instance concurrency guarantee. Parser behavior itself is anchored in
@@ -93,30 +90,53 @@ class GdScriptParserFacadeTest {
     }
 
     @Test
-    void tokenizeRawStreamExposesLayoutTokensSuppressedDuringParse() {
-        // Raw stream has no parser pushing multiline mode, so the grouping's NEWLINE/INDENT
-        // survive tokenize; the parser-driven stream inside parse() suppresses them, which is
-        // why the same source parses cleanly.
+    void tokenizeSuppressesLayoutTokensInsideBracketsAndResumesOutside() {
+        // Standalone tokenization tracks open brackets on parenStack, suppressing NEWLINE/INDENT/DEDENT
+        // inside `(`, `[`, `{` while resuming normal layout tokens once brackets close.
         var source = "var x = (\n\t1 +\n\t2\n)\n";
         var types = facade.tokenize(source).stream().map(GdToken::type).toList();
         var open = types.indexOf(GdTokenType.PARENTHESIS_OPEN);
         var close = types.lastIndexOf(GdTokenType.PARENTHESIS_CLOSE);
         var inside = types.subList(open, close);
-        assertTrue(inside.contains(GdTokenType.NEWLINE), "raw stream must keep NEWLINE inside groupings");
-        assertTrue(inside.contains(GdTokenType.INDENT), "raw stream must keep INDENT inside groupings");
+        assertFalse(inside.contains(GdTokenType.NEWLINE), "standalone tokenize suppresses NEWLINE inside groupings");
+        assertFalse(inside.contains(GdTokenType.INDENT), "standalone tokenize suppresses INDENT inside groupings");
+        assertEquals(GdTokenType.NEWLINE, types.get(close + 1));
+        assertEquals(GdTokenType.EOF, types.getLast());
         assertEquals(List.of(), errorMessages(facade.parse(source)));
     }
 
     @Test
-    void tokenizeRawStreamMayReportIndentErrorsForParserLegalSource() {
-        // The closing line dedents to a width recorded only inside the grouping: raw scanning
-        // reports the misaligned unindent, while parse() never observes it (multiline mode
-        // discards the layout). Pins "raw stream ERROR count is not a validity criterion".
-        var source = "var x = [\n\t\t1\n\t]\n";
-        var errors = facade.tokenize(source).stream().filter(GdToken::isError).toList();
-        assertEquals(1, errors.size());
-        assertEquals("Unindent doesn't match the previous indentation level.", errors.getFirst().errorMessage());
-        assertEquals(List.of(), errorMessages(facade.parse(source)));
+    void tokenizeSuppressesBracketIndentationErrorsWhileKeepingOuterIndentationAndCloserErrors() {
+        // Bracket-internal indentation changes are suppressed in standalone tokenization, whereas
+        // outer statement indentation and bracket mismatches are still checked.
+        var bracketed = "var x = [\n\t\t1\n\t]\n";
+        assertEquals(List.of(), facade.tokenize(bracketed).stream().filter(GdToken::isError).toList());
+        assertEquals(List.of(), errorMessages(facade.parse(bracketed)));
+
+        var outerAfterBracket = "func f():\n\tvar x = [\n\t\t1\n\t]\n\treturn x\n";
+        var outerTokens = facade.tokenize(outerAfterBracket);
+        assertEquals(List.of(), outerTokens.stream().filter(GdToken::isError).toList());
+        assertEquals(1, outerTokens.stream().filter(t -> t.type() == GdTokenType.INDENT).count());
+        assertEquals(1, outerTokens.stream().filter(t -> t.type() == GdTokenType.DEDENT).count());
+
+        var badOuterUnindent = facade.tokenize("func f():\n\t\tpass\n\tpass\n")
+                .stream().filter(GdToken::isError).toList();
+        assertEquals(1, badOuterUnindent.size());
+        assertEquals("Unindent doesn't match the previous indentation level.", badOuterUnindent.getFirst().errorMessage());
+
+        var mismatchedCloser = facade.tokenize("var x = [1)\n");
+        var mismatchedErrors = mismatchedCloser.stream().filter(GdToken::isError).toList();
+        assertEquals(1, mismatchedErrors.size());
+        assertEquals("Closing \")\" doesn't match the opening \"[\".", mismatchedErrors.getFirst().errorMessage());
+
+        var resumedAfterMismatch = facade.tokenize("var x = [1)\nvar y = 1\n");
+        assertEquals(List.of("Closing \")\" doesn't match the opening \"[\"."),
+                resumedAfterMismatch.stream().filter(GdToken::isError).map(GdToken::errorMessage).toList());
+        assertEquals(List.of(
+                GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL,
+                GdTokenType.BRACKET_OPEN, GdTokenType.LITERAL, GdTokenType.ERROR, GdTokenType.NEWLINE,
+                GdTokenType.VAR, GdTokenType.IDENTIFIER, GdTokenType.EQUAL, GdTokenType.LITERAL, GdTokenType.NEWLINE,
+                GdTokenType.EOF), resumedAfterMismatch.stream().map(GdToken::type).toList());
     }
 
     @Test

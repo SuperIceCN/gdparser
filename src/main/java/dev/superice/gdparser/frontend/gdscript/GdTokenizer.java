@@ -1,6 +1,7 @@
 package dev.superice.gdparser.frontend.gdscript;
 
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -8,42 +9,47 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/// Port of Godot's `GDScriptTokenizerText` (vendor/godot/gdscript_tokenizer.h/.cpp)
-/// producing an incremental token stream via `scan()`.
+/// Incremental GDScript lexer producing a token stream via `scan()`.
 ///
-/// Behavioral alignment:
+/// Behavioral highlights:
 /// - Errors are queued and returned as `ERROR` tokens in LIFO order before regular
 ///   scanning resumes; a single error never aborts the scan.
 /// - Indentation uses an indent stack plus a signed `pendingIndents` counter; `scan()`
 ///   delivers at most one `INDENT`/`DEDENT` per call. A misaligned dedent queues an error
 ///   and pushes the actual width back without incrementing the counter.
-/// - Newlines follow Godot's pending-newline model: empty lines and comment-only lines
-///   never emit `NEWLINE`; multiline mode discards pending newlines and suppresses
-///   indentation changes; a backslash line continuation consumes the newline.
+/// - Newlines follow a pending-newline model: empty lines and comment-only lines never
+///   emit `NEWLINE`; multiline mode discards pending newlines and suppresses indentation
+///   changes; a backslash line continuation consumes the newline.
 /// - Comments are collected as `GdComment` trivia and never enter the token stream.
+/// - Supports two operating modes:
+///   - **Standalone (public default)**: layout suppression follows unclosed brackets on
+///     `parenStack` unless explicitly overridden via `setMultilineMode(boolean)`, and
+///     unmatched/mismatched closers emit lexical `ERROR` tokens with single-transition
+///     stack unwinding.
+///   - **Managed (parser / completion)**: explicit `setMultilineMode(boolean)` starts as
+///     `false` and always takes precedence over `parenStack`, while closers always emit
+///     their real closer token so syntactic recovery owns bracket pairing.
 ///
 /// Deliberate deviations (documented project decisions):
 /// - Sign characters are never absorbed into number literals: `+`/`-` always produce
 ///   `PLUS`/`MINUS` so the parser can model unary operations as `UnaryExpression`.
-///   Consequently Godot's `last_token`/`can_precede_bin_op` bookkeeping is dead and
-///   omitted.
 /// - Decoded literal values are not computed; `GdToken.literalKind` carries the literal
 ///   classification instead and the raw text stays available via `GdToken.source`.
-///   `ERROR` tokens carry an empty `source` (byte range stays exact) because Java cannot
-///   share slices like Godot's copy-on-write String — copying the token-so-far window per
-///   queued error would make memory quadratic on error-dense inputs.
-/// - Editor cursor tracking, completion hooks, binary tokenizer paths and the debug-build
-///   keyword-confusable check are cut with the rest of the tooling-only features.
-/// - Positions: tokens carry physical UTF-8 byte offsets (authoritative, used for `Range`
-///   conversion) alongside Godot's 1-based line/column diagnostic coordinates. Where Godot
-///   reports whitespace-phase errors with stale coordinates of the previous token, this
-///   port anchors them to the offending character/line instead.
+///   `ERROR` tokens carry an empty `source` (byte range stays exact) to avoid quadratic
+///   allocation on error-dense inputs.
+/// - Positions: tokens carry physical UTF-8 byte offsets alongside 1-based physical line
+///   and Unicode code-point column coordinates (tab counts as 1; CRLF advances `line`
+///   once). EOF-synthesized `NEWLINE`, `DEDENT`, and `EOF` tokens anchor as zero-width
+///   spans at the physical EOF cursor without advancing `line` or `column`.
 public final class GdTokenizer {
 
     /// Tab width used for indentation level counting, aligned with Godot's default
     /// (`tab_size = 4`); the editor-settings override only exists in TOOLS builds.
     /// Package-visible so the parser's poisoned-region indent gate uses the same unit.
     static final int TAB_SIZE = 4;
+
+    /// Diagnostic message emitted when a string literal reaches EOF without its closing quote.
+    static final String UNTERMINATED_STRING_ERROR = "Unterminated string.";
 
     /// Godot keyword table (vendor/godot/gdscript_tokenizer.cpp `KEYWORDS` macro list).
     /// Keywords are ASCII-only with lengths between 2 and 10.
@@ -104,30 +110,51 @@ public final class GdTokenizer {
     private int startLine = 1;
     private int startColumn = 1;
 
+    private final boolean emitRawClosers;
+    private final @Nullable Boolean initialMultilineMode;
+
     private boolean lineContinuation;
-    private boolean multilineMode;
+    private boolean lineHasContent;
+    private boolean eofSettled;
+    private @Nullable Boolean explicitMultilineMode;
     private boolean pendingNewline;
     private GdToken lastNewline;
     private int pendingIndents;
     private final List<Integer> indentStack = new ArrayList<>();
     private final List<List<Integer>> indentStackStack = new ArrayList<>();
     private final List<Integer> parenStack = new ArrayList<>();
+    private final List<Integer> openParenIndices = new ArrayList<>();
+    private final List<Integer> openBracketIndices = new ArrayList<>();
+    private final List<Integer> openBraceIndices = new ArrayList<>();
     private int indentChar;
     private final List<GdToken> errorStack = new ArrayList<>();
     private final List<GdComment> comments = new ArrayList<>();
     private final List<Integer> continuationLines = new ArrayList<>();
 
     public GdTokenizer() {
-        // Establish the same invariants as an empty source so scan() is safe right away.
-        setSourceCode("");
+        this("", false, null);
     }
 
     public GdTokenizer(@NotNull String source) {
+        this(source, false, null);
+    }
+
+    private GdTokenizer(@NotNull String source, boolean emitRawClosers, @Nullable Boolean initialMultilineMode) {
+        this.emitRawClosers = emitRawClosers;
+        this.initialMultilineMode = initialMultilineMode;
         setSourceCode(source);
     }
 
-    /// Port of `set_source_code`. Unlike Godot (which only resets the cursor fields),
-    /// this resets the entire tokenizer state so an instance can be reused safely.
+    /// Creates a managed tokenizer for syntactic consumers (parser and completion stream):
+    /// explicit `setMultilineMode(boolean)` starts at `false` and always overrides
+    /// `parenStack`, while closing brackets always emit their real closer token instead
+    /// of lexical pairing `ERROR` tokens.
+    static @NotNull GdTokenizer managed(@NotNull String source) {
+        return new GdTokenizer(source, true, Boolean.FALSE);
+    }
+
+    /// Resets the entire tokenizer state for the new source while preserving whether this
+    /// instance runs in standalone or managed mode.
     public void setSourceCode(@NotNull String source) {
         this.source = Objects.requireNonNull(source, "source must not be null");
         var length = source.length();
@@ -153,13 +180,18 @@ public final class GdTokenizer {
         startLine = 1;
         startColumn = 1;
         lineContinuation = false;
-        multilineMode = false;
+        lineHasContent = false;
+        eofSettled = false;
+        explicitMultilineMode = initialMultilineMode;
         pendingNewline = false;
         lastNewline = null;
         pendingIndents = 0;
         indentStack.clear();
         indentStackStack.clear();
         parenStack.clear();
+        openParenIndices.clear();
+        openBracketIndices.clear();
+        openBraceIndices.clear();
         indentChar = 0;
         errorStack.clear();
         comments.clear();
@@ -182,15 +214,21 @@ public final class GdTokenizer {
         return Collections.unmodifiableList(continuationLines);
     }
 
-    /// Port of `set_multiline_mode`. In multiline mode pending newlines are discarded and
-    /// indentation changes are suppressed (the parser toggles this around grouping
-    /// constructs).
+    /// Configures explicit multiline mode for this tokenizer. When called, this explicit
+    /// setting overrides bracket-based auto-suppression (`parenStack`) until reset via
+    /// `setSourceCode(String)`.
     public void setMultilineMode(boolean state) {
-        multilineMode = state;
+        explicitMultilineMode = state;
     }
 
+    /// Whether multiline layout suppression is currently active (explicit override if set,
+    /// otherwise whether any opening bracket remains on `parenStack`).
     public boolean isMultilineMode() {
-        return multilineMode;
+        return effectiveMultilineMode();
+    }
+
+    private boolean effectiveMultilineMode() {
+        return explicitMultilineMode != null ? explicitMultilineMode : !parenStack.isEmpty();
     }
 
     /// Port of `push_expression_indented_block`: snapshots the indent stack so a lambda
@@ -241,8 +279,8 @@ public final class GdTokenizer {
 
             if (pendingNewline) {
                 pendingNewline = false;
-                if (!multilineMode) {
-                    // Don't return newline tokens on multiline mode.
+                if (!effectiveMultilineMode()) {
+                    // Don't return newline tokens in multiline mode.
                     return lastNewline;
                 }
             }
@@ -257,22 +295,32 @@ public final class GdTokenizer {
             startColumn = column;
 
             if (pendingIndents != 0) {
-                // Indent tokens cover the line's leading whitespace (Godot rewinds `_start`).
-                tokenStart -= startColumn - 1;
-                startColumn = 1;
                 if (pendingIndents > 0) {
+                    // Indent tokens cover the line's leading whitespace.
+                    tokenStart -= startColumn - 1;
+                    startColumn = 1;
                     pendingIndents--;
                     return makeToken(GdTokenType.INDENT);
-                } else {
-                    pendingIndents++;
-                    // Godot: dedent.end_column += 1.
-                    return newToken(GdTokenType.DEDENT, GdLiteralKind.NONE, null,
-                            tokenStart, startLine, startColumn, line, column + 1);
                 }
+                pendingIndents++;
+                if (isAtEnd()) {
+                    return new GdToken(GdTokenType.DEDENT, "", GdLiteralKind.NONE, null,
+                            byteOffsets[position], byteOffsets[position], line, column, line, column);
+                }
+                tokenStart -= startColumn - 1;
+                startColumn = 1;
+                return makeToken(GdTokenType.DEDENT);
             }
 
             if (isAtEnd()) {
-                return makeToken(GdTokenType.EOF);
+                if (!eofSettled) {
+                    settleEof();
+                    if (pendingNewline || pendingIndents != 0) {
+                        continue;
+                    }
+                }
+                return new GdToken(GdTokenType.EOF, "", GdLiteralKind.NONE, null,
+                        byteOffsets[position], byteOffsets[position], line, column, line, column);
             }
 
             var c = advance();
@@ -281,35 +329,60 @@ public final class GdTokenizer {
                 // Line continuation with backslash.
                 if (peek() == '\r') {
                     if (peek(1) != '\n') {
-                        return makeError("Unexpected carriage return character.");
+                        return emitContent(makeError("Unexpected carriage return character."));
                     }
                     advance();
                 }
                 if (peek() != '\n') {
-                    return makeError("Expected new line after \"\\\".");
+                    return emitContent(makeError("Expected new line after \"\\\"."));
                 }
                 advance();
                 newline(false);
                 lineContinuation = true;
-                // Skip whitespace/comment lines after the backslash (Godot GH-89403 fix).
+                // Skip whitespace/comment lines after the backslash.
                 skipWhitespace();
                 continuationLines.add(line);
-                // Loop instead of Godot's `return scan()` recursion (see method doc).
+                // Loop instead of tail recursion to keep stack depth O(1).
                 continue;
             }
 
             lineContinuation = false;
 
             if (isDigit(c)) {
-                return number();
+                return emitContent(number());
             } else if (c == 'r' && (peek() == '"' || peek() == '\'')) {
                 // Raw string literals.
-                return string();
+                return emitContent(string());
             } else if (isUnicodeIdentifierStart(c)) {
-                return potentialIdentifier();
+                return emitContent(potentialIdentifier());
             }
 
-            return dispatch(c);
+            return emitContent(dispatch(c));
+        }
+    }
+
+    private GdToken emitContent(GdToken token) {
+        lineHasContent = true;
+        return token;
+    }
+
+    /// Settles EOF state once per stream without mutating physical `(line, column)`:
+    /// schedules a zero-width synthetic `NEWLINE` only if the current logical line emitted
+    /// content and is not suppressed by multiline mode, and flushes any remaining indent levels.
+    private void settleEof() {
+        eofSettled = true;
+        if (lineHasContent) {
+            lineHasContent = false;
+            if (!effectiveMultilineMode()) {
+                var eofByte = byteOffsets[position];
+                lastNewline = new GdToken(GdTokenType.NEWLINE, "", GdLiteralKind.NONE, null,
+                        eofByte, eofByte, line, column, line, column);
+                pendingNewline = true;
+            }
+        }
+        if (!indentStack.isEmpty()) {
+            pendingIndents -= indentStack.size();
+            indentStack.clear();
         }
     }
 
@@ -341,24 +414,9 @@ public final class GdTokenizer {
                 pushParen('{');
                 yield makeToken(GdTokenType.BRACE_OPEN);
             }
-            case ')' -> {
-                if (!popParen('(')) {
-                    yield makeParenError(c);
-                }
-                yield makeToken(GdTokenType.PARENTHESIS_CLOSE);
-            }
-            case ']' -> {
-                if (!popParen('[')) {
-                    yield makeParenError(c);
-                }
-                yield makeToken(GdTokenType.BRACKET_CLOSE);
-            }
-            case '}' -> {
-                if (!popParen('{')) {
-                    yield makeParenError(c);
-                }
-                yield makeToken(GdTokenType.BRACE_CLOSE);
-            }
+            case ')' -> handleCloser(')', '(', GdTokenType.PARENTHESIS_CLOSE);
+            case ']' -> handleCloser(']', '[', GdTokenType.BRACKET_CLOSE);
+            case '}' -> handleCloser('}', '{', GdTokenType.BRACE_CLOSE);
             // Double characters.
             case '!' -> {
                 if (peek() == '=') {
@@ -510,22 +568,14 @@ public final class GdTokenizer {
     /// (column == 1). Skips empty and comment-only lines (which never emit `NEWLINE` nor
     /// affect indentation) and updates the indent stack / pending indent counter.
     private void checkIndent() {
-        if (isAtEnd()) {
-            // Send dedents for every indent level.
-            pendingIndents -= indentStack.size();
-            indentStack.clear();
-            return;
-        }
-
-        for (; ; ) {
-            var currentIndentChar = peek();
-            var indentCount = 0;
-
-            if (currentIndentChar != ' ' && currentIndentChar != '\t' && currentIndentChar != '\r'
-                    && currentIndentChar != '\n' && currentIndentChar != '#') {
+        // Leave EOF dedents to settleEof() so any synthetic EOF NEWLINE is emitted first.
+        while (!isAtEnd()) {
+            var firstChar = peek();
+            if (firstChar != ' ' && firstChar != '\t' && firstChar != '\r'
+                    && firstChar != '\n' && firstChar != '#') {
                 // First character of the line is not whitespace: clear all indentation
                 // levels, unless in a continuation or in multiline mode.
-                if (lineContinuation || multilineMode) {
+                if (lineContinuation || effectiveMultilineMode()) {
                     return;
                 }
                 pendingIndents -= indentStack.size();
@@ -533,21 +583,10 @@ public final class GdTokenizer {
                 return;
             }
 
-            if (peek() == '\r') {
-                advance();
-                if (peek() != '\n') {
-                    pushError(makeCursorError("Stray carriage return character in source code."));
-                }
-            }
-            if (peek() == '\n') {
-                // Empty line, keep going.
-                advance();
-                newline(false);
-                continue;
-            }
-
-            // Count indentation width; a tab counts as TAB_SIZE so files with mixed
-            // indentation stay parseable (aligned with Godot's error-tolerant counting).
+            // Consume leading spaces, tabs, and any stray CR before deciding whether the line
+            // is empty, comment-only, at EOF, or starts a statement.
+            var indentCount = 0;
+            var lineIndentChar = 0;
             var mixed = false;
             while (!isAtEnd()) {
                 var space = peek();
@@ -555,25 +594,26 @@ public final class GdTokenizer {
                     indentCount += TAB_SIZE;
                 } else if (space == ' ') {
                     indentCount += 1;
+                } else if (space == '\r' && peek(1) != '\n') {
+                    advance();
+                    pushError(makeCursorError("Stray carriage return character in source code."));
+                    continue;
                 } else {
                     break;
                 }
-                mixed = mixed || space != currentIndentChar;
+                if (lineIndentChar == 0) {
+                    lineIndentChar = space;
+                }
+                mixed = mixed || space != lineIndentChar;
                 advance();
             }
 
             if (isAtEnd()) {
-                // Reached the end with an empty line, so just dedent as much as needed.
-                pendingIndents -= indentStack.size();
-                indentStack.clear();
                 return;
             }
 
             if (peek() == '\r') {
                 advance();
-                if (peek() != '\n') {
-                    pushError(makeCursorError("Stray carriage return character in source code."));
-                }
             }
             if (peek() == '\n') {
                 // Empty line, keep going.
@@ -592,8 +632,6 @@ public final class GdTokenizer {
                 comments.add(new GdComment(text.toString(), true, commentLine,
                         byteOffsets[commentStart], byteOffsets[position]));
                 if (isAtEnd()) {
-                    pendingIndents -= indentStack.size();
-                    indentStack.clear();
                     return;
                 }
                 advance(); // Consume '\n'.
@@ -601,24 +639,32 @@ public final class GdTokenizer {
                 continue;
             }
 
-            if (mixed && !lineContinuation && !multilineMode) {
-                pushError(makeIndentError("Mixed use of tabs and spaces for indentation.", column));
+            if (mixed && !lineContinuation && !effectiveMultilineMode()) {
+                pushError(makeIndentError("Mixed use of tabs and spaces for indentation."));
             }
 
-            if (lineContinuation || multilineMode) {
+            if (lineContinuation || effectiveMultilineMode()) {
                 // Whitespace at the beginning of the line was consumed; a continuation or
                 // multiline mode must not produce indentation changes.
+                return;
+            }
+
+            if (indentCount == 0) {
+                // A line beginning with a stray CR and no spaces/tabs dedents to column 1
+                // without recording a file-wide indentation character.
+                pendingIndents -= indentStack.size();
+                indentStack.clear();
                 return;
             }
 
             // Check indentation character consistency across the file.
             if (indentChar == 0) {
                 // First time indenting, choose character now.
-                indentChar = currentIndentChar;
-            } else if (currentIndentChar != indentChar) {
+                indentChar = lineIndentChar;
+            } else if (lineIndentChar != indentChar) {
                 pushError(makeIndentError(
-                        "Used " + indentCharName(currentIndentChar) + " character for indentation instead of "
-                                + indentCharName(indentChar) + " as used before in the file.", column));
+                        "Used " + indentCharName(lineIndentChar) + " character for indentation instead of "
+                                + indentCharName(indentChar) + " as used before in the file."));
             }
 
             // Check if indent or dedent.
@@ -634,17 +680,16 @@ public final class GdTokenizer {
             } else {
                 // Indentation decreased (dedent).
                 if (indentStack.isEmpty()) {
-                    pushError(makeIndentError("Tokenizer bug: trying to dedent without previous indent.", column));
+                    pushError(makeIndentError("Tokenizer bug: trying to dedent without previous indent."));
                     return;
                 }
                 while (!indentStack.isEmpty() && indentStack.getLast() > indentCount) {
                     indentStack.removeLast();
                     pendingIndents--;
                 }
-                if ((!indentStack.isEmpty() && indentStack.getLast() != indentCount)
-                        || (indentStack.isEmpty() && indentCount != 0)) {
+                if (indentStack.isEmpty() || indentStack.getLast() != indentCount) {
                     // Mismatched indentation alignment; stay lenient and keep this level.
-                    pushError(makeIndentError("Unindent doesn't match the previous indentation level.", column + 1));
+                    pushError(makeIndentError("Unindent doesn't match the previous indentation level."));
                     indentStack.add(indentCount);
                 }
             }
@@ -709,27 +754,31 @@ public final class GdTokenizer {
         }
     }
 
-    /// Port of `newline()`. When `makeToken` is set and no newline is pending (and this is
-    /// not a continuation), schedules a `NEWLINE` token. The token's byte range covers the
-    /// consumed `\n`; when synthesized at EOF (no physical newline was consumed) it is
-    /// zero-width, anchored at the physical EOF byte offset.
+    /// Consumes a physical newline and advances the physical line cursor. When `makeToken`
+    /// is set and no newline is pending (and this is not a line continuation), schedules a
+    /// `NEWLINE` token covering the consumed `\n` and resets `lineHasContent`.
     private void newline(boolean makeToken) {
+        var prevLine = line;
+        var prevColumn = column;
+        line++;
+        column = 1;
         if (makeToken && !pendingNewline && !lineContinuation) {
             int startByte;
             int endByte;
+            int startCol;
             if (peek(-1) == '\n') {
                 endByte = byteOffsets[position];
                 startByte = endByte - 1;
+                startCol = prevColumn - 1;
             } else {
                 startByte = endByte = byteOffsets[position];
+                startCol = prevColumn;
             }
-            // Godot coordinates: start_column = column - 1, end_column = column.
             lastNewline = new GdToken(GdTokenType.NEWLINE, "", GdLiteralKind.NONE, null,
-                    startByte, endByte, line, column - 1, line, column);
+                    startByte, endByte, prevLine, startCol, line, column);
             pendingNewline = true;
+            lineHasContent = false;
         }
-        line++;
-        column = 1;
     }
 
     /// Port of `number()`. Handles decimal/hex (`0x`)/binary (`0b`) integers, decimals,
@@ -759,7 +808,7 @@ public final class GdTokenizer {
         }
 
         if (base != 10 && isUnderscore(peek())) { // Disallow `0x_` and `0b_`.
-            pushError(makeErrorAtColumn("Unexpected underscore after \"0" + codePointToString(peek(-1)) + "\"."));
+            pushError(makeError("Unexpected underscore after \"0" + codePointToString(peek(-1)) + "\"."));
             hasError = true;
         }
 
@@ -767,7 +816,7 @@ public final class GdTokenizer {
         while (digitCheck(base, peek()) || isUnderscore(peek())) {
             if (isUnderscore(peek())) {
                 if (previousWasUnderscore) {
-                    pushError(makeErrorAtColumn("Multiple underscores cannot be adjacent in a numeric literal."));
+                    pushError(makeError("Multiple underscores cannot be adjacent in a numeric literal."));
                 }
                 previousWasUnderscore = true;
             } else {
@@ -782,13 +831,13 @@ public final class GdTokenizer {
             if (base == 10 && !hasDecimal) {
                 hasDecimal = true;
             } else if (base == 10) {
-                pushError(makeErrorAtColumn("Cannot use a decimal point twice in a number."));
+                pushError(makeError("Cannot use a decimal point twice in a number."));
                 hasError = true;
             } else if (base == 16) {
-                pushError(makeErrorAtColumn("Cannot use a decimal point in a hexadecimal number."));
+                pushError(makeError("Cannot use a decimal point in a hexadecimal number."));
                 hasError = true;
             } else {
-                pushError(makeErrorAtColumn("Cannot use a decimal point in a binary number."));
+                pushError(makeError("Cannot use a decimal point in a binary number."));
                 hasError = true;
             }
             if (!hasError) {
@@ -796,14 +845,14 @@ public final class GdTokenizer {
 
                 // Consume decimal digits. Disallow `10._`, but allow `10.`.
                 if (isUnderscore(peek())) {
-                    pushError(makeErrorAtColumn("Unexpected underscore after decimal point."));
+                    pushError(makeError("Unexpected underscore after decimal point."));
                     hasError = true;
                 }
                 previousWasUnderscore = false;
                 while (isDigit(peek()) || isUnderscore(peek())) {
                     if (isUnderscore(peek())) {
                         if (previousWasUnderscore) {
-                            pushError(makeErrorAtColumn("Multiple underscores cannot be adjacent in a numeric literal."));
+                            pushError(makeError("Multiple underscores cannot be adjacent in a numeric literal."));
                         }
                         previousWasUnderscore = true;
                     } else {
@@ -822,13 +871,13 @@ public final class GdTokenizer {
             }
             // Consume exponent digits.
             if (!isDigit(peek())) {
-                pushError(makeErrorAtColumn("Expected exponent value after \"e\"."));
+                pushError(makeError("Expected exponent value after \"e\"."));
             }
             previousWasUnderscore = false;
             while (isDigit(peek()) || isUnderscore(peek())) {
                 if (isUnderscore(peek())) {
                     if (previousWasUnderscore) {
-                        pushError(makeErrorAtColumn("Multiple underscores cannot be adjacent in a numeric literal."));
+                        pushError(makeError("Multiple underscores cannot be adjacent in a numeric literal."));
                     }
                     previousWasUnderscore = true;
                 } else {
@@ -840,13 +889,13 @@ public final class GdTokenizer {
 
         if (needDigits) {
             // No digits in hex or binary literal; returned immediately (not queued).
-            return makeErrorAtColumn("Expected " + (base == 16 ? "hexadecimal" : "binary")
+            return makeError("Expected " + (base == 16 ? "hexadecimal" : "binary")
                     + " digit after \"0" + (base == 16 ? "x" : "b") + "\".");
         }
 
         // Detect extra decimal point or a letter at the end of the number.
         if (!hasError && hasDecimal && peek() == '.' && peek(1) != '.') {
-            pushError(makeErrorAtColumn("Cannot use a decimal point twice in a number."));
+            pushError(makeError("Cannot use a decimal point twice in a number."));
         } else if (isUnicodeIdentifierStart(peek()) || isUnicodeIdentifierContinue(peek())) {
             pushError(makeError("Invalid numeric notation."));
         }
@@ -888,12 +937,16 @@ public final class GdTokenizer {
         // Pending lead surrogate of a `\\uXXXX`/`\\UXXXXXX` escape awaiting its trail
         // surrogate (Godot's `prev`/`prev_pos`/`prev_line` validation state).
         var prevSurrogate = 0;
-        var prevLine = 0;
-        var prevColumn = 0;
+        var prevSurrogateStart = 0;
+        var prevSurrogateEnd = 0;
+        var prevSurrogateStartLine = 0;
+        var prevSurrogateStartColumn = 0;
+        var prevSurrogateEndLine = 0;
+        var prevSurrogateEndColumn = 0;
 
         for (; ; ) {
             if (isAtEnd()) {
-                return makeError("Unterminated string.");
+                return makeError(UNTERMINATED_STRING_ERROR);
             }
 
             var ch = peek();
@@ -909,15 +962,17 @@ public final class GdTokenizer {
                     message = "Invisible text direction control character present in the string, escape it (\"\\u"
                             + Integer.toHexString(ch) + "\") to avoid confusion.";
                 }
-                pushError(newToken(GdTokenType.ERROR, GdLiteralKind.NONE, message,
-                        tokenStart, line, column, line, column + 1));
+                pushError(makeSpanError(message, position, line, column, position + 1, line, column + 1));
             }
 
             if (ch == '\\') {
                 // Escape pattern.
+                var escapeStart = position;
+                var escapeStartLine = line;
+                var escapeStartColumn = column;
                 advance();
                 if (isAtEnd()) {
-                    return makeError("Unterminated string.");
+                    return makeError(UNTERMINATED_STRING_ERROR);
                 }
 
                 if (isRaw) {
@@ -926,19 +981,22 @@ public final class GdTokenizer {
                     if (peek() == quoteChar) {
                         advance();
                         if (isAtEnd()) {
-                            return makeError("Unterminated string.");
+                            return makeError(UNTERMINATED_STRING_ERROR);
                         }
                     } else if (peek() == '\\') { // For `\\\"`.
                         advance();
                         if (isAtEnd()) {
-                            return makeError("Unterminated string.");
+                            return makeError(UNTERMINATED_STRING_ERROR);
                         }
                     }
                 } else {
                     var code = peek();
                     advance();
+                    if (code == '\n') {
+                        newline(false);
+                    }
                     if (isAtEnd()) {
-                        return makeError("Unterminated string.");
+                        return makeError(UNTERMINATED_STRING_ERROR);
                     }
 
                     var escaped = 0;
@@ -953,7 +1011,7 @@ public final class GdTokenizer {
                             var hexLen = (code == 'U') ? 6 : 4;
                             for (var j = 0; j < hexLen; j++) {
                                 if (isAtEnd()) {
-                                    return makeError("Unterminated string.");
+                                    return makeError(UNTERMINATED_STRING_ERROR);
                                 }
                                 var digit = peek();
                                 int value;
@@ -965,9 +1023,11 @@ public final class GdTokenizer {
                                     value = digit - 'A' + 10;
                                 } else {
                                     // Make error, but keep parsing the string.
-                                    pushError(newToken(GdTokenType.ERROR, GdLiteralKind.NONE,
+                                    var endLine = digit == '\n' ? line + 1 : line;
+                                    var endCol = digit == '\n' ? 1 : column + 1;
+                                    pushError(makeSpanError(
                                             "Invalid hexadecimal digit in unicode escape sequence.",
-                                            tokenStart, line, column, line, column + 1));
+                                            position, line, column, position + 1, endLine, endCol));
                                     validEscape = false;
                                     break;
                                 }
@@ -978,25 +1038,21 @@ public final class GdTokenizer {
                         }
                         case '\r' -> {
                             if (peek() != '\n') {
-                                // Carriage return without newline in string; Godot
-                                // leniently consumes the following character as well.
+                                // Carriage return without newline in string; leniently
+                                // consumes the following character as well.
                                 advance();
                             } else {
-                                // Escaping newline (CRLF): the '\n' itself is consumed by
-                                // the shared plain-character path below, which bumps the
-                                // line counter again (Godot behavior kept as-is).
+                                // Escaping CRLF newline: consume '\n' and advance line once.
+                                advance();
                                 newline(false);
                                 validEscape = false;
                             }
                         }
-                        case '\n' -> {
-                            // Escaping newline.
-                            newline(false);
-                            validEscape = false;
-                        }
+                        // Line break was already counted immediately after consuming '\n'.
+                        case '\n' -> validEscape = false;
                         default -> {
-                            pushError(newToken(GdTokenType.ERROR, GdLiteralKind.NONE,
-                                    "Invalid escape in string.", tokenStart, line, column - 2, line, column));
+                            pushError(makeSpanError("Invalid escape in string.",
+                                    escapeStart, escapeStartLine, escapeStartColumn, position, line, column));
                             validEscape = false;
                         }
                     }
@@ -1006,38 +1062,44 @@ public final class GdTokenizer {
                         if ((escaped & 0xfffffc00) == 0xd800) {
                             if (prevSurrogate == 0) {
                                 prevSurrogate = escaped;
-                                prevColumn = column - 2;
-                                prevLine = line;
+                                prevSurrogateStart = escapeStart;
+                                prevSurrogateEnd = position;
+                                prevSurrogateStartLine = escapeStartLine;
+                                prevSurrogateStartColumn = escapeStartColumn;
+                                prevSurrogateEndLine = line;
+                                prevSurrogateEndColumn = column;
                                 continue;
                             } else {
-                                pushError(newToken(GdTokenType.ERROR, GdLiteralKind.NONE,
+                                pushError(makeSpanError(
                                         "Invalid UTF-16 sequence in string, unpaired lead surrogate.",
-                                        tokenStart, line, column - 2, line, column));
+                                        escapeStart, escapeStartLine, escapeStartColumn, position, line, column));
                                 prevSurrogate = 0;
                             }
                         } else if ((escaped & 0xfffffc00) == 0xdc00) {
                             if (prevSurrogate == 0) {
-                                pushError(newToken(GdTokenType.ERROR, GdLiteralKind.NONE,
+                                pushError(makeSpanError(
                                         "Invalid UTF-16 sequence in string, unpaired trail surrogate.",
-                                        tokenStart, line, column - 2, line, column));
+                                        escapeStart, escapeStartLine, escapeStartColumn, position, line, column));
                             } else {
                                 // Pair completed; the combined code point is unused.
                                 prevSurrogate = 0;
                             }
                         }
                         if (prevSurrogate != 0) {
-                            pushError(newToken(GdTokenType.ERROR, GdLiteralKind.NONE,
+                            pushError(makeSpanError(
                                     "Invalid UTF-16 sequence in string, unpaired lead surrogate.",
-                                    tokenStart, prevLine, prevColumn, prevLine, prevColumn + 2));
+                                    prevSurrogateStart, prevSurrogateStartLine, prevSurrogateStartColumn,
+                                    prevSurrogateEnd, prevSurrogateEndLine, prevSurrogateEndColumn));
                             prevSurrogate = 0;
                         }
                     }
                 }
             } else if (ch == quoteChar) {
                 if (prevSurrogate != 0) {
-                    pushError(newToken(GdTokenType.ERROR, GdLiteralKind.NONE,
+                    pushError(makeSpanError(
                             "Invalid UTF-16 sequence in string, unpaired lead surrogate",
-                            tokenStart, prevLine, prevColumn, prevLine, prevColumn + 2));
+                            prevSurrogateStart, prevSurrogateStartLine, prevSurrogateStartColumn,
+                            prevSurrogateEnd, prevSurrogateEndLine, prevSurrogateEndColumn));
                     prevSurrogate = 0;
                 }
                 advance();
@@ -1055,9 +1117,10 @@ public final class GdTokenizer {
                 }
             } else {
                 if (prevSurrogate != 0) {
-                    pushError(newToken(GdTokenType.ERROR, GdLiteralKind.NONE,
+                    pushError(makeSpanError(
                             "Invalid UTF-16 sequence in string, unpaired lead surrogate",
-                            tokenStart, prevLine, prevColumn, prevLine, prevColumn + 2));
+                            prevSurrogateStart, prevSurrogateStartLine, prevSurrogateStartColumn,
+                            prevSurrogateEnd, prevSurrogateEndLine, prevSurrogateEndColumn));
                     prevSurrogate = 0;
                 }
                 advance();
@@ -1181,12 +1244,12 @@ public final class GdTokenizer {
         return newToken(GdTokenType.ERROR, GdLiteralKind.NONE, message, tokenStart, startLine, startColumn, line, column);
     }
 
-    /// Error token located at the current character, mirroring number()/string() error
-    /// sites that override `start_column = column` / `end_column = column + 1` after
-    /// `make_error(...)` (lines stay on the token's start/end lines).
-    private GdToken makeErrorAtColumn(String message) {
-        return newToken(GdTokenType.ERROR, GdLiteralKind.NONE, message,
-                tokenStart, startLine, column, line, column + 1);
+    /// Error token covering an explicit sub-span inside a multi-character literal.
+    private GdToken makeSpanError(String message, int startIndex, int startLine, int startColumn,
+                                  int endIndex, int endLine, int endColumn) {
+        return new GdToken(GdTokenType.ERROR, "", GdLiteralKind.NONE, message,
+                byteOffsets[startIndex], byteOffsets[endIndex],
+                startLine, startColumn, endLine, endColumn);
     }
 
     /// Whitespace-phase error anchored at the just-consumed character (used for stray
@@ -1197,23 +1260,51 @@ public final class GdTokenizer {
                 byteOffsets[position - 1], byteOffsets[position], line, column - 1, line, column);
     }
 
-    /// Indentation-phase error covering the current line's leading whitespace, with
-    /// Godot's coordinate overrides (`start_line = line`, `start_column = 1`).
-    private GdToken makeIndentError(String message, int endColumn) {
+    /// Indentation-phase error covering the current line's leading whitespace.
+    private GdToken makeIndentError(String message) {
         var lineStartIndex = position - (column - 1);
         return new GdToken(GdTokenType.ERROR, "", GdLiteralKind.NONE, message,
-                byteOffsets[lineStartIndex], byteOffsets[position], line, 1, line, endColumn);
+                byteOffsets[lineStartIndex], byteOffsets[position], line, 1, line, column);
     }
 
-    /// Port of `make_paren_error()`: mismatched closing brackets also pop the opener.
-    private GdToken makeParenError(int paren) {
-        if (parenStack.isEmpty()) {
-            return makeError("Closing \"" + codePointToString(paren) + "\" doesn't have an opening counterpart.");
+    /// Closer handler:
+    /// - Managed mode: emits the real closer token directly in O(1) without touching `parenStack`.
+    /// - Standalone mode:
+    ///   1. Empty stack: emits orphan-closer ERROR.
+    ///   2. Top matches: pops top once and emits the real closer token.
+    ///   3. Ancestor exists: unwinds down to and including the nearest matching ancestor,
+    ///      and emits an ERROR naming every unclosed opener skipped along the way.
+    ///   4. No ancestor: pops only the mismatched top and emits an ERROR naming it.
+    private GdToken handleCloser(int closerChar, int expectedOpener, GdTokenType tokenType) {
+        if (emitRawClosers) {
+            return makeToken(tokenType);
         }
-        var error = makeError("Closing \"" + codePointToString(paren) + "\" doesn't match the opening \""
-                + codePointToString(parenStack.getLast()) + "\".");
-        parenStack.removeLast(); // Remove opening one anyway.
-        return error;
+        if (parenStack.isEmpty()) {
+            return makeError("Closing \"" + codePointToString(closerChar) + "\" doesn't have an opening counterpart.");
+        }
+        var top = parenStack.getLast();
+        if (top == expectedOpener) {
+            popTopParen();
+            return makeToken(tokenType);
+        }
+        var expectedStack = openerIndexStack(expectedOpener);
+        if (expectedStack != null && !expectedStack.isEmpty()) {
+            var matchIndex = expectedStack.getLast();
+            var skipped = new StringBuilder();
+            for (var i = matchIndex + 1; i < parenStack.size(); i++) {
+                if (!skipped.isEmpty()) {
+                    skipped.append(", ");
+                }
+                skipped.append('"').appendCodePoint(parenStack.get(i)).append('"');
+            }
+            while (parenStack.size() > matchIndex) {
+                popTopParen();
+            }
+            return makeError("Closing \"" + codePointToString(closerChar) + "\" skips unclosed " + skipped + ".");
+        }
+        var displaced = popTopParen();
+        return makeError("Closing \"" + codePointToString(closerChar) + "\" doesn't match the opening \""
+                + codePointToString(displaced) + "\".");
     }
 
     // --- Cursor primitives -------------------------------------------------------------
@@ -1235,34 +1326,45 @@ public final class GdTokenizer {
         return peek(0);
     }
 
-    /// Port of `_advance()`: consumes one code point and returns it. Consuming the last
-    /// character triggers Godot's EOF hook: synthesize the final newline and settle
-    /// indentation (this is why a trailing newline bumps the line counter twice — the
-    /// hook and the explicit call site both run; kept for coordinate fidelity).
+    /// Consumes one code point and advances physical `position` and `column` without
+    /// mutating line state or synthesizing EOF layout.
     private int advance() {
         if (isAtEnd()) {
             return 0;
         }
         position++;
         column++;
-        if (isAtEnd()) {
-            // Add extra newline even if it's not there, to satisfy the parser.
-            newline(true);
-            // Also add needed unindent.
-            checkIndent();
-        }
         return peek(-1);
     }
 
-    private void pushParen(int paren) {
-        parenStack.add(paren);
+    private @Nullable List<Integer> openerIndexStack(int opener) {
+        return switch (opener) {
+            case '(' -> openParenIndices;
+            case '[' -> openBracketIndices;
+            case '{' -> openBraceIndices;
+            default -> null;
+        };
     }
 
-    private boolean popParen(int expected) {
-        if (parenStack.isEmpty()) {
-            return false;
+    private void pushParen(int paren) {
+        if (emitRawClosers) {
+            return;
         }
-        return parenStack.removeLast() == expected;
+        var index = parenStack.size();
+        parenStack.add(paren);
+        var stack = openerIndexStack(paren);
+        if (stack != null) {
+            stack.add(index);
+        }
+    }
+
+    private int popTopParen() {
+        var top = parenStack.removeLast();
+        var stack = openerIndexStack(top);
+        if (stack != null) {
+            stack.removeLast();
+        }
+        return top;
     }
 
     private boolean hasError() {
