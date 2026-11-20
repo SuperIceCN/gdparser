@@ -102,7 +102,38 @@ class GdScriptParserRangeInvariantTest {
             "class Inner:\r\nvar x = 1\r\n",
             "class Inner: # c  \nvar x = 1\n",
             "class Inner: # c  \r\nvar x = 1\r\n",
-            "func f():\r\nvar x = 1\r\n"
+            "func f():\r\nvar x = 1\r\n",
+            // Escaped multiline groupings, mismatched closers, header-to-suite layout replay,
+            // outer type-bracket boundaries, and UTF-8 multi-byte payloads.
+            "var a = [1,\nvar b = 2\n",
+            "func f():\n\tprint(1\n\tprint(2)\nvar after = 2\n",
+            "func f(a, b:\n\tpass\nvar after = 2\n",
+            "var g = foo([1)\n",
+            "var h = [1)\n",
+            "var x = g(func() -> Array[, node.\n\tpa)\n",
+            "var s = [\"😀中文\", \r\nvar t = 1\r\n",
+            "func f():\n\tmatch x:\n\t\t[\n\t\t\t" + "[".repeat(254) + "1"
+                    + "]".repeat(254) + "\n\t\t]:\n\t\t\tpass\n\t\t_: return 7\n"
+                    + "\tvar local_after = 7\nvar after = 2\n",
+            // Truncated lambdas at EOF, equal-indent depth trip, suffix escape, unclosed match
+            // patterns, damaged Dictionary return type, inline lambda replacement closer, and
+            // backslash continuation across comment-only lines.
+            "func f():\n\tvar x = g(func(): pass",
+            "func f():\n\tvar x = g(func():\n\t\tpass",
+            "func f():\n\tvar x = g(func()",
+            "func f():\n\tvar x = [" + "(".repeat(260) + "\n\t1\n\t" + ")".repeat(260) + "]\n",
+            "func f():\n\tvar x = (a.\n\tvar y = 2\nvar after = 3\n",
+            "func f():\n\tvar x = (foo.bar\n[2]\n",
+            "func f():\n\tmatch x:\n\t\t[1,\n\tvar local_after = 7\nvar after = 2\n",
+            "func f():\n\tmatch x:\n\t\t{\"a\": 1,\n\tvar local_after = 7\nvar after = 2\n",
+            "var x = g(func() -> Dictionary[String, node.pa)\n",
+            "var x = g(func(): pass]\n",
+            "var x = g(func(): super.]\n",
+            "var x = g(func():\n\tpass]\n\treturn 1\n)\n",
+            "var x = g(func():\n\tvar cb = func(): pass]\n\treturn 1\n)\n",
+            "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "\n\t1\n\t\t" + "]".repeat(260)
+                    + ": pass\n\t\t_:\n\t\t\tpass\n\tvar local_after = 1\nvar after = 2\n",
+            "func f():\n\tvar x = (a.\\\n\t\t# note\n\t\tmatch\n\tvar y = 2\n"
     );
 
     @Test

@@ -8,6 +8,8 @@ import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AstMappingResult;
 import dev.superice.gdparser.frontend.ast.AttributeExpression;
+import dev.superice.gdparser.frontend.ast.AttributePropertyStep;
+import dev.superice.gdparser.frontend.ast.AttributeSubscriptStep;
 import dev.superice.gdparser.frontend.ast.BinaryExpression;
 import dev.superice.gdparser.frontend.ast.CallExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
@@ -27,7 +29,9 @@ import dev.superice.gdparser.frontend.ast.MissingAttributeStep;
 import dev.superice.gdparser.frontend.ast.Node;
 import dev.superice.gdparser.frontend.ast.Parameter;
 import dev.superice.gdparser.frontend.ast.PassStatement;
+import dev.superice.gdparser.frontend.ast.PatternBindingExpression;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
+import dev.superice.gdparser.frontend.ast.TypeRef;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import dev.superice.gdparser.frontend.ast.WhileStatement;
 import dev.superice.gdparser.frontend.cst.CstIssueKind;
@@ -153,8 +157,8 @@ class GdScriptParserErrorRecoveryTest {
         var body = onlyFunction(result).body().statements();
         assertEquals(1, body.size(), () -> "body: " + body);
         assertEquals("y", assertInstanceOf(VariableDeclaration.class, body.getFirst()).name());
-        assertTrue(errorMessages(result).stream().anyMatch(m -> m.startsWith("Expected statement, found ")),
-                () -> errorMessages(result).toString());
+        var closerDiag = findErrorByCode(result, DiagnosticCodes.UNEXPECTED_CLOSER);
+        assertEquals("Unexpected closing \")\".", closerDiag.message());
     }
 
     @Test
@@ -722,10 +726,8 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void matchPatternDepthTripWithMultilineBodyKeepsSibling() {
-        // Same trip as matchPatternDepthTripKeepsNextBranchAndSibling but with the branch body
-        // on its own line: synchronization may stop at the match's closing DEDENT, which the
-        // loop must re-check before parsing another section. The tripped branch's body line
-        // belongs to the poisoned region and is consumed with it.
+        // Bounded depth-trip unwinding settles matching closers before releasing the branch colon,
+        // so both the real `]:` body and the outer top-level sibling survive.
         for (var depth : List.of(253, 254)) {
             var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(depth) + "1" + "]".repeat(depth)
                     + ":\n\t\t\tpass\nvar after = 2\n";
@@ -736,14 +738,13 @@ class GdScriptParserErrorRecoveryTest {
             assertEquals(1, match.sections().size(), () -> "depth " + depth + ": " + match.sections());
             var body = match.sections().getFirst().body().statements();
             if (depth >= 254) {
-                assertTrue(errorMessages(result).contains("Maximum nesting depth exceeded."),
-                        () -> "depth " + depth + ": " + errorMessages(result));
-                assertTrue(body.isEmpty(), () -> "depth " + depth + ": " + body);
+                var depthDiag = findErrorByCode(result, DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+                assertEquals("Maximum nesting depth exceeded.", depthDiag.message());
             } else {
                 assertEquals(List.of(), errorMessages(result), () -> "depth " + depth);
-                assertEquals(1, body.size(), () -> "depth " + depth + ": " + body);
-                assertInstanceOf(PassStatement.class, body.getFirst());
             }
+            assertEquals(1, body.size(), () -> "depth " + depth + ": " + body);
+            assertInstanceOf(PassStatement.class, body.getFirst());
         }
     }
 
@@ -790,14 +791,29 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void multilinePoisonedPatternTerminatesWithDiagnostics() {
-        // Known limitation: a depth trip on a grouping continuation line
-        // breaks sibling scope attribution — the aborted frames pop multiline mode before
-        // consuming the grouping remainder, so the continuation's DEDENT becomes an orphan no
-        // parsed frame owns. Godot has no depth limit and thus no such path. Only termination
-        // and diagnostics are pinned here, NOT the (incorrect) scope attribution.
-        recoverableParse("func f():\n\tmatch x:\n\t\t[\n\t\t\t" + "[".repeat(254) + "1"
+        // Bounded unwinding keeps the outer `[` multiline owner active across the depth trip so
+        // `\t\t]:` closes cleanly without diagnostic flooding, `_: return 7` stays a branch of the
+        // same `match`, `local_after` stays in `f`, and `after` stays top-level.
+        var result = parse("func f():\n\tmatch x:\n\t\t[\n\t\t\t" + "[".repeat(254) + "1"
                 + "]".repeat(254) + "\n\t\t]:\n\t\t\tpass\n\t\t_: return 7\n"
                 + "\tvar local_after = 7\nvar after = 2\n");
+        var depthDiag = findErrorByCode(result, DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+        assertEquals("Maximum nesting depth exceeded.", depthDiag.message());
+        assertEquals(1, errorsOf(result).size(), () -> "unexpected diagnostic flood: " + errorsOf(result));
+        assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+
+        var function = (FunctionDeclaration) result.ast().statements().getFirst();
+        var fnStatements = function.body().statements();
+        assertEquals(2, fnStatements.size(), () -> fnStatements.toString());
+        var match = assertInstanceOf(MatchStatement.class, fnStatements.getFirst());
+        assertEquals(2, match.sections().size(), () -> match.sections().toString());
+        assertInstanceOf(PassStatement.class, match.sections().getFirst().body().statements().getFirst());
+        var fallbackReturn = assertInstanceOf(ReturnStatement.class,
+                match.sections().get(1).body().statements().getFirst());
+        assertEquals("7", assertInstanceOf(LiteralExpression.class, fallbackReturn.value()).sourceText());
+
+        var localAfter = assertInstanceOf(VariableDeclaration.class, fnStatements.get(1));
+        assertEquals("local_after", localAfter.name());
     }
 
     @Test
@@ -1276,11 +1292,11 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void survivingAssertAbsorbsSyncKeywordIntoMessageSlot() {
-        // C2's intentional sync-set difference: today's failure path stops synchronization
-        // before `func` (a sync token); the surviving assert instead parses `func(): pass` as
-        // its message slot. (The pre-existing panic tail hook then consumes the assert's own
-        // `)`, so the closer diagnostic appears as well.)
+        // `func` is a sync keyword, so `assert(1+, func(): pass)` parses `func(): pass` as its
+        // message slot and cleanly settles `)` with only the inner `+` error.
         var result = recoverableParse("func f():\n\tassert(1+, func(): pass)\n");
+        assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(result),
+                () -> errorMessages(result).toString());
         var statement = assertInstanceOf(AssertStatement.class,
                 onlyFunction(result).body().statements().getFirst());
         assertInstanceOf(BinaryExpression.class, statement.condition());
@@ -1492,10 +1508,12 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void lambdaBoundariesIsolateDamage() {
-        // `foo(1+, func(): pass)`: the lambda is a healthy argument despite the damaged sibling.
-        // (The pre-existing panic tail hook then consumes the call's `)`, so the closer
-        // diagnostic appears too — pinned as current recovery behavior.)
+        // `foo(1+, func(): pass)`: per-frame pendingSync keeps the damage inside the first
+        // argument's frame without polluting `foo(...)`, so `)` settles cleanly with zero phantom
+        // missing-closer diagnostics.
         var result = recoverableParse("func f():\n\tfoo(1+, func(): pass)\n");
+        assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(result),
+                () -> errorMessages(result).toString());
         var statement = assertInstanceOf(ExpressionStatement.class,
                 onlyFunction(result).body().statements().getFirst());
         var call = assertInstanceOf(CallExpression.class, statement.expression());
@@ -1503,12 +1521,12 @@ class GdScriptParserErrorRecoveryTest {
         assertInstanceOf(BinaryExpression.class, call.arguments().getFirst());
         assertInstanceOf(LambdaExpression.class, call.arguments().get(1));
 
-        // `var x = func(a = 1+): pass + 2`: the lambda prefix is always Ok and the pending
-        // lambda end stops the fold, so `+ 2` is not folded into the lambda (it is consumed by
-        // the enclosing panic synchronization).
+        // `var x = func(a = 1+): pass + 2`: damage inside the lambda signature stays isolated to
+        // its parameter list, so the trailing `+ 2` after the lambda's single-line body is still
+        // diagnosed in the enclosing class body rather than masked by global panic state.
         var lambdaDefault = recoverableParse("var x = func(a = 1+): pass + 2\n");
-        assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(lambdaDefault),
-                () -> errorMessages(lambdaDefault).toString());
+        assertEquals(List.of("Expected expression after \"+\" operator.", "Unexpected \"+\" in class body."),
+                errorMessages(lambdaDefault), () -> errorMessages(lambdaDefault).toString());
         var variable = assertInstanceOf(VariableDeclaration.class,
                 lambdaDefault.ast().statements().getFirst());
         assertInstanceOf(LambdaExpression.class, variable.value());
@@ -1526,21 +1544,33 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void groupingPureMissingDoesNotConsumeCloser() {
-        // `var x = ()`: the inner expression is absent, so the grouping fails without consuming
-        // `)`; the variable's initializer holds a MISSING marker and the statement tail reports
-        // the leftover closer (no missing-closer diagnostic: the grouping never opened content).
+        // `var x = ()`: empty grouping settles its own `)` cleanly with only the content error,
+        // `foo((), 1)` preserves the second argument, `(1+)` settles its own `)`, and `var x = (\n`
+        // keeps a single primary diagnostic without emitting a duplicate missing-closer error.
         var result = recoverableParse("func f():\n\tvar x = ()\n");
-        assertTrue(errorMessages(result).contains("Expected grouping expression."),
-                () -> errorMessages(result).toString());
-        assertTrue(errorMessages(result).contains("Expected end of statement after variable declaration, found \")\" instead."),
+        assertEquals(List.of("Expected grouping expression."), errorMessages(result),
                 () -> errorMessages(result).toString());
         var body = onlyFunction(result).body().statements();
         var marker = assertInstanceOf(ErrorExpression.class,
                 assertInstanceOf(VariableDeclaration.class, body.getFirst()).value());
         assertEquals("grouping", marker.nodeType());
 
-        // `var x = (\n`: the pending newline is consumed by the multiline push; the inner parse
-        // at EOF reports once and the declaration survives.
+        var callResult = recoverableParse("func f():\n\tfoo((), 1)\n");
+        assertEquals(List.of("Expected grouping expression."), errorMessages(callResult),
+                () -> errorMessages(callResult).toString());
+        var call = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(ExpressionStatement.class, onlyFunction(callResult).body().statements().getFirst())
+                        .expression());
+        assertEquals(2, call.arguments().size());
+        assertInstanceOf(ErrorExpression.class, call.arguments().getFirst());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+
+        var damagedGrouping = recoverableParse("var x = (1+)\n");
+        assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(damagedGrouping),
+                () -> errorMessages(damagedGrouping).toString());
+        assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, damagedGrouping.ast().statements().getFirst()).value());
+
         var open = recoverableParse("var x = (\n");
         assertEquals(List.of("Expected grouping expression."), errorMessages(open),
                 () -> errorMessages(open).toString());
@@ -1687,6 +1717,623 @@ class GdScriptParserErrorRecoveryTest {
         assertNotNull(groupingDiag.recovery());
         assertSame(groupingNode, groupingDiag.recovery().owner());
         assertEquals("variable.initializer", groupingDiag.recovery().facet());
+    }
+
+    @Test
+    void unclosedContainersStopAtOuterDeclarationsAndStatementBoundaries() {
+        var arrayEscape = recoverableParse("""
+                var a = [1,
+                # comment with ] } )
+                var s = "string with ] and if x:"
+                var r = r"raw \\"]"
+                enum E { A, B }
+                func next_fn():
+                \tpass
+                """);
+        var declStatements = arrayEscape.ast().statements().stream()
+                .filter(s -> !(s instanceof CommentStatement))
+                .toList();
+        assertEquals(5, declStatements.size(), () -> declStatements.toString());
+        assertEquals("a", assertInstanceOf(VariableDeclaration.class, declStatements.getFirst()).name());
+        assertEquals("s", assertInstanceOf(VariableDeclaration.class, declStatements.get(1)).name());
+        assertEquals("r", assertInstanceOf(VariableDeclaration.class, declStatements.get(2)).name());
+        assertEquals("E", assertInstanceOf(EnumDeclaration.class, declStatements.get(3)).name());
+        assertEquals("next_fn", assertInstanceOf(FunctionDeclaration.class, declStatements.get(4)).name());
+        findErrorByCode(arrayEscape, DiagnosticCodes.MISSING_CLOSER_ARRAY);
+
+        var dictAndAnnotEscape = recoverableParse("""
+                var d = {
+                \t"k": 1,
+                @export
+                var exported = 2
+                """);
+        assertEquals(List.of("d", "AnnotationStatement", "exported"), topLevelMemberNames(dictAndAnnotEscape));
+        assertInstanceOf(AnnotationStatement.class, dictAndAnnotEscape.ast().statements().get(1));
+        var exportedVar = assertInstanceOf(VariableDeclaration.class, dictAndAnnotEscape.ast().statements().get(2));
+        assertEquals("exported", exportedVar.name());
+        findErrorByCode(dictAndAnnotEscape, DiagnosticCodes.MISSING_CLOSER_DICTIONARY);
+
+        // Statement-head `if cond:` must stop an unclosed grouping, whereas a ternary inside a
+        // valid multiline expression must NOT stop early.
+        var ifHeadEscape = recoverableParse("""
+                func f(cond):
+                \tvar x = (1 +
+                \tif cond:
+                \t\treturn 1
+                var after = 2
+                """);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(ifHeadEscape));
+        var ifFn = assertInstanceOf(FunctionDeclaration.class, ifHeadEscape.ast().statements().getFirst());
+        var fnBody = ifFn.body().statements();
+        assertEquals(2, fnBody.size(), () -> fnBody.toString());
+        assertInstanceOf(VariableDeclaration.class, fnBody.getFirst());
+        assertInstanceOf(IfStatement.class, fnBody.get(1));
+        findErrorByCode(ifHeadEscape, DiagnosticCodes.MISSING_CLOSER_GROUPING);
+
+        var validTernaryAndLambda = parse("""
+                var x = (1 if
+                \ttrue else 2)
+                var y = foo(
+                \tfunc():
+                \t\treturn 1,
+                \t2
+                )
+                """);
+        assertEquals(List.of(), errorMessages(validTernaryAndLambda),
+                () -> errorMessages(validTernaryAndLambda).toString());
+        assertEquals(List.of("x", "y"), topLevelMemberNames(validTernaryAndLambda));
+    }
+
+    @Test
+    void nestedUnclosedPrintAndCloserReplacementFollowOwnershipRules() {
+        // In `print(1\n\tprint(2)`, the single `)` belongs strictly to inner `print(2)` while outer
+        // `print(1` reports missing `)` and yields to `var after = 2`.
+        var nestedPrint = recoverableParse("""
+                func f():
+                \tprint(1
+                \tprint(2)
+                var after = 2
+                """);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(nestedPrint));
+        var outerMissing = findErrorByCode(nestedPrint, DiagnosticCodes.MISSING_CLOSER_CALL);
+        assertEquals("Expected closing \")\" after call arguments.", outerMissing.message());
+        var printFn = assertInstanceOf(FunctionDeclaration.class, nestedPrint.ast().statements().getFirst());
+        assertEquals(2, printFn.body().statements().size());
+
+        // Ancestor closer takes precedence over a single-layer mismatch: `foo([1)` closes `foo(...)`
+        // and reports missing `]` on `[1`.
+        var ancestorOwned = recoverableParse("var x = foo([1)\n");
+        findErrorByCode(ancestorOwned, DiagnosticCodes.MISSING_CLOSER_ARRAY);
+        assertTrue(errorsOf(ancestorOwned).stream()
+                .noneMatch(d -> DiagnosticCodes.MISMATCHED_CLOSER_ARRAY.equals(d.code())));
+        var call = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, ancestorOwned.ast().statements().getFirst()).value());
+        assertEquals(1, call.arguments().size());
+        assertInstanceOf(ArrayExpression.class, call.arguments().getFirst());
+
+        // Unowned closer triggers single-layer replacement: `[1)` reports `MISMATCHED_CLOSER_ARRAY`.
+        var singleReplacement = recoverableParse("var x = [1)\n");
+        var mismatchDiag = findErrorByCode(singleReplacement, DiagnosticCodes.MISMATCHED_CLOSER_ARRAY);
+        assertEquals("Expected \"]\" to close array elements, found \")\" instead.", mismatchDiag.message());
+    }
+
+    @Test
+    void bidirectionalLayoutReplayHandlesIndentDedentCommentsCrlfBackslashAndLambdas() {
+        // Header escape where parameter list omits `)` before `:\n\tpass` recovers body & sibling.
+        var headerEscape = recoverableParse("""
+                func f(a, b = 1:
+                \tpass
+                var after = 2
+                """);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(headerEscape));
+        var fDecl = assertInstanceOf(FunctionDeclaration.class, headerEscape.ast().statements().getFirst());
+        assertEquals(2, fDecl.parameters().size());
+        assertEquals(1, fDecl.body().statements().size());
+        assertInstanceOf(PassStatement.class, fDecl.body().statements().getFirst());
+        findErrorByCode(headerEscape, DiagnosticCodes.MISSING_CLOSER_PARAMETER_LIST);
+
+        // Unclosed grouping directly before an indented `pass` line triggers `NEWLINE + INDENT`
+        // layout replay on escape so `pass` still enters a clean block/statement sequence.
+        var replayIndent = recoverableParse("""
+                func f():
+                \tvar x = (1 +
+                \t\tpass
+                var after = 2
+                """);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(replayIndent));
+        findErrorByCode(replayIndent, DiagnosticCodes.MISSING_CLOSER_GROUPING);
+
+        // CRLF + comment-only lines inside escaped grouping replay `NEWLINE + DEDENT` cleanly.
+        var crlfAndComments = recoverableParse("func f():\r\n\tvar x = (1 +\r\n\t# inside\r\n\t2\r\n# outer\r\nvar after = 2\r\n");
+        assertEquals(List.of("f", "CommentStatement", "after"), topLevelMemberNames(crlfAndComments));
+        findErrorByCode(crlfAndComments, DiagnosticCodes.MISSING_CLOSER_GROUPING);
+
+        // Explicit backslash continuation across lines stays part of the expression rather than
+        // triggering a premature line-start escape.
+        var backslashValid = parse("var x = (1 + \\\n\t2)\n");
+        assertEquals(List.of(), errorMessages(backslashValid),
+                () -> errorMessages(backslashValid).toString());
+
+        // Nested multiline lambda snapshot inside an outer escaped call still restores `indentStackStack`.
+        var lambdaInsideCall = recoverableParse("""
+                func f():
+                \tvar x = g(
+                \t\tfunc():
+                \t\t\treturn 1
+                \tvar local_after = 2
+                var after = 3
+                """);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(lambdaInsideCall));
+        var lambdaFn = assertInstanceOf(FunctionDeclaration.class, lambdaInsideCall.ast().statements().getFirst());
+        assertEquals(2, lambdaFn.body().statements().size());
+    }
+
+    @Test
+    void typeBracketBoundaryIsolatesOuterCommaAndBodylessLambda() {
+        var multiline = recoverableParse("""
+                var x = g(func() -> Array[
+                ,
+                \tnode.
+                \tpa
+                )
+                """);
+        var multilineCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, multiline.ast().statements().getFirst()).value());
+        assertEquals(2, multilineCall.arguments().size());
+        var bodylessLambda = assertInstanceOf(LambdaExpression.class, multilineCall.arguments().getFirst());
+        assertTrue(bodylessLambda.body().statements().isEmpty());
+        assertInstanceOf(AttributeExpression.class, multilineCall.arguments().get(1));
+
+        var validDictType = parse("var d: Dictionary[String, int] = {}\n");
+        assertEquals(List.of(), errorMessages(validDictType), () -> errorMessages(validDictType).toString());
+    }
+
+    @Test
+    void depthTripUnclosedContainersAndTypeBracketsTerminateWithoutCascade() {
+        var unclosedMatch = recoverableParse("func f():\n\tmatch x:\n\t\t[\n\t\t\t"
+                + "[".repeat(254) + "1\n\t\t_: return 7\n\tvar local_after = 7\nvar after = 2\n");
+        findErrorByCode(unclosedMatch, DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+        assertEquals(0, errorsOf(unclosedMatch).stream()
+                .filter(d -> DiagnosticCodes.MISSING_CLOSER_MATCH_ARRAY_PATTERN.equals(d.code()))
+                .count());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(unclosedMatch));
+        var fn = assertInstanceOf(FunctionDeclaration.class, unclosedMatch.ast().statements().getFirst());
+        var fnStatements = fn.body().statements();
+        assertEquals(2, fnStatements.size());
+        var match = assertInstanceOf(MatchStatement.class, fnStatements.getFirst());
+        assertEquals(2, match.sections().size());
+        assertInstanceOf(ReturnStatement.class, match.sections().get(1).body().statements().getFirst());
+        assertEquals("local_after", assertInstanceOf(VariableDeclaration.class, fnStatements.get(1)).name());
+
+        var deepType = recoverableParse("var x: " + "Array[".repeat(260) + "int" + "]".repeat(260)
+                + "\nvar after = 2\n");
+        findErrorByCode(deepType, DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+        assertEquals(List.of("x", "after"), topLevelMemberNames(deepType));
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void lazyBracketOracleCapsScansAtOneAndParserReuseMaintainsI4StackBalance() {
+        var parser = new GdScriptParser();
+
+        // Healthy parse never invokes the bracket oracle (`scanCount == 0`).
+        var healthy = parser.parse("var x = (1 +\n\t2)\n");
+        assertEquals(List.of(), errorMessages(healthy));
+        assertEquals(0, parser.bracketOracleScanCount());
+
+        // Large 250-line unclosed multiline container scans the source at most once (`I2`).
+        var longBody = new StringBuilder("func f():\n\tvar arr = [\n");
+        for (var i = 0; i < 240; i++) {
+            longBody.append("\t\t").append(i).append(",\n");
+        }
+        longBody.append("var after = 2\n");
+        var largeResult = parser.parse(longBody.toString());
+        assertTrue(parser.bracketOracleScanCount() <= 1,
+                () -> "expected <= 1 oracle scan, got " + parser.bracketOracleScanCount());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(largeResult));
+
+        // Reusing the same parser across EOF cuts, mismatched closers, depth trips, and lambda
+        // escapes must always restore all parser and tokenizer stacks (`I4`).
+        for (var input : List.of(
+                "var eof = (\n",
+                "var mismatch = [1)\n",
+                "var deep = " + "(".repeat(280) + "1\nvar ok = 1\n",
+                "var lam = g(func(): super., 1)\n",
+                "var clean = 42\n"
+        )) {
+            var res = parser.parse(input);
+            assertNotNull(res.ast());
+        }
+        var finalClean = parser.parse("var final_ok = 1\n");
+        assertEquals(List.of(), errorMessages(finalClean));
+        assertEquals(List.of("final_ok"), topLevelMemberNames(finalClean));
+    }
+
+    @Test
+    void truncatedLambdasInsideIndentedSuitesRecoverWithoutCrashingAtEof() {
+        var parser = new GdScriptParser();
+        for (var source : List.of(
+                "func f():\n\tvar x = g(func(): pass",
+                "func f():\n\tvar x = g(func():\n\t\tpass",
+                "func f():\n\tvar x = g(func()",
+                "func f():\n\tvar x = g(func():\n\t\tvar y = h(func(): pass"
+        )) {
+            var result = parser.parse(source);
+            var fn = onlyFunction(result);
+            assertEquals("f", fn.name());
+            var x = assertInstanceOf(VariableDeclaration.class, fn.body().statements().getFirst());
+            assertEquals("x", x.name());
+            assertInstanceOf(CallExpression.class, x.value());
+            assertFalse(errorsOf(result).isEmpty());
+        }
+        // Reusing the same parser immediately afterward confirms clean layout/stack restoration.
+        var clean = parser.parse("var after_eof = 1\n");
+        assertEquals(List.of(), errorMessages(clean));
+        assertEquals(List.of("after_eof"), topLevelMemberNames(clean));
+    }
+
+    @Test
+    void depthTripInsidePairedMultilineContainersAcceptsEqualAndDeeperContinuations() {
+        var equalIndent = recoverableParse("func f():\n\tvar x = ["
+                + "(".repeat(260) + "\n\t1\n\t" + ")".repeat(260) + "]\n");
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(equalIndent).stream().map(AstDiagnostic::code).toList());
+        assertEquals("f", onlyFunction(equalIndent).name());
+
+        var deeperIndent = recoverableParse("func f():\n\tvar x = ["
+                + "(".repeat(260) + "\n\t\t1\n\t\t" + ")".repeat(260) + "]\n");
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(deeperIndent).stream().map(AstDiagnostic::code).toList());
+
+        var inMatch = recoverableParse("func f():\n\tmatch x:\n\t\t["
+                + "(".repeat(260) + "\n\t\t1\n\t\t" + ")".repeat(260)
+                + "]:\n\t\t\tpass\n\t\t_: return 7\n\tvar local_after = 7\nvar after = 2\n");
+        findErrorByCode(inMatch, DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(inMatch));
+        var fn = assertInstanceOf(FunctionDeclaration.class, inMatch.ast().statements().getFirst());
+        var match = assertInstanceOf(MatchStatement.class, fn.body().statements().getFirst());
+        assertEquals(2, match.sections().size());
+        assertInstanceOf(ReturnStatement.class, match.sections().get(1).body().statements().getFirst());
+        assertEquals("local_after", assertInstanceOf(VariableDeclaration.class, fn.body().statements().get(1)).name());
+
+        var unclosed = recoverableParse("func f():\n\tvar x = ["
+                + "(".repeat(260) + "\n\t1\n\tvar y = 2\nvar after = 3\n");
+        findErrorByCode(unclosed, DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(unclosed));
+        var unclosedFn = assertInstanceOf(FunctionDeclaration.class, unclosed.ast().statements().getFirst());
+        assertEquals(List.of("x", "y"), unclosedFn.body().statements().stream()
+                .filter(VariableDeclaration.class::isInstance)
+                .map(s -> ((VariableDeclaration) s).name())
+                .toList());
+
+        var shallowerContinuation = recoverableParse("func f():\n\tmatch x:\n\t\t"
+                + "[".repeat(260) + "\n\t1\n\t\t" + "]".repeat(260) + ": pass\n"
+                + "\t\t_:\n\t\t\tpass\n\tvar local_after = 1\nvar after = 2\n");
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(shallowerContinuation).stream().map(AstDiagnostic::code).toList());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(shallowerContinuation));
+        var shallowFn = assertInstanceOf(FunctionDeclaration.class, shallowerContinuation.ast().statements().getFirst());
+        var shallowMatch = assertInstanceOf(MatchStatement.class, shallowFn.body().statements().getFirst());
+        assertEquals(2, shallowMatch.sections().size());
+        assertEquals("local_after", assertInstanceOf(VariableDeclaration.class, shallowFn.body().statements().get(1)).name());
+
+        var shallowerControl = parse("""
+                func f():
+                \tmatch x:
+                \t\t[[
+                \t1
+                \t\t]]: pass
+                \t\t_:
+                \t\t\tpass
+                \tvar local_after = 1
+                var after = 2
+                """);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(shallowerControl));
+        var shallowCtrlFn = assertInstanceOf(FunctionDeclaration.class, shallowerControl.ast().statements().getFirst());
+        var shallowCtrlMatch = assertInstanceOf(MatchStatement.class, shallowCtrlFn.body().statements().getFirst());
+        assertEquals(2, shallowCtrlMatch.sections().size());
+        assertEquals("local_after", assertInstanceOf(VariableDeclaration.class, shallowCtrlFn.body().statements().get(1)).name());
+    }
+
+    @Test
+    void suffixChainYieldsAtUnclosedMultilineEscapesAndPreservesMatchedControls() {
+        var missingNameEscape = recoverableParse("""
+                func f():
+                \tvar x = (a.
+                \tvar y = 2
+                var after = 3
+                """);
+        findErrorByCode(missingNameEscape, DiagnosticCodes.ATTRIBUTE_MISSING_NAME);
+        findErrorByCode(missingNameEscape, DiagnosticCodes.MISSING_CLOSER_GROUPING);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(missingNameEscape));
+        var fn1 = assertInstanceOf(FunctionDeclaration.class, missingNameEscape.ast().statements().getFirst());
+        var x1 = assertInstanceOf(VariableDeclaration.class, fn1.body().statements().getFirst());
+        var y1 = assertInstanceOf(VariableDeclaration.class, fn1.body().statements().get(1));
+        assertEquals("y", y1.name());
+        var attr1 = assertInstanceOf(AttributeExpression.class, x1.value());
+        assertInstanceOf(MissingAttributeStep.class, attr1.steps().getFirst());
+
+        var matchedNameControl = parse("""
+                func f():
+                \tvar x = (a.
+                \tfoo)
+                """);
+        var xMatched = assertInstanceOf(VariableDeclaration.class,
+                onlyFunction(matchedNameControl).body().statements().getFirst());
+        var attrMatched = assertInstanceOf(AttributeExpression.class, xMatched.value());
+        var prop = assertInstanceOf(AttributePropertyStep.class, attrMatched.steps().getFirst());
+        assertEquals("foo", prop.name());
+
+        var subscriptEscapeTop = recoverableParse("""
+                func f():
+                \tvar x = (foo.bar
+                [2]
+                """);
+        findErrorByCode(subscriptEscapeTop, DiagnosticCodes.MISSING_CLOSER_GROUPING);
+        var fn2 = onlyFunction(subscriptEscapeTop);
+        var x2 = assertInstanceOf(VariableDeclaration.class, fn2.body().statements().getFirst());
+        var attr2 = assertInstanceOf(AttributeExpression.class, x2.value());
+        assertEquals(1, attr2.steps().size());
+        assertEquals("bar", assertInstanceOf(AttributePropertyStep.class, attr2.steps().getFirst()).name());
+
+        var subscriptEscapeInSuite = recoverableParse("""
+                func outer():
+                \tif true:
+                \t\tvar x = (foo.bar
+                \t[2]
+                """);
+        findErrorByCode(subscriptEscapeInSuite, DiagnosticCodes.MISSING_CLOSER_GROUPING);
+        var outerFn = onlyFunction(subscriptEscapeInSuite);
+        assertEquals(2, outerFn.body().statements().size());
+        assertInstanceOf(IfStatement.class, outerFn.body().statements().getFirst());
+        var escapedArrayStmt = assertInstanceOf(ExpressionStatement.class, outerFn.body().statements().get(1));
+        assertInstanceOf(ArrayExpression.class, escapedArrayStmt.expression());
+
+        var matchedSubscriptControl = parse("""
+                func f():
+                \tvar x = (foo.bar
+                [2])
+                """);
+        var xSub = assertInstanceOf(VariableDeclaration.class,
+                onlyFunction(matchedSubscriptControl).body().statements().getFirst());
+        var attrSub = assertInstanceOf(AttributeExpression.class, xSub.value());
+        var subStep = assertInstanceOf(AttributeSubscriptStep.class, attrSub.steps().getFirst());
+        assertEquals("bar", subStep.name());
+        assertEquals(1, subStep.arguments().size());
+    }
+
+    @Test
+    void unclosedMatchPatternsDoNotStealOuterDeclarationsWhileClosedPatternsKeepBindings() {
+        var unclosedArray = recoverableParse("""
+                func f():
+                \tmatch x:
+                \t\t[1,
+                \tvar local_after = 7
+                var after = 2
+                """);
+        findErrorByCode(unclosedArray, DiagnosticCodes.MISSING_CLOSER_MATCH_ARRAY_PATTERN);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(unclosedArray));
+        var fnArr = assertInstanceOf(FunctionDeclaration.class, unclosedArray.ast().statements().getFirst());
+        assertInstanceOf(MatchStatement.class, fnArr.body().statements().getFirst());
+        assertEquals("local_after", assertInstanceOf(VariableDeclaration.class, fnArr.body().statements().get(1)).name());
+
+        var unclosedDict = recoverableParse("""
+                func f():
+                \tmatch x:
+                \t\t{"a": 1,
+                \tvar local_after = 7
+                var after = 2
+                """);
+        findErrorByCode(unclosedDict, DiagnosticCodes.MISSING_CLOSER_MATCH_DICTIONARY_PATTERN);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(unclosedDict));
+        var fnDict = assertInstanceOf(FunctionDeclaration.class, unclosedDict.ast().statements().getFirst());
+        assertInstanceOf(MatchStatement.class, fnDict.body().statements().getFirst());
+        assertEquals("local_after", assertInstanceOf(VariableDeclaration.class, fnDict.body().statements().get(1)).name());
+
+        var closedArrayBinding = parse("""
+                func f():
+                \tmatch x:
+                \t\t[
+                \t\t\tvar captured,
+                \t\t\t1
+                \t\t]:
+                \t\t\tpass
+                """);
+        var closedArrMatch = assertInstanceOf(MatchStatement.class,
+                onlyFunction(closedArrayBinding).body().statements().getFirst());
+        var closedArrPat = assertInstanceOf(ArrayExpression.class,
+                closedArrMatch.sections().getFirst().patterns().getFirst());
+        assertEquals("captured", assertInstanceOf(PatternBindingExpression.class,
+                closedArrPat.elements().getFirst()).name());
+
+        var closedDictBinding = parse("""
+                func f():
+                \tmatch x:
+                \t\t{
+                \t\t\t"k": var captured,
+                \t\t}:
+                \t\t\tpass
+                """);
+        var closedDictMatch = assertInstanceOf(MatchStatement.class,
+                onlyFunction(closedDictBinding).body().statements().getFirst());
+        var closedDictPat = assertInstanceOf(DictionaryExpression.class,
+                closedDictMatch.sections().getFirst().patterns().getFirst());
+        assertEquals("captured", assertInstanceOf(PatternBindingExpression.class,
+                closedDictPat.entries().getFirst().value()).name());
+    }
+
+    @Test
+    void damagedDictionaryTypeLeavesEnclosingCallCommaForOuterArguments() {
+        var damaged = recoverableParse("var x = g(func() -> Dictionary[String, node.pa)\n");
+        findErrorByCode(damaged, DiagnosticCodes.MISSING_CLOSER_TYPE_BRACKET);
+        var x = assertInstanceOf(VariableDeclaration.class, damaged.ast().statements().getFirst());
+        var call = assertInstanceOf(CallExpression.class, x.value());
+        assertEquals(2, call.arguments().size());
+        assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+        var secondArg = assertInstanceOf(AttributeExpression.class, call.arguments().get(1));
+        assertEquals("pa", assertInstanceOf(AttributePropertyStep.class, secondArg.steps().getFirst()).name());
+
+        var valid = parse("var x = g(func() -> Dictionary[String, int]: pass, node.pa)\n");
+        var validX = assertInstanceOf(VariableDeclaration.class, valid.ast().statements().getFirst());
+        var validCall = assertInstanceOf(CallExpression.class, validX.value());
+        assertEquals(2, validCall.arguments().size());
+        var lambda = assertInstanceOf(LambdaExpression.class, validCall.arguments().getFirst());
+        var returnType = assertInstanceOf(TypeRef.class, lambda.returnType());
+        assertEquals("Dictionary[String, int]", returnType.sourceText());
+        assertInstanceOf(AttributeExpression.class, validCall.arguments().get(1));
+    }
+
+    @Test
+    void inlineLambdaDefersEnclosingCallReplacementCloserWithoutOrphanDiagnostic() {
+        var mismatched = recoverableParse("var x = g(func(): pass]\n");
+        var codes = errorsOf(mismatched).stream().map(AstDiagnostic::code).toList();
+        assertEquals(List.of(DiagnosticCodes.MISMATCHED_CLOSER_CALL), codes);
+
+        var damagedInline = recoverableParse("var x = g(func(): super.]\n");
+        assertEquals(List.of(DiagnosticCodes.SUPER_MISSING_NAME, DiagnosticCodes.MISMATCHED_CLOSER_CALL),
+                errorsOf(damagedInline).stream().map(AstDiagnostic::code).toList());
+        var damagedX = assertInstanceOf(VariableDeclaration.class, damagedInline.ast().statements().getFirst());
+        var damagedCall = assertInstanceOf(CallExpression.class, damagedX.value());
+        assertEquals(1, damagedCall.arguments().size());
+        var damagedLambda = assertInstanceOf(LambdaExpression.class, damagedCall.arguments().getFirst());
+        assertEquals(1, damagedLambda.body().statements().size());
+        assertInstanceOf(ExpressionStatement.class, damagedLambda.body().statements().getFirst());
+
+        var multilineLambda = recoverableParse("""
+                var x = g(func():
+                \tpass]
+                \treturn 1
+                )
+                """);
+        assertEquals(List.of(DiagnosticCodes.UNEXPECTED_CLOSER),
+                errorsOf(multilineLambda).stream().map(AstDiagnostic::code).toList());
+        var multiX = assertInstanceOf(VariableDeclaration.class, multilineLambda.ast().statements().getFirst());
+        var multiCall = assertInstanceOf(CallExpression.class, multiX.value());
+        var multiLambda = assertInstanceOf(LambdaExpression.class, multiCall.arguments().getFirst());
+        assertEquals(2, multiLambda.body().statements().size());
+        assertInstanceOf(PassStatement.class, multiLambda.body().statements().getFirst());
+        assertInstanceOf(ReturnStatement.class, multiLambda.body().statements().get(1));
+
+        var nestedInlineInMultiline = recoverableParse("""
+                var x = g(func():
+                \tvar cb = func(): pass]
+                \treturn 1
+                )
+                """);
+        assertEquals(List.of(DiagnosticCodes.UNEXPECTED_CLOSER),
+                errorsOf(nestedInlineInMultiline).stream().map(AstDiagnostic::code).toList());
+        var nestedX = assertInstanceOf(VariableDeclaration.class, nestedInlineInMultiline.ast().statements().getFirst());
+        var nestedCall = assertInstanceOf(CallExpression.class, nestedX.value());
+        var outerLambda = assertInstanceOf(LambdaExpression.class, nestedCall.arguments().getFirst());
+        assertEquals(2, outerLambda.body().statements().size());
+        assertEquals("cb", assertInstanceOf(VariableDeclaration.class, outerLambda.body().statements().getFirst()).name());
+        assertInstanceOf(ReturnStatement.class, outerLambda.body().statements().get(1));
+
+        var multilineMatchedControl = parse("var x = foo(func():\n\treturn 1)\n");
+        assertEquals(List.of(), errorMessages(multilineMatchedControl));
+
+        var orphanInFunction = recoverableParse("func f():\n\tpass]\n");
+        findErrorByCode(orphanInFunction, DiagnosticCodes.UNEXPECTED_CLOSER);
+
+        var orphanTopLambda = recoverableParse("var f = func(): pass]\n");
+        findErrorByCode(orphanTopLambda, DiagnosticCodes.UNEXPECTED_CLOSER);
+    }
+
+    @Test
+    void escapedMultilineLinesSurfaceLexicalIndentationDiagnosticsWhileClosedMultilineStaysClean() {
+        var wrongChar = recoverableParse("""
+                func f():
+                \tvar x = [1,
+                    var y = 1
+                var after = 1
+                """);
+        var wrongCharDiag = findErrorByCode(wrongChar, DiagnosticCodes.LEXICAL_ERROR);
+        assertTrue(wrongCharDiag.message().contains("space character for indentation"));
+        findErrorByCode(wrongChar, DiagnosticCodes.MISSING_CLOSER_ARRAY);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(wrongChar));
+        var fn1 = assertInstanceOf(FunctionDeclaration.class, wrongChar.ast().statements().getFirst());
+        assertEquals("y", assertInstanceOf(VariableDeclaration.class, fn1.body().statements().get(1)).name());
+
+        var badDedent = recoverableParse("""
+                func f():
+                    if true:
+                        var x = [1,
+                      var y = 1
+                var after = 1
+                """);
+        var badDedentDiag = findErrorByCode(badDedent, DiagnosticCodes.LEXICAL_ERROR);
+        assertTrue(badDedentDiag.message().contains("Unindent doesn't match"));
+        assertEquals(List.of("f", "after"), topLevelMemberNames(badDedent));
+
+        var mixed = recoverableParse("""
+                func f():
+                \tvar x = [1,
+                \t var y = 1
+                var after = 1
+                """);
+        var mixedDiag = findErrorByCode(mixed, DiagnosticCodes.LEXICAL_ERROR);
+        assertTrue(mixedDiag.message().contains("Mixed use of tabs and spaces"));
+        assertEquals(List.of("f", "after"), topLevelMemberNames(mixed));
+
+        var closedMultiline = parse("""
+                func f():
+                \tvar x = [
+                    1
+                \t]
+                """);
+        assertEquals(List.of(), errorMessages(closedMultiline));
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS)
+    void lineIndentationMetadataScansScaleLinearlyAcrossWideIndentAndManyTokens() {
+        var parser = new GdScriptParser();
+        for (var k : List.of(64, 512)) {
+            var indent = " ".repeat(k);
+            var source = "func f():\n"
+                    + indent + "var x = " + "(".repeat(260) + "\n"
+                    + indent + "1 + " + "g(0) + ".repeat(k) + "1\n";
+            var result = parser.parse(source);
+            findErrorByCode(result, DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+            assertTrue(parser.lineIndentScanSteps() <= 2 * k + 8,
+                    () -> "expected linear indent scan for k=" + k + ", got " + parser.lineIndentScanSteps());
+        }
+    }
+
+    @Test
+    void backslashContinuationAcrossCommentLinesPreservesContainerAndMemberNames() {
+        var commentInArray = recoverableParse("""
+                func f():
+                \tvar x = [1,
+                \t\t# note
+                \t\t2,
+                \tvar y = 3
+                """);
+        findErrorByCode(commentInArray, DiagnosticCodes.MISSING_CLOSER_ARRAY);
+        assertTrue(errorsOf(commentInArray).stream().noneMatch(d -> DiagnosticCodes.LEXICAL_ERROR.equals(d.code())));
+        var fn1 = onlyFunction(commentInArray);
+        var x = assertInstanceOf(VariableDeclaration.class, fn1.body().statements().getFirst());
+        var y = assertInstanceOf(VariableDeclaration.class, fn1.body().statements().get(1));
+        assertEquals("y", y.name());
+        var arr = assertInstanceOf(ArrayExpression.class, x.value());
+        assertEquals(2, arr.elements().size());
+
+        var continuedMemberAcrossComment = recoverableParse("""
+                func f():
+                \tvar x = (a.\\
+                \t\t# continuation note
+                \t\tmatch
+                \tvar y = 2
+                """);
+        findErrorByCode(continuedMemberAcrossComment, DiagnosticCodes.MISSING_CLOSER_GROUPING);
+        assertTrue(errorsOf(continuedMemberAcrossComment).stream()
+                .noneMatch(d -> DiagnosticCodes.ATTRIBUTE_MISSING_NAME.equals(d.code())));
+        var fn2 = onlyFunction(continuedMemberAcrossComment);
+        var x2 = assertInstanceOf(VariableDeclaration.class, fn2.body().statements().getFirst());
+        var y2 = assertInstanceOf(VariableDeclaration.class, fn2.body().statements().get(1));
+        assertEquals("y", y2.name());
+        var attr = assertInstanceOf(AttributeExpression.class, x2.value());
+        assertEquals("match", assertInstanceOf(AttributePropertyStep.class, attr.steps().getFirst()).name());
     }
 
     private static AstDiagnostic findErrorByCode(AstMappingResult result, String code) {

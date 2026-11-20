@@ -1187,6 +1187,156 @@ class GdTokenizerTest {
         assertEquals(GdTokenType.EOF, managed.getLast().type());
     }
 
+    @Test
+    void reconcileLayoutForReplayEmitsNewlineAndIndentOrDedentAcrossMultilineEscape() {
+        // Deeper line after suppressed multiline newline replays NEWLINE + INDENT (`func f(a, b:\n\tpass`).
+        var indentTokenizer = GdTokenizer.managed("func f(a, b:\n\tpass\n");
+        assertEquals(GdTokenType.FUNC, indentTokenizer.scan().type());
+        assertEquals(GdTokenType.IDENTIFIER, indentTokenizer.scan().type());
+        indentTokenizer.setMultilineMode(true);
+        assertEquals(GdTokenType.PARENTHESIS_OPEN, indentTokenizer.scan().type());
+        assertEquals(GdTokenType.IDENTIFIER, indentTokenizer.scan().type()); // a
+        assertEquals(GdTokenType.COMMA, indentTokenizer.scan().type());
+        assertEquals(GdTokenType.IDENTIFIER, indentTokenizer.scan().type()); // b
+        assertEquals(GdTokenType.COLON, indentTokenizer.scan().type());
+        var passLookahead = indentTokenizer.scan(); // crosses suppressed `\n\t` -> PASS
+        assertEquals(GdTokenType.PASS, passLookahead.type());
+        indentTokenizer.setMultilineMode(false); // exit multiline without consuming `)`
+        var replayedIndent = indentTokenizer.reconcileLayoutForReplay(passLookahead);
+        assertEquals(List.of(GdTokenType.NEWLINE, GdTokenType.INDENT), typesOf(replayedIndent));
+        // Draining the rest of the stream balances indentStack cleanly to EOF.
+        assertEquals(GdTokenType.NEWLINE, indentTokenizer.scan().type());
+        assertEquals(GdTokenType.DEDENT, indentTokenizer.scan().type());
+        assertEquals(GdTokenType.EOF, indentTokenizer.scan().type());
+        assertTrue(indentTokenizer.hasBalancedLayoutState());
+
+        // Shallower line across CRLF with comment-only lines replays NEWLINE + DEDENT.
+        var dedentTokenizer = GdTokenizer.managed("func f():\r\n\tprint(1\r\n# trivia\r\nvar after = 2\r\n");
+        while (dedentTokenizer.scan().type() != GdTokenType.IDENTIFIER) {
+            // advance until `print`
+        }
+        while (dedentTokenizer.scan().type() != GdTokenType.IDENTIFIER) {
+            // advance until `print`
+        }
+        dedentTokenizer.setMultilineMode(true);
+        assertEquals(GdTokenType.PARENTHESIS_OPEN, dedentTokenizer.scan().type());
+        assertEquals(GdTokenType.LITERAL, dedentTokenizer.scan().type()); // 1
+        var varLookahead = dedentTokenizer.scan(); // crosses `\r\n# trivia\r\n` -> VAR
+        assertEquals(GdTokenType.VAR, varLookahead.type());
+        dedentTokenizer.setMultilineMode(false);
+        var replayedDedent = dedentTokenizer.reconcileLayoutForReplay(varLookahead);
+        assertEquals(List.of(GdTokenType.NEWLINE, GdTokenType.DEDENT), typesOf(replayedDedent));
+        assertTrue(replayedDedent.getFirst().startByte() < varLookahead.startByte());
+        while (dedentTokenizer.scan().type() != GdTokenType.EOF) {
+            // drain to EOF
+        }
+        assertTrue(dedentTokenizer.hasBalancedLayoutState());
+    }
+
+    @Test
+    void reconcileLayoutForReplaySkipsNormalClosureAndSoftNewlines() {
+        var tokenizer = GdTokenizer.managed("var x = (1\n\t+ 2)\n");
+        while (tokenizer.scan().type() != GdTokenType.EQUAL) {
+            // advance to `=`
+        }
+        tokenizer.setMultilineMode(true);
+        assertEquals(GdTokenType.PARENTHESIS_OPEN, tokenizer.scan().type());
+        assertEquals(GdTokenType.LITERAL, tokenizer.scan().type()); // 1
+        assertEquals(GdTokenType.PLUS, tokenizer.scan().type()); // + (cleared suppressed newline on next scan)
+        assertEquals(GdTokenType.LITERAL, tokenizer.scan().type()); // 2
+        tokenizer.setMultilineMode(false);
+        var closer = tokenizer.scan(); // `)`
+        assertEquals(GdTokenType.PARENTHESIS_CLOSE, closer.type());
+        assertEquals(List.of(), tokenizer.reconcileLayoutForReplay(closer));
+        assertEquals(GdTokenType.NEWLINE, tokenizer.scan().type());
+        assertEquals(GdTokenType.EOF, tokenizer.scan().type());
+        assertTrue(tokenizer.hasBalancedLayoutState());
+    }
+
+    @Test
+    void drainRestoredEofDedentsBalancesRestoredIndentStackAtEof() {
+        var tokenizer = GdTokenizer.managed("func f():\n\tvar x = g(func(): pass");
+        // Scan until `g(` (second `(`) so indentStack holds `[4]`, then isolate the lambda body.
+        var openParens = 0;
+        while (openParens < 2) {
+            if (tokenizer.scan().type() == GdTokenType.PARENTHESIS_OPEN) {
+                openParens++;
+            }
+        }
+        tokenizer.pushExpressionIndentedBlock();
+        while (tokenizer.scan().type() != GdTokenType.EOF) {
+            // drain truncated lambda to EOF
+        }
+        tokenizer.popExpressionIndentedBlock();
+        var closure = tokenizer.drainRestoredEofDedents();
+        assertEquals(List.of(GdTokenType.NEWLINE, GdTokenType.DEDENT), typesOf(closure));
+        assertTrue(tokenizer.hasBalancedLayoutState());
+    }
+
+    @Test
+    void reconcileLayoutForReplayValidatesEscapedLineIndentationAndExemptsMultiline() {
+        // Negative 1: wrong indentation character on an escaped line emits ERROR + NEWLINE.
+        var wrongCharTok = GdTokenizer.managed("func f():\n\tvar x = [1,\n    var y = 1\n");
+        while (wrongCharTok.scan().type() != GdTokenType.BRACKET_OPEN) {
+            // advance to `[`
+        }
+        wrongCharTok.setMultilineMode(true);
+        assertEquals(GdTokenType.LITERAL, wrongCharTok.scan().type());
+        assertEquals(GdTokenType.COMMA, wrongCharTok.scan().type());
+        var wrongCharLookahead = wrongCharTok.scan();
+        assertEquals(GdTokenType.VAR, wrongCharLookahead.type());
+        wrongCharTok.setMultilineMode(false);
+        var wrongCharReplay = wrongCharTok.reconcileLayoutForReplay(wrongCharLookahead);
+        assertEquals(List.of(GdTokenType.NEWLINE, GdTokenType.ERROR), typesOf(wrongCharReplay));
+        assertTrue(wrongCharReplay.get(1).errorMessage().contains("space character for indentation"));
+
+        // Negative 2: mixed tabs and spaces on an escaped line emits ERROR + NEWLINE (+ INDENT for width 5 > 4).
+        var mixedTok = GdTokenizer.managed("func f():\n\tvar x = [1,\n\t var y = 1\n");
+        while (mixedTok.scan().type() != GdTokenType.BRACKET_OPEN) {
+            // advance to `[`
+        }
+        mixedTok.setMultilineMode(true);
+        assertEquals(GdTokenType.LITERAL, mixedTok.scan().type());
+        assertEquals(GdTokenType.COMMA, mixedTok.scan().type());
+        var mixedLookahead = mixedTok.scan();
+        assertEquals(GdTokenType.VAR, mixedLookahead.type());
+        mixedTok.setMultilineMode(false);
+        var mixedReplay = mixedTok.reconcileLayoutForReplay(mixedLookahead);
+        assertEquals(List.of(GdTokenType.NEWLINE, GdTokenType.ERROR, GdTokenType.INDENT), typesOf(mixedReplay));
+        assertTrue(mixedReplay.get(1).errorMessage().contains("Mixed use of tabs and spaces"));
+
+        // Negative 3: mismatched dedent on an escaped line emits ERROR + NEWLINE + DEDENT.
+        var mismatchTok = GdTokenizer.managed("func f():\n    if true:\n        var x = [1,\n      var y = 1\n");
+        while (mismatchTok.scan().type() != GdTokenType.BRACKET_OPEN) {
+            // advance to `[`
+        }
+        mismatchTok.setMultilineMode(true);
+        assertEquals(GdTokenType.LITERAL, mismatchTok.scan().type());
+        assertEquals(GdTokenType.COMMA, mismatchTok.scan().type());
+        var mismatchLookahead = mismatchTok.scan();
+        assertEquals(GdTokenType.VAR, mismatchLookahead.type());
+        mismatchTok.setMultilineMode(false);
+        var mismatchReplay = mismatchTok.reconcileLayoutForReplay(mismatchLookahead);
+        assertEquals(List.of(GdTokenType.NEWLINE, GdTokenType.DEDENT, GdTokenType.ERROR), typesOf(mismatchReplay));
+        assertTrue(mismatchReplay.get(2).errorMessage().contains("Unindent doesn't match"));
+
+        // Positive control: closed multiline line using spaces inside a tab file stays error-free.
+        var closedMultiline = GdTokenizer.managed("func f():\n\tvar x = [\n    1\n\t]\n");
+        while (closedMultiline.scan().type() != GdTokenType.BRACKET_OPEN) {
+            // advance to `[`
+        }
+        closedMultiline.setMultilineMode(true);
+        var lit = closedMultiline.scan();
+        assertEquals(GdTokenType.LITERAL, lit.type());
+        var closer = closedMultiline.scan();
+        assertEquals(GdTokenType.BRACKET_CLOSE, closer.type());
+        closedMultiline.setMultilineMode(false);
+        assertEquals(GdTokenType.NEWLINE, closedMultiline.scan().type());
+        assertEquals(GdTokenType.DEDENT, closedMultiline.scan().type());
+        assertEquals(GdTokenType.EOF, closedMultiline.scan().type());
+        assertTrue(closedMultiline.hasBalancedLayoutState());
+    }
+
     private static void assertPhysicalCoordinatesMatchBytes(String source, List<GdToken> tokens) {
         var utf8Length = source.getBytes(StandardCharsets.UTF_8).length;
         var lines = new int[utf8Length + 1];

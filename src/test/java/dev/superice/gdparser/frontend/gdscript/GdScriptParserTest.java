@@ -1467,15 +1467,17 @@ class GdScriptParserTest {
         var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
         assertTrue(lambda.body().statements().isEmpty());
 
-        // `f(func(): super., 1)`: the `, 1)` tail is eaten by synchronization inside the lambda
-        // body (unchanged from the pre-marker behavior).
+        // `f(func(): super., 1)`: the outer `,` is an ancestor-owned separator, so synchronization
+        // ends the inline lambda at `,` and preserves the second call argument `1`.
         var comma = parse("func f():\n\tf(func(): super., 1)\n");
         assertTrue(errorMessages(comma).contains("Expected function name after \".\"."),
                 () -> errorMessages(comma).toString());
         var commaCall = assertInstanceOf(CallExpression.class,
                 assertInstanceOf(ExpressionStatement.class, assertInstanceOf(FunctionDeclaration.class,
                         comma.ast().statements().getFirst()).body().statements().getFirst()).expression());
-        assertEquals(1, commaCall.arguments().size());
+        assertEquals(2, commaCall.arguments().size());
+        assertInstanceOf(LambdaExpression.class, commaCall.arguments().getFirst());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, commaCall.arguments().get(1)).sourceText());
     }
 
     @Test

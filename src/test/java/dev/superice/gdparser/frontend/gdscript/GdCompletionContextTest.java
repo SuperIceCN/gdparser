@@ -432,7 +432,7 @@ class GdCompletionContextTest {
                 new Fact("var x = g(func() -> Array[\n,\n\tnode.\n\tpa\n)",
                         AttributeExpression.class, "node.\n\tpa", true),
                 new Fact("var x = g(func() -> Array[, node.\n\tpa)",
-                        AttributeExpression.class, "node.\n\tpa", false))) {
+                        AttributeExpression.class, "node.\n\tpa", true))) {
             var result = FACADE.parse(fact.source());
             assertTrue(!result.diagnostics().isEmpty(), fact.source());
             var nodes = new ArrayDeque<Node>();

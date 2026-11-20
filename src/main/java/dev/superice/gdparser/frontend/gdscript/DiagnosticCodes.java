@@ -65,6 +65,7 @@ public final class DiagnosticCodes {
     public static final String MISSING_CLOSER_TYPE_BRACKET = "parse.missing_closer.type_bracket";
     public static final String MISSING_CLOSER_MATCH_ARRAY_PATTERN = "parse.missing_closer.match_array_pattern";
     public static final String MISSING_CLOSER_MATCH_DICTIONARY_PATTERN = "parse.missing_closer.match_dictionary_pattern";
+    public static final String MISSING_CLOSER_ENUM = "parse.missing_closer.enum";
 
     // Mismatched / unexpected closers.
     public static final String MISMATCHED_CLOSER_GROUPING = "parse.mismatched_closer.grouping";
@@ -79,6 +80,7 @@ public final class DiagnosticCodes {
     public static final String MISMATCHED_CLOSER_TYPE_BRACKET = "parse.mismatched_closer.type_bracket";
     public static final String MISMATCHED_CLOSER_MATCH_ARRAY_PATTERN = "parse.mismatched_closer.match_array_pattern";
     public static final String MISMATCHED_CLOSER_MATCH_DICTIONARY_PATTERN = "parse.mismatched_closer.match_dictionary_pattern";
+    public static final String MISMATCHED_CLOSER_ENUM = "parse.mismatched_closer.enum";
     public static final String UNEXPECTED_CLOSER = "parse.unexpected_closer";
 
     // Opened expression slots whose content failed.
@@ -243,6 +245,7 @@ public final class DiagnosticCodes {
         facets.put("constant.value", Set.of(VariableDeclaration.class));
         facets.put("parameter.default", Set.of(Parameter.class));
         facets.put("enum.value", Set.of(EnumMember.class));
+        facets.put("enum.body", Set.of(EnumDeclaration.class));
 
         // Structural, declaration, signature, and pattern facets
         facets.put("statement.trailing", Set.of(Statement.class));
@@ -367,6 +370,8 @@ public final class DiagnosticCodes {
                 MISSING_CLOSER_MATCH_ARRAY_PATTERN, MISMATCHED_CLOSER_MATCH_ARRAY_PATTERN);
         registerPairings(pairings, Set.of("match.pattern", "match.dictionary_pattern", "match.section", "variable.property"),
                 MISSING_CLOSER_MATCH_DICTIONARY_PATTERN, MISMATCHED_CLOSER_MATCH_DICTIONARY_PATTERN);
+        registerPairings(pairings, Set.of("enum.body"),
+                MISSING_CLOSER_ENUM, MISMATCHED_CLOSER_ENUM);
 
         // Explicit type slot codes
         pairings.put(MISSING_TYPE_VARIABLE, Set.of("variable.type", "variable.property"));

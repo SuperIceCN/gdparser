@@ -110,23 +110,39 @@ public final class GdTokenizer {
     private int startLine = 1;
     private int startColumn = 1;
 
+    // Mode configuration preserved across `setSourceCode` resets (standalone vs. managed).
     private final boolean emitRawClosers;
     private final @Nullable Boolean initialMultilineMode;
 
+    // Line progression, newline/EOF settlement, and active multiline/continuation flags.
     private boolean lineContinuation;
     private boolean lineHasContent;
     private boolean eofSettled;
     private @Nullable Boolean explicitMultilineMode;
     private boolean pendingNewline;
     private GdToken lastNewline;
+
+    // Suppressed-layout replay state for managed multiline escapes: captures the suppressed
+    // NEWLINE, its one-token expiration flag, the last non-ERROR token's code-point start (used
+    // to inspect leading whitespace on an escaped line), and whether that token followed `\`.
+    private @Nullable GdToken suppressedNewline;
+    private boolean clearSuppressedOnNextScan;
+    private int lastReturnedTokenStart;
+    private boolean lastTokenFollowedContinuation;
+
+    // Indentation levels and expression-block snapshots (used for inline/indented lambda bodies).
     private int pendingIndents;
+    private int indentChar;
     private final List<Integer> indentStack = new ArrayList<>();
     private final List<List<Integer>> indentStackStack = new ArrayList<>();
+
+    // Standalone lexical bracket-pairing stacks (unused in managed mode).
     private final List<Integer> parenStack = new ArrayList<>();
     private final List<Integer> openParenIndices = new ArrayList<>();
     private final List<Integer> openBracketIndices = new ArrayList<>();
     private final List<Integer> openBraceIndices = new ArrayList<>();
-    private int indentChar;
+
+    // Diagnostic queue and side-channel trivia/continuation records collected during scanning.
     private final List<GdToken> errorStack = new ArrayList<>();
     private final List<GdComment> comments = new ArrayList<>();
     private final List<Integer> continuationLines = new ArrayList<>();
@@ -180,11 +196,15 @@ public final class GdTokenizer {
         startLine = 1;
         startColumn = 1;
         lineContinuation = false;
+        lastTokenFollowedContinuation = false;
         lineHasContent = false;
         eofSettled = false;
         explicitMultilineMode = initialMultilineMode;
         pendingNewline = false;
         lastNewline = null;
+        suppressedNewline = null;
+        clearSuppressedOnNextScan = false;
+        lastReturnedTokenStart = 0;
         pendingIndents = 0;
         indentStack.clear();
         indentStackStack.clear();
@@ -248,6 +268,28 @@ public final class GdTokenizer {
         indentStack.addAll(snapshot);
     }
 
+    /// Emits synthetic zero-width layout closure tokens (`NEWLINE` followed by one `DEDENT` per
+    /// restored outer indentation level) when a nested expression block exits after `EOF` has
+    /// already been settled. Clears `indentStack` and any dangling `suppressedNewline` so the
+    /// parser can close outer suites cleanly with balanced tokenizer state.
+    @NotNull List<GdToken> drainRestoredEofDedents() {
+        if (!eofSettled || indentStack.isEmpty()) {
+            return List.of();
+        }
+        suppressedNewline = null;
+        var eofByte = byteOffsets[position];
+        var count = indentStack.size();
+        indentStack.clear();
+        var tokens = new ArrayList<GdToken>(count + 1);
+        tokens.add(new GdToken(GdTokenType.NEWLINE, "", GdLiteralKind.NONE, null,
+                eofByte, eofByte, line, column, line, column));
+        for (var i = 0; i < count; i++) {
+            tokens.add(new GdToken(GdTokenType.DEDENT, "", GdLiteralKind.NONE, null,
+                    eofByte, eofByte, line, column, line, column));
+        }
+        return List.copyOf(tokens);
+    }
+
     /// Current 1-based scanner line (Godot diagnostic coordinate).
     public int getLine() {
         return line;
@@ -263,6 +305,221 @@ public final class GdTokenizer {
         return SourceTextIndex.of(source);
     }
 
+    int[] codePoints() {
+        return chars;
+    }
+
+    int[] byteOffsets() {
+        return byteOffsets;
+    }
+
+    boolean isLineContinuation() {
+        return lastTokenFollowedContinuation;
+    }
+
+    boolean hasBalancedLayoutState() {
+        return indentStack.isEmpty()
+                && indentStackStack.isEmpty()
+                && pendingIndents == 0
+                && !pendingNewline
+                && suppressedNewline == null
+                && errorStack.isEmpty();
+    }
+
+    boolean hasBalancedPersistentState() {
+        return indentStackStack.isEmpty() && suppressedNewline == null;
+    }
+
+    /// Reconciles suppressed multiline layout against `indentStack` once multiline suppression
+    /// turns off at an escaped cross-line `lookahead` token. Returns layout tokens (`NEWLINE`
+    /// and any needed `INDENT` or `DEDENT`) plus any indentation `ERROR` tokens to emit ahead of
+    /// `lookahead`, preserving physical coordinates and deduplicating already-emitted layout.
+    @NotNull List<GdToken> reconcileLayoutForReplay(@NotNull GdToken lookahead) {
+        if (effectiveMultilineMode() || suppressedNewline == null) {
+            return List.of();
+        }
+        var nl = suppressedNewline;
+        suppressedNewline = null;
+        if (lookahead.type() == GdTokenType.NEWLINE || lookahead.type() == GdTokenType.INDENT) {
+            return List.of();
+        }
+        if (lookahead.type() == GdTokenType.DEDENT || lookahead.type() == GdTokenType.EOF) {
+            return List.of(nl);
+        }
+        var lineStartIdx = Math.max(0, lastReturnedTokenStart - (lookahead.startColumn() - 1));
+        var indentCount = 0;
+        var lineIndentChar = 0;
+        var mixed = false;
+        for (var i = lineStartIdx; i < lastReturnedTokenStart && i < chars.length; i++) {
+            var ch = chars[i];
+            if (ch == '\t') {
+                indentCount += TAB_SIZE;
+            } else if (ch == ' ') {
+                indentCount += 1;
+            } else if (ch == '\r') {
+                continue;
+            } else {
+                break;
+            }
+            if (lineIndentChar == 0) {
+                lineIndentChar = ch;
+            }
+            mixed = mixed || ch != lineIndentChar;
+        }
+        var replayed = new ArrayList<GdToken>(4);
+        replayed.add(nl);
+        applyIndentationStep(
+                indentCount,
+                lineIndentChar,
+                mixed,
+                lineStartIdx,
+                lastReturnedTokenStart,
+                lookahead.startLine(),
+                lookahead.startColumn(),
+                replayed
+        );
+        return List.copyOf(replayed);
+    }
+
+    /// Validates leading-whitespace indentation (`mixed`, `indentChar` consistency, and dedent
+    /// alignment) and applies the resulting state change to `indentStack`. When `replayOut` is
+    /// null, behaves as live `checkIndent()` (updating `pendingIndents` and pushing errors onto
+    /// `errorStack`); when non-null, appends replay `ERROR`/`INDENT`/`DEDENT` tokens directly.
+    private void applyIndentationStep(
+            int indentCount,
+            int lineIndentChar,
+            boolean mixed,
+            int lineStartIdx,
+            int wsEndIdx,
+            int targetLine,
+            int targetColumn,
+            @Nullable List<GdToken> replayOut
+    ) {
+        if (mixed) {
+            emitIndentationStepError(
+                    "Mixed use of tabs and spaces for indentation.",
+                    lineStartIdx,
+                    wsEndIdx,
+                    targetLine,
+                    targetColumn,
+                    replayOut
+            );
+        }
+
+        if (indentCount == 0) {
+            if (replayOut == null) {
+                // A line beginning with a stray CR and no spaces/tabs dedents to column 1
+                // without recording a file-wide indentation character.
+                pendingIndents -= indentStack.size();
+                indentStack.clear();
+            } else {
+                var wsText = new String(chars, lineStartIdx, Math.max(0, wsEndIdx - lineStartIdx));
+                var wsStartByte = byteOffsets[lineStartIdx];
+                var wsEndByte = byteOffsets[wsEndIdx];
+                while (!indentStack.isEmpty()) {
+                    indentStack.removeLast();
+                    replayOut.add(new GdToken(GdTokenType.DEDENT, wsText, GdLiteralKind.NONE, null,
+                            wsStartByte, wsEndByte, targetLine, 1, targetLine, targetColumn));
+                }
+            }
+            return;
+        }
+
+        // Check indentation character consistency across the file.
+        if (indentChar == 0) {
+            // First time indenting, choose character now.
+            indentChar = lineIndentChar;
+        } else if (lineIndentChar != indentChar) {
+            emitIndentationStepError(
+                    "Used " + indentCharName(lineIndentChar) + " character for indentation instead of "
+                            + indentCharName(indentChar) + " as used before in the file.",
+                    lineStartIdx,
+                    wsEndIdx,
+                    targetLine,
+                    targetColumn,
+                    replayOut
+            );
+        }
+
+        // Check if indent or dedent.
+        var previousIndent = indentStack.isEmpty() ? 0 : indentStack.getLast();
+        if (indentCount == previousIndent) {
+            return;
+        }
+        if (indentCount > previousIndent) {
+            indentStack.add(indentCount);
+            if (replayOut == null) {
+                pendingIndents++;
+            } else {
+                var wsText = new String(chars, lineStartIdx, Math.max(0, wsEndIdx - lineStartIdx));
+                replayOut.add(new GdToken(GdTokenType.INDENT, wsText, GdLiteralKind.NONE, null,
+                        byteOffsets[lineStartIdx], byteOffsets[wsEndIdx], targetLine, 1, targetLine, targetColumn));
+            }
+            return;
+        }
+
+        // Indentation decreased (dedent).
+        if (replayOut == null && indentStack.isEmpty()) {
+            pushError(makeIndentError("Tokenizer bug: trying to dedent without previous indent."));
+            return;
+        }
+        var wsText = replayOut == null
+                ? ""
+                : new String(chars, lineStartIdx, Math.max(0, wsEndIdx - lineStartIdx));
+        var wsStartByte = byteOffsets[lineStartIdx];
+        var wsEndByte = byteOffsets[wsEndIdx];
+        while (!indentStack.isEmpty() && indentStack.getLast() > indentCount) {
+            indentStack.removeLast();
+            if (replayOut == null) {
+                pendingIndents--;
+            } else {
+                replayOut.add(new GdToken(GdTokenType.DEDENT, wsText, GdLiteralKind.NONE, null,
+                        wsStartByte, wsEndByte, targetLine, 1, targetLine, targetColumn));
+            }
+        }
+        if (indentStack.isEmpty() || indentStack.getLast() != indentCount) {
+            // Mismatched indentation alignment; stay lenient and keep this level.
+            emitIndentationStepError(
+                    "Unindent doesn't match the previous indentation level.",
+                    lineStartIdx,
+                    wsEndIdx,
+                    targetLine,
+                    targetColumn,
+                    replayOut
+            );
+            indentStack.add(indentCount);
+        }
+    }
+
+    private void emitIndentationStepError(
+            @NotNull String message,
+            int lineStartIdx,
+            int wsEndIdx,
+            int targetLine,
+            int targetColumn,
+            @Nullable List<GdToken> replayOut
+    ) {
+        var error = makeSpanError(message, lineStartIdx, targetLine, 1, wsEndIdx, targetLine, targetColumn);
+        if (replayOut == null) {
+            pushError(error);
+        } else {
+            replayOut.add(error);
+        }
+    }
+
+    private GdToken returnScannedToken(GdToken token, int tokenStartIndex) {
+        return returnScannedToken(token, tokenStartIndex, false);
+    }
+
+    private GdToken returnScannedToken(GdToken token, int tokenStartIndex, boolean followedContinuation) {
+        if (token.type() != GdTokenType.ERROR) {
+            clearSuppressedOnNextScan = true;
+            lastReturnedTokenStart = tokenStartIndex;
+            lastTokenFollowedContinuation = followedContinuation;
+        }
+        return token;
+    }
+
     /// Port of `scan()`: returns the next token, draining queued errors first (LIFO),
     /// then a pending newline, then pending indent/dedent tokens, then dispatches on the
     /// next character. At end of input returns an `EOF` token.
@@ -270,6 +527,10 @@ public final class GdTokenizer {
     /// Godot recurses `scan()` for line continuations; the JVM does not eliminate tail
     /// calls, so this port loops instead (identical state flow, bounded stack usage).
     public @NotNull GdToken scan() {
+        if (clearSuppressedOnNextScan) {
+            suppressedNewline = null;
+            clearSuppressedOnNextScan = false;
+        }
         while (true) {
             if (hasError()) {
                 return popError();
@@ -281,8 +542,9 @@ public final class GdTokenizer {
                 pendingNewline = false;
                 if (!effectiveMultilineMode()) {
                     // Don't return newline tokens in multiline mode.
-                    return lastNewline;
+                    return returnScannedToken(lastNewline, position);
                 }
+                suppressedNewline = lastNewline;
             }
 
             // Errors queued while skipping whitespace come before any regular token.
@@ -300,16 +562,16 @@ public final class GdTokenizer {
                     tokenStart -= startColumn - 1;
                     startColumn = 1;
                     pendingIndents--;
-                    return makeToken(GdTokenType.INDENT);
+                    return returnScannedToken(makeToken(GdTokenType.INDENT), tokenStart);
                 }
                 pendingIndents++;
                 if (isAtEnd()) {
-                    return new GdToken(GdTokenType.DEDENT, "", GdLiteralKind.NONE, null,
-                            byteOffsets[position], byteOffsets[position], line, column, line, column);
+                    return returnScannedToken(new GdToken(GdTokenType.DEDENT, "", GdLiteralKind.NONE, null,
+                            byteOffsets[position], byteOffsets[position], line, column, line, column), position);
                 }
                 tokenStart -= startColumn - 1;
                 startColumn = 1;
-                return makeToken(GdTokenType.DEDENT);
+                return returnScannedToken(makeToken(GdTokenType.DEDENT), tokenStart);
             }
 
             if (isAtEnd()) {
@@ -319,8 +581,8 @@ public final class GdTokenizer {
                         continue;
                     }
                 }
-                return new GdToken(GdTokenType.EOF, "", GdLiteralKind.NONE, null,
-                        byteOffsets[position], byteOffsets[position], line, column, line, column);
+                return returnScannedToken(new GdToken(GdTokenType.EOF, "", GdLiteralKind.NONE, null,
+                        byteOffsets[position], byteOffsets[position], line, column, line, column), position);
             }
 
             var c = advance();
@@ -346,18 +608,19 @@ public final class GdTokenizer {
                 continue;
             }
 
+            var followedContinuation = lineContinuation;
             lineContinuation = false;
 
             if (isDigit(c)) {
-                return emitContent(number());
+                return returnScannedToken(emitContent(number()), tokenStart, followedContinuation);
             } else if (c == 'r' && (peek() == '"' || peek() == '\'')) {
                 // Raw string literals.
-                return emitContent(string());
+                return returnScannedToken(emitContent(string()), tokenStart, followedContinuation);
             } else if (isUnicodeIdentifierStart(c)) {
-                return emitContent(potentialIdentifier());
+                return returnScannedToken(emitContent(potentialIdentifier()), tokenStart, followedContinuation);
             }
 
-            return emitContent(dispatch(c));
+            return returnScannedToken(emitContent(dispatch(c)), tokenStart, followedContinuation);
         }
     }
 
@@ -373,11 +636,14 @@ public final class GdTokenizer {
         eofSettled = true;
         if (lineHasContent) {
             lineHasContent = false;
+            var eofByte = byteOffsets[position];
+            var eofNewline = new GdToken(GdTokenType.NEWLINE, "", GdLiteralKind.NONE, null,
+                    eofByte, eofByte, line, column, line, column);
             if (!effectiveMultilineMode()) {
-                var eofByte = byteOffsets[position];
-                lastNewline = new GdToken(GdTokenType.NEWLINE, "", GdLiteralKind.NONE, null,
-                        eofByte, eofByte, line, column, line, column);
+                lastNewline = eofNewline;
                 pendingNewline = true;
+            } else if (suppressedNewline == null) {
+                suppressedNewline = eofNewline;
             }
         }
         if (!indentStack.isEmpty()) {
@@ -639,60 +905,22 @@ public final class GdTokenizer {
                 continue;
             }
 
-            if (mixed && !lineContinuation && !effectiveMultilineMode()) {
-                pushError(makeIndentError("Mixed use of tabs and spaces for indentation."));
-            }
-
             if (lineContinuation || effectiveMultilineMode()) {
                 // Whitespace at the beginning of the line was consumed; a continuation or
                 // multiline mode must not produce indentation changes.
                 return;
             }
 
-            if (indentCount == 0) {
-                // A line beginning with a stray CR and no spaces/tabs dedents to column 1
-                // without recording a file-wide indentation character.
-                pendingIndents -= indentStack.size();
-                indentStack.clear();
-                return;
-            }
-
-            // Check indentation character consistency across the file.
-            if (indentChar == 0) {
-                // First time indenting, choose character now.
-                indentChar = lineIndentChar;
-            } else if (lineIndentChar != indentChar) {
-                pushError(makeIndentError(
-                        "Used " + indentCharName(lineIndentChar) + " character for indentation instead of "
-                                + indentCharName(indentChar) + " as used before in the file."));
-            }
-
-            // Check if indent or dedent.
-            var previousIndent = indentStack.isEmpty() ? 0 : indentStack.getLast();
-            if (indentCount == previousIndent) {
-                // No change in indentation.
-                return;
-            }
-            if (indentCount > previousIndent) {
-                // Indentation increased.
-                indentStack.add(indentCount);
-                pendingIndents++;
-            } else {
-                // Indentation decreased (dedent).
-                if (indentStack.isEmpty()) {
-                    pushError(makeIndentError("Tokenizer bug: trying to dedent without previous indent."));
-                    return;
-                }
-                while (!indentStack.isEmpty() && indentStack.getLast() > indentCount) {
-                    indentStack.removeLast();
-                    pendingIndents--;
-                }
-                if (indentStack.isEmpty() || indentStack.getLast() != indentCount) {
-                    // Mismatched indentation alignment; stay lenient and keep this level.
-                    pushError(makeIndentError("Unindent doesn't match the previous indentation level."));
-                    indentStack.add(indentCount);
-                }
-            }
+            applyIndentationStep(
+                    indentCount,
+                    lineIndentChar,
+                    mixed,
+                    position - (column - 1),
+                    position,
+                    line,
+                    column,
+                    null
+            );
             break;
         }
     }
