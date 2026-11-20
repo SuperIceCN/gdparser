@@ -67,6 +67,7 @@ import org.jetbrains.annotations.Nullable;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.function.BooleanSupplier;
 
 /// Recursive-descent + Pratt parser producing `frontend.ast` directly from a GDScript source.
 /// Port of `GDScriptParser` (`vendor/godot/gdscript_parser.h` / `gdscript_parser.cpp`), scoped to
@@ -100,10 +101,43 @@ public final class GdScriptParser {
     /// of the reference path).
     private static final String DIAGNOSTIC_NODE_TYPE = "ERROR";
 
+    private record QueuedToken(@NotNull GdToken token, boolean followedContinuation) {
+    }
+
+    private static final class LocalBracketOpener {
+        final @NotNull GdTokenType openerType;
+        final int depth;
+        final int startByte;
+        final int openerLine;
+        final boolean allowsComma;
+        boolean oracleResolved;
+        boolean oracleMissing;
+        @Nullable BracketBalanceOracle.OpenerStatus oracleStatus;
+        int pairedCloserByte = -1;
+        int pairedCloserLine = -1;
+        int pairedCloserIndent = -1;
+        int openerIndent = -1;
+
+        LocalBracketOpener(
+                @NotNull GdTokenType openerType,
+                int depth,
+                int startByte,
+                int openerLine,
+                boolean allowsComma
+        ) {
+            this.openerType = openerType;
+            this.depth = depth;
+            this.startByte = startByte;
+            this.openerLine = openerLine;
+            this.allowsComma = allowsComma;
+        }
+    }
+
     private GdTokenizer tokenizer = GdTokenizer.managed("");
     private byte[] sourceBytes = new byte[0];
     private SourceTextIndex index;
     private GdToken current;
+    private boolean currentFollowedContinuation;
     private GdToken previous;
     private final Deque<Boolean> multilineStack = new ArrayDeque<>();
     /// Start byte of the token that opened each multiline frame, parallel to `multilineStack`.
@@ -113,7 +147,7 @@ public final class GdScriptParser {
     /// Number of active ancestor/current frames expecting `)`, `]`, or `}` respectively.
     private final int[] openCloserCounts = new int[3];
     /// Single-step lookahead buffer used when peeking past a `NEWLINE` without consuming it.
-    private final Deque<GdToken> tokenQueue = new ArrayDeque<>();
+    private final Deque<QueuedToken> tokenQueue = new ArrayDeque<>();
     /// Source spans of closed grouping frames. Comments inside them are grouping-internal: the
     /// reference path materializes them as unknown-expression placeholders, which this parser
     /// cannot reproduce (registered parity difference), so every drain skips them. Recording
@@ -126,6 +160,10 @@ public final class GdScriptParser {
     /// Lazy single-pass lexical bracket-balance oracle for cross-line multiline disambiguation.
     private @Nullable BracketBalanceOracle bracketOracle;
     private final RecoveryTransactionTracker recoveryTracker = new RecoveryTransactionTracker();
+    /// Active outer property recovery frame while draining a discarded property accessor suite,
+    /// so inner diagnostics fall back onto the owning `VariableDeclaration`'s `variable.property`
+    /// facet instead of leaking onto unreachable local nodes.
+    private RecoveryTransactionTracker.@Nullable ProvisionalFrame isolatedFallbackFrame;
 
     /// Annotations parsed but not yet flushed into a statement sequence. They flush (in source
     /// order) right before the next dispatched statement, and the flushed run that sits on the
@@ -137,10 +175,6 @@ public final class GdScriptParser {
     /// Start byte of the parameter currently being parsed; the signature loops set this because a
     /// variadic `...` marker extends the parameter range to the marker start.
     private int parameterStartByte;
-    /// Whether the last `parseStatement` core dispatch produced no statement (Godot's `nullptr`
-    /// return). The suite circuit breaker counts this — not the flushed annotation output — so a
-    /// failed declaration preceded by annotations still counts, exactly like Godot.
-    private boolean lastStatementWasNull;
     /// Whether the script-level `extends` was already used (set by both the standalone and the
     /// same-line `class_name … extends` forms; Godot tracks it on the root class node).
     private boolean scriptExtendsUsed;
@@ -194,6 +228,9 @@ public final class GdScriptParser {
     private int[] cachedLineIndent = new int[0];
     private int[] cachedLineFirstContentByte = new int[0];
     private int lineIndentScanSteps;
+    private int signatureContinuationScanSteps;
+    private int circuitBreakerStackOps;
+    private int circuitBreakerOracleResolutions;
 
     public GdScriptParser() {
     }
@@ -212,14 +249,17 @@ public final class GdScriptParser {
         cachedLineFirstContentByte = new int[lineCount];
         Arrays.fill(cachedLineFirstContentByte, -1);
         lineIndentScanSteps = 0;
+        signatureContinuationScanSteps = 0;
+        circuitBreakerStackOps = 0;
+        circuitBreakerOracleResolutions = 0;
         multilineStack.clear();
         multilineStartStack.clear();
         structuralStack.clear();
         tokenQueue.clear();
         Arrays.fill(openCloserCounts, 0);
         recoveryTracker.reset();
+        isolatedFallbackFrame = null;
         pendingAnnotations.clear();
-        lastStatementWasNull = false;
         scriptExtendsUsed = false;
         canBreak = false;
         canContinue = false;
@@ -265,6 +305,7 @@ public final class GdScriptParser {
             leadingPendingSync = false;
         }
         current = token;
+        currentFollowedContinuation = token.type() != GdTokenType.EOF && tokenizer.isLineContinuation();
 
         var statements = parseProgram(leadingPendingSync);
         // Vendor invariant (debug-only there): the multiline stack must be balanced by the end
@@ -301,7 +342,7 @@ public final class GdScriptParser {
     /// Scans until a non-ERROR token, converting each ERROR token into a staged lexical diagnostic
     /// (the parser never observes ERROR tokens, mirroring `GDScriptParser::advance`). Staging
     /// prevents lookahead errors from binding to a still-open previous-statement frame.
-    private GdToken scanSkippingErrors() {
+    private @NotNull QueuedToken scanSkippingErrors() {
         var token = tokenizer.scan();
         while (token.isError()) {
             recoveryTracker.stageLexicalError(
@@ -311,10 +352,10 @@ public final class GdScriptParser {
             );
             token = tokenizer.scan();
         }
-        return token;
+        return new QueuedToken(token, tokenizer.isLineContinuation());
     }
 
-    private @NotNull GdToken nextScannedToken() {
+    private @NotNull QueuedToken nextScannedToken() {
         if (!tokenQueue.isEmpty()) {
             return tokenQueue.removeFirst();
         }
@@ -325,7 +366,7 @@ public final class GdScriptParser {
         if (tokenQueue.isEmpty()) {
             tokenQueue.addLast(scanSkippingErrors());
         }
-        return tokenQueue.getFirst().type();
+        return tokenQueue.getFirst().token().type();
     }
 
     /// Port of `GDScriptParser::advance`. Godot soft-fails on EOF (`ERR_FAIL_COND_V_MSG`,
@@ -340,7 +381,16 @@ public final class GdScriptParser {
         lambdaEnded = false;
         trailingLambdaEndByte = -1;
         previous = current;
-        current = nextScannedToken();
+        var next = nextScannedToken();
+        current = next.token();
+        currentFollowedContinuation = next.followedContinuation();
+    }
+
+    /// Returns `previous` as a non-null token. `parse(...)` initializes `previous` to an `EMPTY`
+    /// sentinel before parsing starts, and `advance()` only ever replaces it with non-null tokens
+    /// produced by `tokenizer.scan()`.
+    private @NotNull GdToken requirePreviousToken() {
+        return Objects.requireNonNull(previous, "previous token must be initialized before parsing");
     }
 
     /// End byte of the consumed span of the expression most recently parsed at this level:
@@ -581,6 +631,41 @@ public final class GdScriptParser {
         return lineIndentScanSteps;
     }
 
+    int signatureContinuationScanSteps() {
+        return signatureContinuationScanSteps;
+    }
+
+    int circuitBreakerStackOps() {
+        return circuitBreakerStackOps;
+    }
+
+    int circuitBreakerOracleResolutions() {
+        return circuitBreakerOracleResolutions;
+    }
+
+    private @Nullable StructuralFrame enclosingLambdaDelimiterFrame() {
+        var seenLambda = false;
+        var it = structuralStack.descendingIterator();
+        while (it.hasNext()) {
+            var frame = it.next();
+            if (!seenLambda) {
+                if (frame.role == StructuralRole.LAMBDA) {
+                    seenLambda = true;
+                }
+                continue;
+            }
+            if (frame.isBracketed()) {
+                return frame;
+            }
+        }
+        return null;
+    }
+
+    private boolean isOracleCloserMissing(int openerStartByte) {
+        var fact = bracketOracle().factFor(openerStartByte);
+        return fact == null || fact.status() == BracketBalanceOracle.OpenerStatus.MISSING;
+    }
+
     private @NotNull BracketBalanceOracle bracketOracle() {
         if (bracketOracle == null) {
             bracketOracle = new BracketBalanceOracle(tokenizer.codePoints(), tokenizer.byteOffsets());
@@ -655,7 +740,7 @@ public final class GdScriptParser {
             return false;
         }
         var suiteBaseline = enclosingSuiteBaseline(activeFrame);
-        var potentialDedentEscape = suiteBaseline > 0 && !tokenizer.isLineContinuation()
+        var potentialDedentEscape = suiteBaseline > 0 && !currentFollowedContinuation
                 && current.startByte() < sourceBytes.length
                 && current.startLine() > previous.endLine() && isLineStartToken(current)
                 && lineIndentOf(current.startByte()) < suiteBaseline;
@@ -692,11 +777,12 @@ public final class GdScriptParser {
         if (layoutTokens.isEmpty()) {
             return;
         }
-        tokenQueue.addFirst(current);
+        tokenQueue.addFirst(new QueuedToken(current, currentFollowedContinuation));
         for (var i = layoutTokens.size() - 1; i >= 1; i--) {
-            tokenQueue.addFirst(layoutTokens.get(i));
+            tokenQueue.addFirst(new QueuedToken(layoutTokens.get(i), false));
         }
         current = layoutTokens.getFirst();
+        currentFollowedContinuation = false;
     }
 
     private static GdTokenType matchingCloserFor(GdTokenType opener) {
@@ -706,6 +792,367 @@ public final class GdScriptParser {
             case BRACE_OPEN -> GdTokenType.BRACE_CLOSE;
             default -> throw new IllegalArgumentException("Not a bracket opener: " + opener);
         };
+    }
+
+    private void ensureLocalOpenerOracleResolved(@NotNull LocalBracketOpener opener) {
+        if (opener.oracleResolved) {
+            return;
+        }
+        opener.oracleResolved = true;
+        circuitBreakerOracleResolutions++;
+        var fact = bracketOracle().factFor(opener.startByte);
+        opener.oracleStatus = fact != null ? fact.status() : null;
+        if (fact == null || fact.status() == BracketBalanceOracle.OpenerStatus.MISSING) {
+            opener.oracleMissing = true;
+            return;
+        }
+        opener.oracleMissing = false;
+        opener.pairedCloserByte = fact.pairedCloserByte();
+        opener.pairedCloserLine = fact.pairedCloserLine();
+        if (opener.pairedCloserByte >= 0 && opener.pairedCloserLine > 0) {
+            opener.pairedCloserIndent = lineIndentForOneBasedLine(opener.pairedCloserLine);
+            opener.openerIndent = lineIndentForOneBasedLine(opener.openerLine);
+        }
+    }
+
+    private @Nullable LocalBracketOpener popReplacedLocalOpenerAt(
+            @NotNull ArrayDeque<LocalBracketOpener> deque,
+            int closerByte
+    ) {
+        if (deque.isEmpty()) {
+            return null;
+        }
+        var top = deque.peekLast();
+        ensureLocalOpenerOracleResolved(top);
+        if (top.oracleStatus == BracketBalanceOracle.OpenerStatus.REPLACED
+                && top.pairedCloserByte == closerByte) {
+            circuitBreakerStackOps++;
+            deque.removeLast();
+            return top;
+        }
+        return null;
+    }
+
+    private void unwindSkippedInnerLocalOpeners(
+            int closedOpenerStartByte,
+            @NotNull ArrayDeque<LocalBracketOpener> deque
+    ) {
+        while (!deque.isEmpty()) {
+            circuitBreakerStackOps++;
+            var top = deque.peekLast();
+            if (top.startByte <= closedOpenerStartByte) {
+                break;
+            }
+            ensureLocalOpenerOracleResolved(top);
+            if (!top.oracleMissing) {
+                break;
+            }
+            circuitBreakerStackOps++;
+            deque.removeLast();
+        }
+    }
+
+    private static boolean isCommaOwningParenPredecessor(
+            @Nullable GdToken token,
+            boolean wasMemberName,
+            boolean wasStatementStart
+    ) {
+        if (token == null) {
+            return false;
+        }
+        if (wasMemberName && isNodeName(token)) {
+            return true;
+        }
+        return switch (token.type()) {
+            case IDENTIFIER, WHEN, FUNC, ANNOTATION, PRELOAD, ASSERT, SUPER,
+                 PARENTHESIS_CLOSE, BRACKET_CLOSE -> true;
+            case MATCH -> !wasStatementStart;
+            default -> false;
+        };
+    }
+
+    private static boolean isSubscriptBracketPredecessor(
+            @Nullable GdToken token,
+            boolean wasMemberName,
+            boolean wasAfterTypeIntroducer,
+            boolean wasStatementStart
+    ) {
+        if (token == null) {
+            return false;
+        }
+        if (wasMemberName && isNodeName(token)) {
+            return true;
+        }
+        if (token.type() == GdTokenType.IDENTIFIER
+                && token.source().equals("Dictionary")
+                && wasAfterTypeIntroducer) {
+            return false;
+        }
+        return switch (token.type()) {
+            case IDENTIFIER, WHEN, CONST_PI, CONST_TAU, CONST_INF, CONST_NAN,
+                 SELF, LITERAL, PARENTHESIS_CLOSE, BRACKET_CLOSE, BRACE_CLOSE -> true;
+            case MATCH -> !wasStatementStart;
+            default -> false;
+        };
+    }
+
+    private boolean settleExitedSubsuiteOpeners(
+            @NotNull ArrayDeque<LocalBracketOpener> deque,
+            int remainingDepth,
+            boolean ancestorSameKindCloserMissing,
+            int suiteIndentBaseline
+    ) {
+        var settledAny = false;
+        while (!deque.isEmpty()) {
+            circuitBreakerStackOps++;
+            var top = deque.peekLast();
+            if (top.depth <= remainingDepth) {
+                break;
+            }
+            ensureLocalOpenerOracleResolved(top);
+            if (!top.oracleMissing) {
+                if (current.type() == GdTokenType.COMMA && top.allowsComma) {
+                    break;
+                }
+                // Only settle an oracle-paired grouping opener when an enclosing same-kind
+                // delimiter lacks a closer and the paired closer sits shallower than the opener's
+                // own line, either on the current outer separator line or shallower than the suite.
+                var canSettlePairedGrouping = ancestorSameKindCloserMissing
+                        && top.pairedCloserByte >= 0
+                        && top.pairedCloserIndent < top.openerIndent
+                        && ((current.startByte() < top.pairedCloserByte
+                                        && top.pairedCloserLine == current.startLine())
+                                || (suiteIndentBaseline > 0
+                                        && top.pairedCloserIndent < suiteIndentBaseline));
+                if (!canSettlePairedGrouping) {
+                    break;
+                }
+            }
+            circuitBreakerStackOps++;
+            deque.removeLast();
+            settledAny = true;
+        }
+        return settledAny;
+    }
+
+    private boolean settleHardStatementOpeners(
+            @NotNull ArrayDeque<LocalBracketOpener> deque,
+            int remainingDepth
+    ) {
+        var settledAny = false;
+        while (!deque.isEmpty()) {
+            circuitBreakerStackOps++;
+            if (deque.peekLast().depth < remainingDepth) {
+                break;
+            }
+            circuitBreakerStackOps++;
+            deque.removeLast();
+            settledAny = true;
+        }
+        return settledAny;
+    }
+
+    private boolean hasExitedSubsuiteOpener(
+            @NotNull ArrayDeque<LocalBracketOpener> deque,
+            int remainingDepth
+    ) {
+        if (deque.isEmpty()) {
+            return false;
+        }
+        circuitBreakerStackOps++;
+        return deque.peekLast().depth > remainingDepth;
+    }
+
+    private boolean isCircuitBreakerHardStatementStarter(
+            @NotNull GdTokenType type,
+            @NotNull ArrayDeque<LocalBracketOpener> localBraces) {
+        return switch (type) {
+            case CLASS, CLASS_NAME, EXTENDS, ENUM, VAR, CONST, SIGNAL, STATIC, ANNOTATION,
+                 RETURN, PASS, BREAK, CONTINUE, BREAKPOINT, WHILE, FOR, ASSERT -> true;
+            case IF -> isStatementHeadColonLineOnSourceBytes(current.endByte(), true);
+            case MATCH -> {
+                if (!localBraces.isEmpty()) {
+                    var brace = localBraces.peekLast();
+                    ensureLocalOpenerOracleResolved(brace);
+                    if (brace.oracleStatus == BracketBalanceOracle.OpenerStatus.MATCHED
+                            && brace.pairedCloserByte >= 0
+                            && current.startByte() < brace.pairedCloserByte) {
+                        yield false;
+                    }
+                }
+                yield isStatementHeadColonLineOnSourceBytes(current.endByte(), false);
+            }
+            default -> false;
+        };
+    }
+
+    /// Distinguishes a statement-head `if <cond>:` / `match <expr>:` on the current logical line
+    /// from an inline `if <cond> else <rhs>` or expression-position `match(arg)` at local bracket
+    /// depth 0 without mutating parser/tokenizer state. Aligns `\` line-continuation (strict `\n`
+    /// or `\r\n`, followed by any whitespace, blank lines, and `#...` comment lines) and
+    /// multi-line non-triple strings with `GdTokenizer`.
+    private boolean isStatementHeadColonLineOnSourceBytes(int pos, boolean stopAtElse) {
+        var len = sourceBytes.length;
+        var depth = 0;
+        while (pos < len) {
+            var b = sourceBytes[pos] & 0xFF;
+            if (b == '\n' || b == '#') {
+                return false;
+            }
+            if (b == '\\') {
+                var nextPos = pos + 1;
+                if (nextPos < len && sourceBytes[nextPos] == '\r'
+                        && nextPos + 1 < len && sourceBytes[nextPos + 1] == '\n') {
+                    nextPos += 2;
+                } else if (nextPos < len && sourceBytes[nextPos] == '\n') {
+                    nextPos++;
+                } else {
+                    pos++;
+                    continue;
+                }
+                pos = nextPos;
+                while (pos < len) {
+                    while (pos < len && (sourceBytes[pos] == ' ' || sourceBytes[pos] == '\t' || sourceBytes[pos] == '\r')) {
+                        pos++;
+                    }
+                    if (pos < len && sourceBytes[pos] == '#') {
+                        while (pos < len && sourceBytes[pos] != '\n') {
+                            pos++;
+                        }
+                    }
+                    if (pos < len && sourceBytes[pos] == '\n') {
+                        pos++;
+                        continue;
+                    }
+                    break;
+                }
+                continue;
+            }
+            if (b == '"' || b == '\''
+                    || ((b == 'r' || b == '&' || b == '^') && pos + 1 < len
+                    && (sourceBytes[pos + 1] == '"' || sourceBytes[pos + 1] == '\''))) {
+                pos = skipStringBytes(pos);
+                continue;
+            }
+            if (b == '(' || b == '[' || b == '{') {
+                if (depth == 0) {
+                    var fact = bracketOracle().factFor(pos);
+                    if (fact != null
+                            && fact.status() == BracketBalanceOracle.OpenerStatus.MATCHED
+                            && fact.pairedCloserByte() > pos) {
+                        pos = fact.pairedCloserByte() + 1;
+                        continue;
+                    }
+                }
+                depth++;
+                pos++;
+                continue;
+            }
+            if (b == ')' || b == ']' || b == '}') {
+                if (depth == 0) {
+                    return false;
+                }
+                depth--;
+                pos++;
+                continue;
+            }
+            if (b == ':' && depth == 0) {
+                if (stopAtElse) {
+                    return true;
+                }
+                var tail = pos + 1;
+                while (tail < len && (sourceBytes[tail] == ' '
+                        || sourceBytes[tail] == '\t'
+                        || sourceBytes[tail] == '\r')) {
+                    tail++;
+                }
+                if (tail < len && sourceBytes[tail] == '#') {
+                    while (tail < len && sourceBytes[tail] != '\n') {
+                        tail++;
+                    }
+                }
+                return tail == len || sourceBytes[tail] == '\n';
+            }
+            if (isAsciiOrUtf8IdentifierStart(b)) {
+                var start = pos;
+                pos++;
+                while (pos < len && isAsciiOrUtf8IdentifierContinue(sourceBytes[pos] & 0xFF)) {
+                    pos++;
+                }
+                if (stopAtElse && depth == 0 && pos - start == 4
+                        && sourceBytes[start] == 'e' && sourceBytes[start + 1] == 'l'
+                        && sourceBytes[start + 2] == 's' && sourceBytes[start + 3] == 'e') {
+                    return false;
+                }
+                continue;
+            }
+            pos++;
+        }
+        return false;
+    }
+
+    private int skipStringBytes(int pos) {
+        var len = sourceBytes.length;
+        var isRaw = false;
+        var b = sourceBytes[pos] & 0xFF;
+        if (b == 'r') {
+            isRaw = true;
+            pos++;
+        } else if (b == '&' || b == '^') {
+            pos++;
+        }
+        if (pos >= len) {
+            return pos;
+        }
+        var quote = sourceBytes[pos++] & 0xFF;
+        var isTriple = pos + 1 < len
+                && (sourceBytes[pos] & 0xFF) == quote
+                && (sourceBytes[pos + 1] & 0xFF) == quote;
+        if (isTriple) {
+            pos += 2;
+        }
+        while (pos < len) {
+            var c = sourceBytes[pos] & 0xFF;
+            if (c == '\\') {
+                pos++;
+                if (pos >= len) {
+                    return pos;
+                }
+                if (isRaw) {
+                    if ((sourceBytes[pos] & 0xFF) == quote || (sourceBytes[pos] & 0xFF) == '\\') {
+                        pos++;
+                    }
+                } else {
+                    pos++;
+                }
+                continue;
+            }
+            if (c == quote) {
+                if (isTriple) {
+                    if (pos + 2 < len
+                            && (sourceBytes[pos + 1] & 0xFF) == quote
+                            && (sourceBytes[pos + 2] & 0xFF) == quote) {
+                        return pos + 3;
+                    }
+                    pos++;
+                    continue;
+                }
+                return pos + 1;
+            }
+            pos++;
+        }
+        return pos;
+    }
+
+    private static boolean isAsciiOrUtf8IdentifierStart(int b) {
+        return (b >= 'a' && b <= 'z')
+                || (b >= 'A' && b <= 'Z')
+                || b == '_'
+                || b >= 0x80;
+    }
+
+    private static boolean isAsciiOrUtf8IdentifierContinue(int b) {
+        return isAsciiOrUtf8IdentifierStart(b) || (b >= '0' && b <= '9');
     }
 
     /// Settles a contiguous chain of open bracketed frames iteratively in one forward scan after
@@ -837,7 +1284,7 @@ public final class GdScriptParser {
             if (type == GdTokenType.NEWLINE && !tokenizer.isMultilineMode()) {
                 break;
             }
-            if (current.startLine() > rejectionLine && !tokenizer.isLineContinuation()
+            if (current.startLine() > rejectionLine && !currentFollowedContinuation
                     && current.startByte() < sourceBytes.length && isLineStartToken(current)) {
                 var indent = lineIndentOf(current.startByte());
                 if (outermostIsMissing) {
@@ -1002,9 +1449,28 @@ public final class GdScriptParser {
         };
     }
 
-    /// Opens an owner context for a facet that may hold a damaged expression.
+    /// Opens an owner context for a facet that may hold a damaged expression. Inside an isolated
+    /// property suite, child frames inherit the owning `variable.property` fallback so discarded
+    /// local constructs never swallow diagnostics.
     private void pushRecoveryOwner(String facet) {
-        recoveryTracker.pushFrame(facet);
+        if (isolatedFallbackFrame != null) {
+            recoveryTracker.pushChildFrame(facet, isolatedFallbackFrame, "variable.property");
+        } else {
+            recoveryTracker.pushFrame(facet);
+        }
+    }
+
+    /// Opens a parameter slot owner anchored to its enclosing signature/signal frame so dropped
+    /// duplicate parameters still attribute supported diagnostics to the outer declaration.
+    private void pushParameterSlotOwner(
+            @NotNull String facet,
+            RecoveryTransactionTracker.@Nullable ProvisionalFrame signatureFrame
+    ) {
+        if (signatureFrame != null) {
+            recoveryTracker.pushChildFrame(facet, signatureFrame, signatureFrame.facet());
+        } else {
+            pushRecoveryOwner(facet);
+        }
     }
 
     /// Closes the innermost owner context and returns it for later binding. The frame is popped
@@ -1243,7 +1709,6 @@ public final class GdScriptParser {
                         return;
                     }
                     default -> {
-                        // Keep scanning.
                     }
                 }
             }
@@ -1326,6 +1791,12 @@ public final class GdScriptParser {
         return cachedLineIndent[row];
     }
 
+    private int lineIndentForOneBasedLine(int oneBasedLine) {
+        var row = oneBasedLine - 1;
+        ensureLineMetadataCached(row);
+        return cachedLineIndent[row];
+    }
+
     private void ensureLineMetadataCached(int row) {
         if (cachedLineIndent[row] >= 0) {
             return;
@@ -1370,7 +1841,9 @@ public final class GdScriptParser {
         while (current.type() == GdTokenType.NEWLINE
                 || current.type() == GdTokenType.INDENT
                 || current.type() == GdTokenType.DEDENT) {
-            current = nextScannedToken();
+            var next = nextScannedToken();
+            current = next.token();
+            currentFollowedContinuation = next.followedContinuation();
         }
     }
 
@@ -1471,6 +1944,78 @@ public final class GdScriptParser {
         if (!found && !isAtEnd()) {
             pushError("Expected end of statement after %s, found \"%s\" instead."
                     .formatted(context, current.type().displayName()));
+            if (previous.type() != GdTokenType.NEWLINE
+                    && previous.type() != GdTokenType.SEMICOLON
+                    && previous.type() != GdTokenType.INDENT
+                    && previous.type() != GdTokenType.DEDENT
+                    && (current.startLine() <= previous.endLine() || currentFollowedContinuation)) {
+                // Drain remaining tokens on the same logical line (including explicit `\`
+                // continuations) so separator-less trailing declarations (e.g., `super. 0 var y = 1`
+                // or `super. \\\n var y = 1`) cannot survive as a second statement, while stopping
+                // before layout tokens, comma-owning lists, or ancestor closers.
+                var drainLine = previous.endLine();
+                var localParens = 0;
+                var localBrackets = 0;
+                var localBraces = 0;
+                while (!isAtEnd()) {
+                    if (current.type() == GdTokenType.NEWLINE
+                            || current.type() == GdTokenType.SEMICOLON
+                            || current.type() == GdTokenType.INDENT
+                            || current.type() == GdTokenType.DEDENT
+                            || (current.startLine() > drainLine && !currentFollowedContinuation)) {
+                        break;
+                    }
+                    if (current.type() == GdTokenType.COMMA && hasCommaOwningAncestor()) {
+                        if (inLambda) {
+                            lambdaEnded = true;
+                        }
+                        break;
+                    }
+                    if (isCloserToken(current.type())) {
+                        var matchingLocalOpeners = switch (current.type()) {
+                            case PARENTHESIS_CLOSE -> localParens;
+                            case BRACKET_CLOSE -> localBrackets;
+                            case BRACE_CLOSE -> localBraces;
+                            default -> 0;
+                        };
+                        if (matchingLocalOpeners == 0
+                                && (hasMatchingAncestorCloser(current.type())
+                                        || (inLambda && canDeferReplacementCloserToEnclosingDelimiter()))) {
+                            if (inLambda) {
+                                lambdaEnded = true;
+                            }
+                            break;
+                        }
+                    }
+                    switch (current.type()) {
+                        case PARENTHESIS_OPEN -> localParens++;
+                        case PARENTHESIS_CLOSE -> {
+                            if (localParens > 0) {
+                                localParens--;
+                            }
+                        }
+                        case BRACKET_OPEN -> localBrackets++;
+                        case BRACKET_CLOSE -> {
+                            if (localBrackets > 0) {
+                                localBrackets--;
+                            }
+                        }
+                        case BRACE_OPEN -> localBraces++;
+                        case BRACE_CLOSE -> {
+                            if (localBraces > 0) {
+                                localBraces--;
+                            }
+                        }
+                        default -> {
+                        }
+                    }
+                    advance();
+                    drainLine = previous.endLine();
+                }
+                if (isStatementEndToken() && !isAtEnd()) {
+                    advance();
+                }
+            }
             markCurrentFramePendingSync();
         }
     }
@@ -1641,6 +2186,7 @@ public final class GdScriptParser {
     private void parseClassBody(boolean multiline, List<Statement> statements, int bodyIndent) {
         var classEnd = false;
         var nextIsStatic = false;
+        var unexpectedIndentDepth = 0;
         while (!classEnd && !isAtEnd()) {
             var token = current;
             switch (token.type()) {
@@ -1717,8 +2263,20 @@ public final class GdScriptParser {
                     statements.add(new PassStatement(range(statementStartByte, previous.endByte())));
                     endStatement("\"pass\"");
                 }
+                case INDENT -> {
+                    if (multiline) {
+                        advance();
+                        pushError("Unexpected %s in class body.".formatted(debugName(previous)));
+                        unexpectedIndentDepth++;
+                    } else {
+                        reportUnexpectedClassBodyToken();
+                    }
+                }
                 case DEDENT -> {
-                    if (bodyIndent > 0) {
+                    if (multiline && unexpectedIndentDepth > 0) {
+                        unexpectedIndentDepth--;
+                        advance();
+                    } else if (bodyIndent > 0) {
                         classEnd = true;
                     } else {
                         advance();
@@ -1915,6 +2473,10 @@ public final class GdScriptParser {
     /// pending, the closing DEDENT becomes optional in that case, and `lambdaEnded` is raised when
     /// the suite finishes so the enclosing statement ends without a newline token.
     private @NotNull Block parseSuite(String context, boolean forLambda) {
+        return parseSuite(context, forLambda, false);
+    }
+
+    private @NotNull Block parseSuite(String context, boolean forLambda, boolean consumedNewline) {
         // Depth guard: nested control-flow suites recurse via parseStatement. The rejected
         // suite's tokens are not consumed here; the poisoned synchronize() pass that follows
         // (triggered by the enclosing statement's panic-mode tail or the match loop head)
@@ -1923,23 +2485,27 @@ public final class GdScriptParser {
             return new Block(List.of(), range(current.startByte(), current.startByte()));
         }
         try {
-            return parseSuiteImpl(context, forLambda);
+            return parseSuiteImpl(context, forLambda, consumedNewline);
         } finally {
             exitNestingLevel();
         }
     }
 
-    private @NotNull Block parseSuiteImpl(String context, boolean forLambda) {
-        var headerEnd = previous != null ? previous.endByte() : 0;
-        var multiline = match(GdTokenType.NEWLINE);
+    private @NotNull Block parseSuiteImpl(String context, boolean forLambda, boolean consumedNewline) {
+        // `previous` cannot be null here: `parse(...)` seeds it with an EMPTY sentinel before
+        // parsing starts, `advance()` only assigns non-null tokens returned by `tokenizer.scan()`,
+        // and every suite caller has already consumed at least its construct header token.
+        var headerEnd = requirePreviousToken().endByte();
+        var multiline = consumedNewline || match(GdTokenType.NEWLINE);
         int blockStart;
         var suiteIndent = -1;
         if (multiline) {
+            var newlineToken = requirePreviousToken();
             // A comment trailing the suite-header line (`if x: # c`) is dropped by both paths.
-            var commentEnd = discardTrailingCommentsBefore(previous.startByte());
+            var commentEnd = discardTrailingCommentsBefore(newlineToken.startByte());
             // The reference path spans the body from right after the header content: trailing
             // whitespace before the newline is included, a trailing comment is not.
-            blockStart = layoutBlockStart(previous, Math.max(headerEnd, commentEnd));
+            blockStart = layoutBlockStart(newlineToken, Math.max(headerEnd, commentEnd));
             if (!consume(GdTokenType.INDENT, "Expected indented block after %s.".formatted(context))) {
                 return new Block(List.of(), range(blockStart, blockStart));
             }
@@ -1953,26 +2519,72 @@ public final class GdScriptParser {
         var suiteLayoutBaseline = multiline && !check(GdTokenType.DEDENT) && !isAtEnd()
                 ? lineIndentOf(current.startByte())
                 : 0;
+        // Comments strictly before `blockStart` belong to the suite header (for instance on a `\`
+        // continuation line before `:`), never inside this Block's byte envelope.
+        while (commentCursor < comments.size() && comments.get(commentCursor).startByte() < blockStart) {
+            commentCursor++;
+        }
         var suiteFrame = pushStructuralFrame(StructuralFrame.nonBracketed(
                 StructuralRole.SUITE, blockStart, suiteLayoutBaseline, multiline, false, context));
         var statements = new ArrayList<Statement>();
         var errorCount = 0;
+        var unexpectedIndentDepth = 0;
+        var trippedCircuitBreaker = false;
+        var consumedPrefixOnLine = false;
         try {
+            suiteLoop:
             do {
-                if (isAtEnd() || (!multiline && previous.type() == GdTokenType.SEMICOLON && check(GdTokenType.NEWLINE))) {
+                if (isAtEnd() || (!multiline && !consumedPrefixOnLine
+                        && previous.type() == GdTokenType.SEMICOLON && check(GdTokenType.NEWLINE))) {
                     break;
                 }
-                var produced = parseStatement();
-                if (lastStatementWasNull) {
+                if (multiline && check(GdTokenType.DEDENT)) {
+                    if (unexpectedIndentDepth > 0) {
+                        unexpectedIndentDepth--;
+                        advance();
+                        continue;
+                    }
+                    break;
+                }
+                if (multiline && check(GdTokenType.INDENT)) {
+                    advance();
+                    pushError("Expected statement, found \"%s\" instead."
+                            .formatted(previous.type().displayName()));
+                    unexpectedIndentDepth++;
                     if (errorCount++ > 100) {
-                        pushError("Too many statement errors.");
-                        break;
+                        recoveryTracker.emitError(
+                                "Too many statement errors.",
+                                tokenRange(previous),
+                                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS,
+                                RecoveryTransactionTracker.AttributionPolicy.STANDALONE,
+                                null
+                        );
+                        trippedCircuitBreaker = true;
+                        break suiteLoop;
                     }
                     continue;
                 }
-                statements.addAll(produced);
-            } while ((multiline || previous.type() == GdTokenType.SEMICOLON)
-                    && !check(GdTokenType.DEDENT)
+                consumedPrefixOnLine = false;
+                switch (parseStatement()) {
+                    case StatementProgress.Produced(var produced) -> statements.addAll(produced);
+                    case StatementProgress.ConsumedPrefix _ ->
+                            consumedPrefixOnLine = previous.type() != GdTokenType.NEWLINE;
+                    case StatementProgress.Failed _ -> {
+                        if (errorCount++ > 100) {
+                            recoveryTracker.emitError(
+                                    "Too many statement errors.",
+                                    tokenRange(previous),
+                                    DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS,
+                                    RecoveryTransactionTracker.AttributionPolicy.STANDALONE,
+                                    null
+                            );
+                            trippedCircuitBreaker = true;
+                            break suiteLoop;
+                        }
+                    }
+                }
+            } while ((multiline || consumedPrefixOnLine || previous.type() == GdTokenType.SEMICOLON)
+                    && (!check(GdTokenType.DEDENT) || unexpectedIndentDepth > 0)
                     && !lambdaEnded
                     && !isAtEnd());
         } finally {
@@ -1980,7 +2592,504 @@ public final class GdScriptParser {
         }
 
         if (multiline) {
-            if (!lambdaEnded) {
+            if (trippedCircuitBreaker) {
+                // Drain the aborted suite plus every extra unexpected INDENT it claimed so
+                // enclosing declarations never inherit leftover statements or DEDENTs, while
+                // yielding immediately at an outer inline-lambda separator or closer once
+                // statement-head match tracking and hard-line/exited-subsuite settlement agree.
+                var remainingDepth = unexpectedIndentDepth + 1;
+                var localParens = new ArrayDeque<LocalBracketOpener>();
+                var localBrackets = new ArrayDeque<LocalBracketOpener>();
+                var localBraces = new ArrayDeque<LocalBracketOpener>();
+                var lastToken = requirePreviousToken();
+                var atLineStart = lastToken.type() == GdTokenType.NEWLINE
+                        || lastToken.type() == GdTokenType.INDENT
+                        || lastToken.type() == GdTokenType.DEDENT;
+                var atStatementStart = atLineStart || lastToken.type() == GdTokenType.SEMICOLON;
+                var matchHeaderDepth = -1;
+                var matchSawColon = false;
+                var pendingMatchBaseDepth = -1;
+                var matchBodyDepths = new ArrayDeque<Integer>();
+                var inMatchBranchHeader = false;
+                var prevTokenWasPeriod = lastToken.type() == GdTokenType.PERIOD;
+                var previousWasMemberName = false;
+                var declTypeColonEligible = false;
+                var prevTokenWasIs = lastToken.type() == GdTokenType.IS;
+                var prevTokenWasTypeIntroducer = lastToken.type() == GdTokenType.FORWARD_ARROW
+                        || lastToken.type() == GdTokenType.AS
+                        || lastToken.type() == GdTokenType.IS;
+                var previousWasAfterTypeIntroducer = false;
+                var previousWasStatementStart = false;
+                var annotationPrefixState = 0;
+                var annotationParenDepth = 0;
+                var annotationStartDepth = -1;
+                while (remainingDepth > 0 && !isAtEnd()) {
+                    var localOpenersEmpty = localParens.isEmpty() && localBrackets.isEmpty() && localBraces.isEmpty();
+                    if (atLineStart && !currentFollowedContinuation && !localOpenersEmpty
+                            && isCircuitBreakerHardStatementStarter(current.type(), localBraces)) {
+                        var settledAny = settleHardStatementOpeners(localParens, remainingDepth);
+                        settledAny |= settleHardStatementOpeners(localBrackets, remainingDepth);
+                        settledAny |= settleHardStatementOpeners(localBraces, remainingDepth);
+                        if (annotationPrefixState == 2 && localParens.size() < annotationParenDepth) {
+                            annotationPrefixState = 0;
+                            annotationStartDepth = -1;
+                        }
+                        localOpenersEmpty = localParens.isEmpty() && localBrackets.isEmpty() && localBraces.isEmpty();
+                        if (settledAny && localOpenersEmpty) {
+                            matchHeaderDepth = -1;
+                            matchSawColon = false;
+                            pendingMatchBaseDepth = -1;
+                            annotationPrefixState = 0;
+                            annotationStartDepth = -1;
+                            while (!matchBodyDepths.isEmpty() && matchBodyDepths.peekLast() > remainingDepth) {
+                                matchBodyDepths.removeLast();
+                            }
+                            inMatchBranchHeader = !matchBodyDepths.isEmpty()
+                                    && matchBodyDepths.peekLast() == remainingDepth;
+                        }
+                    }
+                    // Register a match body's branch depth on the first non-layout token after
+                    // `match ...:\n` whenever it sits strictly deeper than the match statement's
+                    // own line depth, independent of how many intermediate continuation indents or
+                    // dedents occurred between the header and the first branch.
+                    if (pendingMatchBaseDepth >= 0
+                            && current.type() != GdTokenType.NEWLINE
+                            && current.type() != GdTokenType.INDENT
+                            && current.type() != GdTokenType.DEDENT) {
+                        if (remainingDepth > pendingMatchBaseDepth) {
+                            matchBodyDepths.addLast(remainingDepth);
+                            inMatchBranchHeader = true;
+                        }
+                        pendingMatchBaseDepth = -1;
+                    }
+                    if (inLambda) {
+                        var potentialOuterBoundary = (current.type() == GdTokenType.COMMA && hasCommaOwningAncestor())
+                                || (isCloserToken(current.type()) && hasMatchingAncestorCloser(current.type()));
+                        if (potentialOuterBoundary
+                                && (hasExitedSubsuiteOpener(localParens, remainingDepth)
+                                        || hasExitedSubsuiteOpener(localBrackets, remainingDepth)
+                                        || hasExitedSubsuiteOpener(localBraces, remainingDepth))) {
+                            var enclosingDelimiter = enclosingLambdaDelimiterFrame();
+                            var ancestorCloserMissing = enclosingDelimiter != null
+                                    && isOracleCloserMissing(enclosingDelimiter.openerStartByte);
+                            var enclosingOpenerType = enclosingDelimiter != null
+                                    ? enclosingDelimiter.openerType
+                                    : null;
+                            var settledAny = settleExitedSubsuiteOpeners(
+                                    localParens, remainingDepth,
+                                    ancestorCloserMissing && enclosingOpenerType == GdTokenType.PARENTHESIS_OPEN,
+                                    suiteLayoutBaseline);
+                            settledAny |= settleExitedSubsuiteOpeners(
+                                    localBrackets, remainingDepth,
+                                    ancestorCloserMissing && enclosingOpenerType == GdTokenType.BRACKET_OPEN,
+                                    suiteLayoutBaseline);
+                            settledAny |= settleExitedSubsuiteOpeners(
+                                    localBraces, remainingDepth,
+                                    ancestorCloserMissing && enclosingOpenerType == GdTokenType.BRACE_OPEN,
+                                    suiteLayoutBaseline);
+                            if (annotationPrefixState == 2 && localParens.size() < annotationParenDepth) {
+                                annotationPrefixState = 0;
+                                annotationStartDepth = -1;
+                            }
+                            localOpenersEmpty = localParens.isEmpty() && localBrackets.isEmpty() && localBraces.isEmpty();
+                            if (settledAny && localOpenersEmpty) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                                pendingMatchBaseDepth = -1;
+                                annotationPrefixState = 0;
+                                annotationStartDepth = -1;
+                                while (!matchBodyDepths.isEmpty() && matchBodyDepths.peekLast() > remainingDepth) {
+                                    matchBodyDepths.removeLast();
+                                }
+                                inMatchBranchHeader = !matchBodyDepths.isEmpty()
+                                        && matchBodyDepths.peekLast() == remainingDepth;
+                            }
+                        }
+                        if (!inMatchBranchHeader
+                                && localOpenersEmpty
+                                && current.type() == GdTokenType.COMMA
+                                && hasCommaOwningAncestor()) {
+                            lambdaEnded = true;
+                            break;
+                        }
+                        if (isCloserToken(current.type())) {
+                            var hasMatchingLocal = switch (current.type()) {
+                                case PARENTHESIS_CLOSE -> {
+                                    circuitBreakerStackOps++;
+                                    yield !localParens.isEmpty();
+                                }
+                                case BRACKET_CLOSE -> {
+                                    circuitBreakerStackOps++;
+                                    yield !localBrackets.isEmpty();
+                                }
+                                case BRACE_CLOSE -> {
+                                    circuitBreakerStackOps++;
+                                    yield !localBraces.isEmpty();
+                                }
+                                default -> false;
+                            };
+                            // A multiline suite never defers an unmatched closer of another kind
+                            // to an enclosing call/container; only an exact matching ancestor closer
+                            // terminates the lambda body early.
+                            if (!hasMatchingLocal && hasMatchingAncestorCloser(current.type())) {
+                                lambdaEnded = true;
+                                break;
+                            }
+                        }
+                    }
+                    var currentType = current.type();
+                    var currentWasStatementStart = atStatementStart;
+                    var currentTypeIsTypeColon = false;
+                    if (atStatementStart && localOpenersEmpty
+                            && (currentType == GdTokenType.VAR
+                                    || currentType == GdTokenType.CONST
+                                    || currentType == GdTokenType.FOR)) {
+                        declTypeColonEligible = true;
+                    }
+                    switch (currentType) {
+                        case MATCH -> {
+                            if (atStatementStart && localOpenersEmpty) {
+                                matchHeaderDepth = annotationStartDepth >= 0
+                                        ? annotationStartDepth
+                                        : remainingDepth;
+                                matchSawColon = false;
+                            } else if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            atLineStart = false;
+                            atStatementStart = false;
+                        }
+                        case COLON -> {
+                            var isTypeColon = isIdentifier(requirePreviousToken())
+                                    && ((localOpenersEmpty && declTypeColonEligible)
+                                            || (!localParens.isEmpty()
+                                                    && localBrackets.isEmpty()
+                                                    && localBraces.isEmpty()));
+                            currentTypeIsTypeColon = isTypeColon;
+                            declTypeColonEligible = false;
+                            if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            if (localOpenersEmpty) {
+                                inMatchBranchHeader = false;
+                                if (matchHeaderDepth >= 0 && remainingDepth >= matchHeaderDepth) {
+                                    if (matchSawColon) {
+                                        matchHeaderDepth = -1;
+                                        matchSawColon = false;
+                                    } else {
+                                        matchSawColon = true;
+                                    }
+                                }
+                            } else if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            atLineStart = false;
+                            atStatementStart = localOpenersEmpty && !isTypeColon;
+                        }
+                        case NEWLINE -> {
+                            declTypeColonEligible = false;
+                            if (annotationPrefixState != 2) {
+                                annotationPrefixState = 0;
+                                annotationStartDepth = -1;
+                            }
+                            if (localOpenersEmpty) {
+                                if (matchHeaderDepth >= 0 && matchSawColon) {
+                                    pendingMatchBaseDepth = matchHeaderDepth;
+                                }
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                                inMatchBranchHeader = !matchBodyDepths.isEmpty()
+                                        && matchBodyDepths.peekLast() == remainingDepth;
+                            }
+                            atLineStart = true;
+                            atStatementStart = true;
+                        }
+                        case INDENT -> {
+                            declTypeColonEligible = false;
+                            if (annotationPrefixState != 2) {
+                                annotationPrefixState = 0;
+                                annotationStartDepth = -1;
+                            }
+                            remainingDepth++;
+                            if (localOpenersEmpty) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                                inMatchBranchHeader = !matchBodyDepths.isEmpty()
+                                        && matchBodyDepths.peekLast() == remainingDepth;
+                            }
+                            atLineStart = true;
+                            atStatementStart = true;
+                        }
+                        case DEDENT -> {
+                            declTypeColonEligible = false;
+                            if (annotationPrefixState != 2) {
+                                annotationPrefixState = 0;
+                                annotationStartDepth = -1;
+                            }
+                            remainingDepth--;
+                            if (pendingMatchBaseDepth >= 0 && remainingDepth <= pendingMatchBaseDepth) {
+                                pendingMatchBaseDepth = -1;
+                            }
+                            if (localOpenersEmpty) {
+                                while (!matchBodyDepths.isEmpty() && matchBodyDepths.peekLast() > remainingDepth) {
+                                    matchBodyDepths.removeLast();
+                                }
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                                inMatchBranchHeader = !matchBodyDepths.isEmpty()
+                                        && matchBodyDepths.peekLast() == remainingDepth;
+                            } else if (remainingDepth < matchHeaderDepth) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            atLineStart = true;
+                            atStatementStart = true;
+                        }
+                        case SEMICOLON -> {
+                            declTypeColonEligible = false;
+                            if (localOpenersEmpty) {
+                                annotationPrefixState = 0;
+                                annotationStartDepth = -1;
+                            }
+                            matchHeaderDepth = -1;
+                            matchSawColon = false;
+                            pendingMatchBaseDepth = -1;
+                            atLineStart = false;
+                            atStatementStart = true;
+                        }
+                        case ANNOTATION -> {
+                            if (atStatementStart && localOpenersEmpty) {
+                                annotationPrefixState = 1;
+                                if (annotationStartDepth < 0) {
+                                    annotationStartDepth = remainingDepth;
+                                }
+                                atStatementStart = true;
+                            } else {
+                                if (annotationPrefixState != 2) {
+                                    annotationPrefixState = 0;
+                                    annotationStartDepth = -1;
+                                }
+                                atStatementStart = false;
+                            }
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            atLineStart = false;
+                        }
+                        case PARENTHESIS_OPEN -> {
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            circuitBreakerStackOps++;
+                            localParens.addLast(new LocalBracketOpener(
+                                    GdTokenType.PARENTHESIS_OPEN, remainingDepth, current.startByte(),
+                                    current.startLine(),
+                                    isCommaOwningParenPredecessor(
+                                            previous, previousWasMemberName, previousWasStatementStart)));
+                            if (annotationPrefixState == 1) {
+                                annotationPrefixState = 2;
+                                annotationParenDepth = localParens.size();
+                            } else if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            atLineStart = false;
+                            atStatementStart = false;
+                        }
+                        case BRACKET_OPEN -> {
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            circuitBreakerStackOps++;
+                            localBrackets.addLast(new LocalBracketOpener(
+                                    GdTokenType.BRACKET_OPEN, remainingDepth, current.startByte(),
+                                    current.startLine(),
+                                    !isSubscriptBracketPredecessor(
+                                            previous,
+                                            previousWasMemberName,
+                                            previousWasAfterTypeIntroducer,
+                                            previousWasStatementStart)));
+                            atLineStart = false;
+                            atStatementStart = false;
+                        }
+                        case BRACE_OPEN -> {
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            circuitBreakerStackOps++;
+                            localBraces.addLast(new LocalBracketOpener(
+                                    GdTokenType.BRACE_OPEN, remainingDepth, current.startByte(),
+                                    current.startLine(), true));
+                            atLineStart = false;
+                            atStatementStart = false;
+                        }
+                        case PARENTHESIS_CLOSE -> {
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            circuitBreakerStackOps++;
+                            LocalBracketOpener closedOpener;
+                            if (!localParens.isEmpty()) {
+                                closedOpener = localParens.removeLast();
+                            } else {
+                                closedOpener = popReplacedLocalOpenerAt(localBrackets, current.startByte());
+                                if (closedOpener == null) {
+                                    closedOpener = popReplacedLocalOpenerAt(localBraces, current.startByte());
+                                }
+                            }
+                            if (closedOpener != null) {
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localParens);
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localBrackets);
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localBraces);
+                            }
+                            atLineStart = false;
+                            if (annotationPrefixState == 2 && localParens.size() < annotationParenDepth) {
+                                annotationPrefixState = 0;
+                                if (closedOpener != null
+                                        && closedOpener.openerType == GdTokenType.PARENTHESIS_OPEN
+                                        && localParens.size() == annotationParenDepth - 1) {
+                                    atStatementStart = true;
+                                } else {
+                                    annotationStartDepth = -1;
+                                    atStatementStart = false;
+                                }
+                            } else {
+                                if (annotationPrefixState != 2) {
+                                    annotationStartDepth = -1;
+                                }
+                                atStatementStart = false;
+                            }
+                        }
+                        case BRACKET_CLOSE -> {
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            circuitBreakerStackOps++;
+                            LocalBracketOpener closedOpener;
+                            if (!localBrackets.isEmpty()) {
+                                closedOpener = localBrackets.removeLast();
+                            } else {
+                                closedOpener = popReplacedLocalOpenerAt(localParens, current.startByte());
+                                if (closedOpener == null) {
+                                    closedOpener = popReplacedLocalOpenerAt(localBraces, current.startByte());
+                                }
+                            }
+                            if (closedOpener != null) {
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localParens);
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localBrackets);
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localBraces);
+                            }
+                            if (annotationPrefixState == 2 && localParens.size() < annotationParenDepth) {
+                                annotationPrefixState = 0;
+                                annotationStartDepth = -1;
+                            } else if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            atLineStart = false;
+                            atStatementStart = false;
+                        }
+                        case BRACE_CLOSE -> {
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            circuitBreakerStackOps++;
+                            LocalBracketOpener closedOpener;
+                            if (!localBraces.isEmpty()) {
+                                closedOpener = localBraces.removeLast();
+                            } else {
+                                closedOpener = popReplacedLocalOpenerAt(localParens, current.startByte());
+                                if (closedOpener == null) {
+                                    closedOpener = popReplacedLocalOpenerAt(localBrackets, current.startByte());
+                                }
+                            }
+                            if (closedOpener != null) {
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localParens);
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localBrackets);
+                                unwindSkippedInnerLocalOpeners(closedOpener.startByte, localBraces);
+                            }
+                            if (annotationPrefixState == 2 && localParens.size() < annotationParenDepth) {
+                                annotationPrefixState = 0;
+                                annotationStartDepth = -1;
+                            } else if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            atLineStart = false;
+                            atStatementStart = false;
+                        }
+                        case IN, EQUAL -> {
+                            declTypeColonEligible = false;
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            atLineStart = false;
+                            atStatementStart = false;
+                        }
+                        default -> {
+                            if (matchSawColon) {
+                                matchHeaderDepth = -1;
+                                matchSawColon = false;
+                            }
+                            if (annotationPrefixState != 2) {
+                                annotationStartDepth = -1;
+                            }
+                            atLineStart = false;
+                            atStatementStart = false;
+                        }
+                    }
+                    if (annotationPrefixState == 1
+                            && currentType != GdTokenType.ANNOTATION
+                            && currentType != GdTokenType.PARENTHESIS_OPEN) {
+                        annotationPrefixState = 0;
+                        annotationStartDepth = -1;
+                    }
+                    if (currentType == GdTokenType.NEWLINE
+                            || currentType == GdTokenType.INDENT
+                            || currentType == GdTokenType.DEDENT) {
+                        previousWasMemberName = false;
+                        previousWasAfterTypeIntroducer = false;
+                        previousWasStatementStart = false;
+                        prevTokenWasIs = false;
+                        if (localOpenersEmpty && !currentFollowedContinuation) {
+                            prevTokenWasPeriod = false;
+                            prevTokenWasTypeIntroducer = false;
+                        }
+                    } else {
+                        previousWasMemberName = prevTokenWasPeriod && isNodeName(current);
+                        previousWasAfterTypeIntroducer = prevTokenWasTypeIntroducer;
+                        previousWasStatementStart = currentWasStatementStart;
+                        prevTokenWasPeriod = currentType == GdTokenType.PERIOD;
+                        var nextTypeIntroducer = currentType == GdTokenType.FORWARD_ARROW
+                                || currentType == GdTokenType.AS
+                                || currentType == GdTokenType.IS
+                                || currentTypeIsTypeColon
+                                || (currentType == GdTokenType.NOT && prevTokenWasIs);
+                        prevTokenWasIs = currentType == GdTokenType.IS;
+                        prevTokenWasTypeIntroducer = nextTypeIntroducer;
+                    }
+                    advance();
+                }
+            } else if (!lambdaEnded) {
                 consume(GdTokenType.DEDENT, "Missing unindent at the end of %s.".formatted(context));
             } else {
                 match(GdTokenType.DEDENT);
@@ -2004,11 +3113,10 @@ public final class GdScriptParser {
         return new Block(List.copyOf(statements), range(blockStart, blockEnd));
     }
 
-    /// Discard path of the expression-statement dispatch for outcomes that already carry their
-    /// root-cause diagnostic (`Failed`, or a `Damaged` expression not sitting at a statement
-    /// boundary): inside a lambda the failure ends the lambda without consuming the token;
-    /// outside, exactly one token is consumed (EOF-guarded, mirroring the vendor's soft-failing
-    /// `advance()`) so the following `synchronize()` keeps its usual boundary. No
+    /// Discard path of the expression-statement dispatch for `Failed` outcomes that already carry
+    /// their root-cause diagnostic: inside a lambda the failure ends the lambda without consuming
+    /// the token; outside, exactly one token is consumed (EOF-guarded, mirroring the vendor's
+    /// soft-failing `advance()`) so the following `synchronize()` keeps its usual boundary. No
     /// `endStatement` call and no additional diagnostic.
     private void discardFailedStatement() {
         if (inLambda) {
@@ -2041,36 +3149,49 @@ public final class GdScriptParser {
         };
     }
 
+    /// Explicit tri-state outcome of one `parseStatement()` step so legal prefix annotations
+    /// (`ConsumedPrefix`) never consume the suite circuit-breaker budget reserved for `Failed`.
+    private sealed interface StatementProgress {
+        record Produced(@NotNull List<Statement> statements) implements StatementProgress {
+        }
+
+        record ConsumedPrefix() implements StatementProgress {
+            static final ConsumedPrefix INSTANCE = new ConsumedPrefix();
+        }
+
+        record Failed() implements StatementProgress {
+            static final Failed INSTANCE = new Failed();
+        }
+    }
+
     /// Port of `GDScriptParser::parse_statement` for the declaration-scoped subset: `pass`, local
     /// `var`/`const`, statement annotations, and expression statements built from the available
-    /// expression subset. Returns the flushed annotations plus the parsed statement; an empty list
-    /// mirrors Godot's `nullptr` return (counted by the suite's circuit breaker).
-    private @NotNull List<Statement> parseStatement() {
+    /// expression subset. Distinguishes `Produced` (statement built), `ConsumedPrefix` (legal
+    /// statement-level annotation consumed without counting as an error), and `Failed` (counts
+    /// toward the suite circuit-breaker budget).
+    private @NotNull StatementProgress parseStatement() {
         // A construct aborted on the nesting budget upstream poisons the current token region:
         // skip straight to synchronization (which also lifts the poison flag) instead of
         // letting partial constructs interpret the leftover tokens.
         if (nestingBudgetExceeded) {
-            lastStatementWasNull = true;
             synchronize();
-            return List.of();
+            return StatementProgress.Failed.INSTANCE;
         }
-        // Statement-level annotations are collected and attach to the next real statement; the
-        // annotation-only result is empty like Godot's null return.
+        // Statement-level annotations are collected and attach to the next real statement;
+        // consuming one is valid progress (`ConsumedPrefix`) and does not consume failure budget.
         if (current.type() == GdTokenType.ANNOTATION) {
             advance();
             pendingAnnotations.add(parseAnnotation());
-            // An annotation-only round produces no statement (Godot returns `nullptr` here too).
-            lastStatementWasNull = true;
             if (consumeCurrentFramePendingSync() || nestingBudgetExceeded) {
                 synchronize();
             }
-            return List.of();
+            return StatementProgress.ConsumedPrefix.INSTANCE;
         }
 
-        lastStatementWasNull = false;
         statementStartByte = computeStatementStart(current);
         var produced = new ArrayList<>(drainAnnotationsAndComments(current.startByte()));
         Statement result;
+        var terminatedLambda = false;
         switch (current.type()) {
             case PASS -> {
                 advance();
@@ -2184,17 +3305,12 @@ public final class GdScriptParser {
                         endStatement("expression");
                     }
                     case ParseOutcome.Damaged<Expression>(var expression) -> {
-                        if (isStatementEndToken() || lambdaEnded || (inLambda && isVirtualLambdaBoundary())) {
-                            // A damaged expression survives only at a real statement boundary (or
-                            // an ancestor-owned inline lambda boundary); `isStatementEnd()` cannot
-                            // gate this because it is always true inside a lambda.
-                            result = new ExpressionStatement(expression, range(statementStartByte, extentEnd()));
-                            bindRecoveryOwner(expressionFrame, result);
-                            endStatement("expression");
-                        } else {
-                            discardFailedStatement();
-                            result = null;
-                        }
+                        // A damaged expression already has an explicit AST node; retain the
+                        // statement and hand tail cleanup to `endStatement` so trailing non-end
+                        // tokens on the same line are still diagnosed rather than silently split.
+                        result = new ExpressionStatement(expression, range(statementStartByte, extentEnd()));
+                        bindRecoveryOwner(expressionFrame, result);
+                        endStatement("expression");
                     }
                     case ParseOutcome.Failed<Expression> _ -> {
                         // The root cause was already reported inside; no generic message here.
@@ -2206,6 +3322,7 @@ public final class GdScriptParser {
                             // Inside a lambda, an ancestor-owned delimiter or suite end terminates
                             // the lambda without consuming the boundary token.
                             lambdaEnded = true;
+                            terminatedLambda = true;
                         } else {
                             if (!isAtEnd()) {
                                 advance();
@@ -2224,16 +3341,19 @@ public final class GdScriptParser {
             }
         }
 
-        lastStatementWasNull = result == null;
-        if (result != null) {
-            produced.add(result);
+        if (result == null) {
+            if (consumeCurrentFramePendingSync() || nestingBudgetExceeded) {
+                synchronize();
+            }
+            return terminatedLambda ? StatementProgress.ConsumedPrefix.INSTANCE : StatementProgress.Failed.INSTANCE;
         }
+        produced.add(result);
         // A comment trailing the statement's own line lands right after it.
         produced.addAll(drainTrailingComments());
         if (consumeCurrentFramePendingSync() || nestingBudgetExceeded) {
             synchronize();
         }
-        return List.copyOf(produced);
+        return new StatementProgress.Produced(List.copyOf(produced));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2326,24 +3446,31 @@ public final class GdScriptParser {
 
     /// Port of `GDScriptParser::parse_for`: optional `: type` after the loop variable (the two
     /// distinct `in` error messages depend on whether a type was given), iterable expression, and
-    /// a loop suite with break/continue enabled. A failed iterable keeps a marker in the
-    /// surviving statement (vendor keeps the node with a null iterable); a missing loop variable
-    /// name still drops the statement (no node can carry the failure).
-    private @Nullable Statement parseFor() {
+    /// a loop suite with break/continue enabled. Both a missing loop variable name (`iterator = ""`)
+    /// and a failed iterable retain the `ForStatement` node with diagnostic attribution.
+    private @NotNull Statement parseFor() {
         var start = statementStartByte;
-        var hasIterator = consume(GdTokenType.IDENTIFIER, "Expected loop variable name after \"for\".");
+        pushRecoveryOwner("for.iterator");
+        var hasIterator = match(GdTokenType.IDENTIFIER);
+        if (!hasIterator) {
+            recoveryTracker.emitError(
+                    "Expected loop variable name after \"for\".",
+                    tokenRange(previous),
+                    DiagnosticCodes.FOR_MISSING_ITERATOR,
+                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                    null
+            );
+        }
         var iterator = hasIterator ? previous.source() : "";
 
         TypeRef iteratorType = null;
-        RecoveryTransactionTracker.ProvisionalFrame iteratorTypeFrame = null;
         if (match(GdTokenType.COLON)) {
-            pushRecoveryOwner("for.iterator");
             iteratorType = parseType(false);
-            iteratorTypeFrame = popRecoveryOwner();
             if (iteratorType == null) {
                 pushError("Expected type specifier after \":\".");
             }
         }
+        var iteratorFrame = popRecoveryOwner();
 
         if (iteratorType == null) {
             consume(GdTokenType.IN, "Expected \"in\" or \":\" after \"for\" variable name.");
@@ -2370,18 +3497,9 @@ public final class GdScriptParser {
         canBreak = couldBreak;
         canContinue = couldContinue;
 
-        if (!hasIterator) {
-            if (iteratorTypeFrame != null) {
-                recoveryTracker.abandon(iteratorTypeFrame);
-            }
-            recoveryTracker.abandon(iterableFrame);
-            return null;
-        }
         var statement = new ForStatement(iterator, iteratorType, iterable, body,
                 range(start, body.range().endByte()));
-        if (iteratorTypeFrame != null) {
-            bindRecoveryOwner(iteratorTypeFrame, statement);
-        }
+        bindRecoveryOwner(iteratorFrame, statement);
         bindRecoveryOwner(iterableFrame, statement);
         return statement;
     }
@@ -2514,6 +3632,7 @@ public final class GdScriptParser {
                 StructuralRole.MATCH_BODY, matchBodyStart, matchLayoutBaseline, true, false, "match body"));
         try {
             while (!check(GdTokenType.DEDENT) && !isAtEnd()) {
+                var loopStart = current;
                 // A depth trip inside a branch leaves a poisoned region that ends at the branch
                 // indentation; consume it before interpreting the next line as a branch (the match
                 // level has no parseStatement tail hook of its own). The `continue` re-checks the
@@ -2544,6 +3663,9 @@ public final class GdScriptParser {
                 }
                 sections.add(parseMatchSection());
                 danglingAnnotations.clear();
+                if (current == loopStart && !check(GdTokenType.DEDENT) && !isAtEnd()) {
+                    advance();
+                }
             }
         } finally {
             popStructuralFrame(matchBodyFrame);
@@ -2585,6 +3707,7 @@ public final class GdScriptParser {
     /// bind-conflict checks (multiple patterns with a bind, duplicate or shadowing binds) are
     /// symbol-table-dependent and deferred to the analysis layer.
     private @NotNull MatchSection parseMatchSection() {
+        var sectionStartToken = current;
         var start = current.startByte();
         var patterns = new ArrayList<Expression>();
         var sawAnyPattern = false;
@@ -2622,18 +3745,59 @@ public final class GdScriptParser {
             guardFrame = popRecoveryOwner();
         }
 
+        pushRecoveryOwner("match.section");
+        var missingColon = !match(GdTokenType.COLON);
+        if (missingColon) {
+            recoveryTracker.emitError(
+                    hasGuard
+                            ? "Expected \":\" after \"match\" pattern guard."
+                            : "Expected \":\" or \"when\" after \"match\" patterns.",
+                    tokenRange(previous),
+                    DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON,
+                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                    null
+            );
+        }
+        var sectionFrame = popRecoveryOwner();
+
         Block body;
-        if (!consume(GdTokenType.COLON, hasGuard
-                ? "Expected \":\" after \"match\" pattern guard."
-                : "Expected \":\" or \"when\" after \"match\" patterns.")) {
-            // Vendor recovery: consume the rest of the line; the next line starts a new branch.
-            while (current.type() != GdTokenType.NEWLINE && !isAtEnd()) {
-                advance();
+        if (missingColon) {
+            var sectionConsumedAny = current != sectionStartToken;
+            var alreadyAtLineBoundary = isAtEnd()
+                    || (sectionConsumedAny
+                            && (previous.type() == GdTokenType.NEWLINE
+                                    || previous.type() == GdTokenType.DEDENT))
+                    || lambdaEnded
+                    || (hasGuard && current.startLine() > guard.range().endPoint().row() + 1);
+            if (lambdaEnded) {
+                lambdaEnded = false;
             }
-            if (!isAtEnd()) {
-                advance();
+            if (alreadyAtLineBoundary) {
+                if (previous.type() == GdTokenType.NEWLINE && check(GdTokenType.INDENT)) {
+                    // An inline lambda guard already consumed the line break before an indented
+                    // suite: parse it directly so the stray INDENT does not desync sibling branches.
+                    body = parseSuite("match pattern block", false, true);
+                } else {
+                    var emptyEnd = Math.max(start, extentEnd());
+                    body = new Block(List.of(), range(emptyEnd, emptyEnd));
+                }
+            } else {
+                // Drain only the remainder of the malformed branch header line, stopping before DEDENT
+                // so an outer layout boundary is never stolen; take over a real indented suite only
+                // when `NEWLINE + INDENT` immediately follows.
+                while (current.type() != GdTokenType.NEWLINE
+                        && current.type() != GdTokenType.DEDENT
+                        && !isAtEnd()) {
+                    advance();
+                }
+                if (check(GdTokenType.NEWLINE) && peekAfterCurrent() == GdTokenType.INDENT) {
+                    body = parseSuite("match pattern block");
+                } else {
+                    match(GdTokenType.NEWLINE);
+                    var emptyEnd = Math.max(start, previous.endByte());
+                    body = new Block(List.of(), range(emptyEnd, emptyEnd));
+                }
             }
-            body = new Block(List.of(), range(start, previous.endByte()));
         } else {
             body = parseSuite("match pattern block");
         }
@@ -2646,6 +3810,7 @@ public final class GdScriptParser {
         }
         var section = new MatchSection(List.copyOf(patterns), guard, body,
                 range(sectionStart, body.range().endByte()));
+        bindRecoveryOwner(sectionFrame, section);
         bindRecoveryOwner(patternFrame, section);
         if (guardFrame != null) {
             bindRecoveryOwner(guardFrame, section);
@@ -2733,36 +3898,36 @@ public final class GdScriptParser {
                     || isAtUnclosedMultilineStop()) {
                 break;
             }
+            var itemStart = current.startByte();
+            var diagBefore = recoveryTracker.diagnosticCount();
             var sub = parseMatchPattern();
-            if (sub == null) {
-                if (arrayPatternFrame.settled || nestingBudgetExceeded) {
-                    break;
-                }
-                continue;
-            }
-            if (openEnded) {
-                pushError("The \"..\" pattern must be the last element in the pattern array.");
-                if (!sub.rest()) {
+            if (sub != null) {
+                if (openEnded) {
+                    pushError("The \"..\" pattern must be the last element in the pattern array.");
+                    if (!sub.rest()) {
+                        elements.add(sub.expression());
+                    }
+                } else if (sub.rest()) {
+                    openEnded = true;
+                } else {
                     elements.add(sub.expression());
                 }
-            } else if (sub.rest()) {
-                openEnded = true;
-            } else {
-                elements.add(sub.expression());
             }
-        } while (!arrayPatternFrame.settled && !nestingBudgetExceeded && match(GdTokenType.COMMA));
+            if (!advanceSeparatedList(arrayPatternFrame, itemStart, previous,
+                    recoveryTracker.diagnosticCount() > diagBefore, this::isArrayPatternStarter)) {
+                break;
+            }
+        } while (true);
 
         consumeCloser(arrayPatternFrame);
         return new MatchPattern(new ArrayExpression(List.copyOf(elements), openEnded,
                 range(start, Math.max(start, extentEnd()))), false);
     }
 
-    /// Dictionary pattern: `key: pattern` entries, the `..` rest marker, and healthy key-only
-    /// entries (`DictEntry(key, null, range)` with zero diagnostics). A failed key keeps a marker
-    /// in its entry when a `: sub-pattern` carrier survives; when no carrier exists (no colon,
-    /// a dropped sub-pattern, or a `..`-misuse branch that drops the entry), the damaged key would
-    /// be homeless, so the whole dictionary pattern degrades to an ERROR fragment covering the
-    /// consumed prefix.
+    /// Dictionary pattern: `key: pattern` entries, the `..` rest marker, and key-only or
+    /// damaged-key entries (`DictEntry(key, null, range)`). Entries stay independent so a damaged
+    /// key without a colon never discards surviving sibling entries, and non-starter garbage
+    /// after a damaged entry is boundedly skipped at the same bracket level.
     private @NotNull MatchPattern parseDictionaryMatchPattern() {
         var start = current.startByte();
         pushMultiline();
@@ -2782,65 +3947,62 @@ public final class GdScriptParser {
 
         var entries = new ArrayList<DictEntry>();
         var openEnded = false;
-        var homelessDamagedKey = false;
         do {
             if (dictPatternFrame.settled || nestingBudgetExceeded
                     || check(GdTokenType.BRACE_CLOSE) || isAtEnd()
                     || isAtUnclosedMultilineStop()) {
                 break;
             }
+            var itemStart = current.startByte();
+            var diagBefore = recoveryTracker.diagnosticCount();
             if (match(GdTokenType.PERIOD_PERIOD)) {
                 if (openEnded) {
                     pushError("The \"..\" pattern must be the last element in the pattern dictionary.");
                 } else {
                     openEnded = true;
                 }
-                continue;
-            }
-            var keyStart = current.startByte();
-            var keyOutcome = parseExpression(false);
-            if (dictPatternFrame.settled || nestingBudgetExceeded) {
-                break;
-            }
-            var key = absorbSlot(keyOutcome, keyStart, "dictionary_pattern.key",
-                    "Expected expression as key for dictionary pattern.");
-            var keyDamaged = !(keyOutcome instanceof ParseOutcome.Ok<Expression>);
-            if (match(GdTokenType.COLON)) {
-                var sub = parseMatchPattern();
-                if (sub == null) {
-                    homelessDamagedKey |= keyDamaged;
+            } else {
+                var keyStart = current.startByte();
+                var keyOutcome = parseExpression(false);
+                if (dictPatternFrame.settled || nestingBudgetExceeded) {
+                    break;
+                }
+                var key = absorbSlot(keyOutcome, keyStart, "dictionary_pattern.key",
+                        "Expected expression as key for dictionary pattern.");
+                if (match(GdTokenType.COLON)) {
+                    var sub = parseMatchPattern();
                     if (dictPatternFrame.settled || nestingBudgetExceeded) {
                         break;
                     }
-                    continue;
-                }
-                if (openEnded) {
-                    pushError("The \"..\" pattern must be the last element in the pattern dictionary.");
-                    homelessDamagedKey |= keyDamaged;
-                } else if (sub.rest()) {
-                    pushError("The \"..\" pattern cannot be used as a value.");
-                    homelessDamagedKey |= keyDamaged;
+                    if (sub != null) {
+                        if (openEnded) {
+                            pushError("The \"..\" pattern must be the last element in the pattern dictionary.");
+                            if (!sub.rest()) {
+                                entries.add(new DictEntry(key, sub.expression(),
+                                        range(Math.min(keyStart, key.range().startByte()),
+                                                Objects.requireNonNull(sub.expression()).range().endByte())));
+                            }
+                        } else if (sub.rest()) {
+                            pushError("The \"..\" pattern cannot be used as a value.");
+                        } else {
+                            entries.add(new DictEntry(key, sub.expression(),
+                                    range(Math.min(keyStart, key.range().startByte()),
+                                            Objects.requireNonNull(sub.expression()).range().endByte())));
+                        }
+                    }
                 } else {
-                    entries.add(new DictEntry(key, sub.expression(),
+                    entries.add(new DictEntry(key, null,
                             range(Math.min(keyStart, key.range().startByte()),
-                                    Objects.requireNonNull(sub.expression()).range().endByte())));
+                                    Math.max(key.range().endByte(), extentEnd()))));
                 }
-            } else if (keyDamaged) {
-                // A damaged key without a `: value` carrier has no representable home.
-                homelessDamagedKey = true;
-            } else {
-                entries.add(new DictEntry(key, null,
-                        range(Math.min(keyStart, key.range().startByte()),
-                                Math.max(key.range().endByte(), extentEnd()))));
             }
-        } while (!dictPatternFrame.settled && !nestingBudgetExceeded && match(GdTokenType.COMMA));
+            if (!advanceSeparatedList(dictPatternFrame, itemStart, previous,
+                    recoveryTracker.diagnosticCount() > diagBefore, this::isDictionaryPatternKeyStarter)) {
+                break;
+            }
+        } while (true);
 
         consumeCloser(dictPatternFrame);
-        if (homelessDamagedKey) {
-            var end = extentEnd();
-            return new MatchPattern(new ErrorExpression(CstIssueKind.ERROR, DIAGNOSTIC_NODE_TYPE,
-                    slice(start, end), range(start, end)), false);
-        }
         return new MatchPattern(new DictionaryExpression(List.copyOf(entries), openEnded,
                 range(start, Math.max(start, extentEnd()))), false);
     }
@@ -3037,10 +4199,25 @@ public final class GdScriptParser {
     /// get/set property tail is consumed but, per the AST contract, produces no nodes.
     private @Nullable VariableDeclaration parseVariable(boolean isStatic, boolean allowProperty) {
         var start = statementStartByte;
-        if (!consume(GdTokenType.IDENTIFIER, "Expected variable name after \"var\".")) {
+        String name;
+        RecoveryTransactionTracker.ProvisionalFrame nameFrame = null;
+        if (match(GdTokenType.IDENTIFIER)) {
+            name = previous.source();
+        } else if (check(GdTokenType.COLON) || check(GdTokenType.EQUAL)) {
+            pushRecoveryOwner("declaration.name");
+            recoveryTracker.emitError(
+                    "Expected variable name after \"var\".",
+                    tokenRange(previous),
+                    DiagnosticCodes.DECLARATION_MISSING_NAME,
+                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                    null
+            );
+            nameFrame = popRecoveryOwner();
+            name = "";
+        } else {
+            pushError("Expected variable name after \"var\".");
             return null;
         }
-        var name = previous.source();
 
         TypeRef type = null;
         RecoveryTransactionTracker.ProvisionalFrame typeFrame = null;
@@ -3056,8 +4233,14 @@ public final class GdScriptParser {
                     var propertyFrame = popRecoveryOwner();
                     var variable = new VariableDeclaration(DeclarationKind.VAR, name, null, null, isStatic,
                             "variable_statement", range(start, end));
+                    if (nameFrame != null) {
+                        bindRecoveryOwner(nameFrame, variable);
+                    }
                     bindRecoveryOwner(propertyFrame, variable);
                     return variable;
+                }
+                if (nameFrame != null) {
+                    recoveryTracker.abandon(nameFrame);
                 }
                 pushError("Expected type after \":\"");
                 return null;
@@ -3072,6 +4255,9 @@ public final class GdScriptParser {
                     var propertyFrame = popRecoveryOwner();
                     var variable = new VariableDeclaration(DeclarationKind.VAR, name, null, null, isStatic,
                             "variable_statement", range(start, end));
+                    if (nameFrame != null) {
+                        bindRecoveryOwner(nameFrame, variable);
+                    }
                     bindRecoveryOwner(propertyFrame, variable);
                     return variable;
                 }
@@ -3101,6 +4287,9 @@ public final class GdScriptParser {
             var propertyFrame = popRecoveryOwner();
             var withProperty = new VariableDeclaration(DeclarationKind.VAR, name, type, value, isStatic,
                     "variable_statement", range(start, end));
+            if (nameFrame != null) {
+                bindRecoveryOwner(nameFrame, withProperty);
+            }
             if (typeFrame != null) {
                 bindRecoveryOwner(typeFrame, withProperty);
             }
@@ -3113,6 +4302,9 @@ public final class GdScriptParser {
 
         var variable = new VariableDeclaration(DeclarationKind.VAR, name, type, value, isStatic,
                 "variable_statement", range(start, extentEnd()));
+        if (nameFrame != null) {
+            bindRecoveryOwner(nameFrame, variable);
+        }
         if (typeFrame != null) {
             bindRecoveryOwner(typeFrame, variable);
         }
@@ -3123,92 +4315,298 @@ public final class GdScriptParser {
         return variable;
     }
 
-    /// Port of `GDScriptParser::parse_property` (+ setter/getter helpers): consumes both the
-    /// reference form (`get = name, set = name`) and the inline-suite form (`get:` /
-    /// `set(value):`). Produces no AST and returns the end byte of the whole property tail,
-    /// captured before the trailing statement-end / DEDENT consumption.
+    /// Port of `GDScriptParser::parse_property` (+ setter/getter helpers) extended to drain
+    /// variable-length property blocks and single-line lists: each entry independently parses
+    /// `= fn`, `get:`, `set(v):`, duplicate accessors, or unknown accessors without borrowing an
+    /// outer `DEDENT` or calling global `synchronize()`. Returns the end byte of the last drained
+    /// property part, captured before the trailing statement-end / DEDENT consumption.
     private int parseProperty(boolean needIndent) {
         if (needIndent
                 && !consume(GdTokenType.INDENT, "Expected indented block for property after \":\".")) {
             return previous.endByte();
         }
 
-        if (!consume(GdTokenType.IDENTIFIER, "Expected \"get\" or \"set\" for property declaration.")) {
-            return previous.endByte();
-        }
-        var functionName = previous.source();
-
-        // Reference form when `=` follows the first accessor, inline form otherwise.
-        var referenceForm = check(GdTokenType.EQUAL);
-        if (!referenceForm && !needIndent) {
+        var firstIdent = check(GdTokenType.IDENTIFIER);
+        var firstKeyword = firstIdent && (current.source().equals("get") || current.source().equals("set"));
+        var firstLooksReference = firstIdent && peekAfterCurrent() == GdTokenType.EQUAL;
+        if (!needIndent && firstKeyword && !firstLooksReference) {
             pushError("Property with inline code must go to an indented block.");
         }
 
+        // Lock reference-vs-block style only on the first valid `get`/`set` accessor so leading
+        // unknown entries (such as `oops = g` or `oops:`) never misclassify later valid accessors.
+        Boolean lockedReferenceForm = null;
+        var singleLineReferenceList = !needIndent && firstLooksReference;
         var getterUsed = false;
         var setterUsed = false;
-        var accessorEnd = previous.endByte();
-        // Run in a loop because accessor order doesn't matter.
-        for (var i = 0; i < 2; i++) {
+        var end = previous.endByte();
+        var firstItem = true;
+        var prevConsumedComma = false;
+        while (true) {
+            if (!firstItem) {
+                if (!needIndent) {
+                    if (singleLineReferenceList) {
+                        if (!match(GdTokenType.COMMA)) {
+                            break;
+                        }
+                        if (check(GdTokenType.NEWLINE)) {
+                            // Leave the hard newline unconsumed for `endStatement` so single-line
+                            // reference lists never swallow the next member declaration.
+                            pushError("Inline setter/getter setting cannot span across multiple lines (use \"\\\\\"\" if needed).");
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                } else {
+                    var matchedComma = match(GdTokenType.COMMA);
+                    var commaToken = matchedComma ? previous : null;
+                    var hadSeparator = matchedComma || prevConsumedComma;
+                    prevConsumedComma = false;
+                    match(GdTokenType.NEWLINE);
+                    if (check(GdTokenType.DEDENT) || isAtEnd()) {
+                        if (matchedComma) {
+                            recoveryTracker.emitError(
+                                    "Expected \"get\" or \"set\" for property declaration.",
+                                    tokenRange(commaToken),
+                                    DiagnosticCodes.PROPERTY_INVALID_ACCESSOR,
+                                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                                    null
+                            );
+                        }
+                        break;
+                    }
+                    if (Boolean.TRUE.equals(lockedReferenceForm)
+                            && !hadSeparator
+                            && check(GdTokenType.IDENTIFIER)
+                            && (current.source().equals("get") || current.source().equals("set"))
+                            && peekAfterCurrent() == GdTokenType.EQUAL) {
+                        var point = extentEnd();
+                        recoveryTracker.emitError(
+                                "Expected \",\" between property accessors.",
+                                range(point, point),
+                                DiagnosticCodes.MISSING_SEPARATOR_COMMA,
+                                RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                                null
+                        );
+                    }
+                }
+            }
+            firstItem = false;
+
+            if (needIndent && (check(GdTokenType.DEDENT) || isAtEnd())) {
+                break;
+            }
+            if (!needIndent && isAtEnd()) {
+                break;
+            }
+            var iterationStartToken = current;
+            if (!match(GdTokenType.IDENTIFIER)) {
+                recoveryTracker.emitError(
+                        "Expected \"get\" or \"set\" for property declaration.",
+                        tokenRange(current),
+                        DiagnosticCodes.PROPERTY_INVALID_ACCESSOR,
+                        RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                        null
+                );
+                var stopAtComma = needIndent || singleLineReferenceList || !firstKeyword;
+                end = Math.max(end, drainUnexpectedPropertyAccessor(needIndent, stopAtComma));
+                if (!needIndent) {
+                    if (check(GdTokenType.COMMA) && (singleLineReferenceList || !firstKeyword)) {
+                        singleLineReferenceList = true;
+                        continue;
+                    }
+                    break;
+                }
+                if (current == iterationStartToken && !isAtEnd() && !check(GdTokenType.DEDENT)) {
+                    advance();
+                    end = Math.max(end, previous.endByte());
+                    if (previous.type() == GdTokenType.COMMA) {
+                        prevConsumedComma = true;
+                    }
+                }
+                continue;
+            }
+
+            var functionName = previous.source();
+            var itemIsReferenceForm = check(GdTokenType.EQUAL);
             if (functionName.equals("set")) {
                 if (setterUsed) {
-                    pushError("Properties can only have one setter.");
+                    recoveryTracker.emitError(
+                            "Properties can only have one setter.",
+                            tokenRange(previous),
+                            DiagnosticCodes.PROPERTY_DUPLICATE_SETTER,
+                            RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                            null
+                    );
                 } else {
-                    accessorEnd = parsePropertyAccessor(true, referenceForm);
                     setterUsed = true;
+                }
+                if (Boolean.TRUE.equals(lockedReferenceForm) && !itemIsReferenceForm) {
+                    pushError("Expected \"=\" after \"set\"");
+                }
+                var parseAsReference = lockedReferenceForm != null
+                        ? (lockedReferenceForm && itemIsReferenceForm)
+                        : itemIsReferenceForm;
+                var outcome = parsePropertyAccessor(true, parseAsReference);
+                end = Math.max(end, outcome.endByte());
+                if (lockedReferenceForm == null && outcome.completeHeader()) {
+                    lockedReferenceForm = itemIsReferenceForm;
                 }
             } else if (functionName.equals("get")) {
                 if (getterUsed) {
-                    pushError("Properties can only have one getter.");
+                    recoveryTracker.emitError(
+                            "Properties can only have one getter.",
+                            tokenRange(previous),
+                            DiagnosticCodes.PROPERTY_DUPLICATE_GETTER,
+                            RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                            null
+                    );
                 } else {
-                    accessorEnd = parsePropertyAccessor(false, referenceForm);
                     getterUsed = true;
                 }
+                if (Boolean.TRUE.equals(lockedReferenceForm) && !itemIsReferenceForm) {
+                    pushError("Expected \"=\" after \"get\"");
+                }
+                var parseAsReference = lockedReferenceForm != null
+                        ? (lockedReferenceForm && itemIsReferenceForm)
+                        : itemIsReferenceForm;
+                var outcome = parsePropertyAccessor(false, parseAsReference);
+                end = Math.max(end, outcome.endByte());
+                if (lockedReferenceForm == null && outcome.completeHeader()) {
+                    lockedReferenceForm = itemIsReferenceForm;
+                }
             } else {
-                pushError("Expected \"get\" or \"set\" for property declaration.");
+                recoveryTracker.emitError(
+                        "Expected \"get\" or \"set\" for property declaration.",
+                        tokenRange(previous),
+                        DiagnosticCodes.PROPERTY_INVALID_ACCESSOR,
+                        RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                        null
+                );
+                var stopAtComma = needIndent || singleLineReferenceList || !firstKeyword;
+                end = Math.max(end, drainUnexpectedPropertyAccessor(needIndent, stopAtComma));
+                if (!needIndent && check(GdTokenType.COMMA) && (singleLineReferenceList || !firstKeyword)) {
+                    singleLineReferenceList = true;
+                }
             }
 
-            if (i == 0 && referenceForm) {
-                if (match(GdTokenType.COMMA)) {
-                    // Consume potential newline. (The message text is byte-exact with Godot's
-                    // source, including its quirky quoting.)
-                    if (match(GdTokenType.NEWLINE) && !needIndent) {
-                        pushError("Inline setter/getter setting cannot span across multiple lines (use \"\\\\\"\" if needed).");
-                    }
-                } else {
+            if (current == iterationStartToken && !isAtEnd() && !(needIndent && check(GdTokenType.DEDENT))) {
+                advance();
+                end = Math.max(end, previous.endByte());
+                if (!needIndent) {
                     break;
                 }
             }
-
-            if (!match(GdTokenType.IDENTIFIER)) {
-                break;
-            }
-            functionName = previous.source();
         }
 
-        // Inline form: the property tail ends at the last accessor suite's content end (the
-        // suite's own trailing DEDENT is not part of it, matching the reference path's extent).
-        var end = referenceForm ? previous.endByte() : accessorEnd;
-        if (referenceForm) {
+        if (!needIndent && singleLineReferenceList) {
             endStatement("property declaration");
         }
         if (needIndent) {
             consume(GdTokenType.DEDENT, "Expected end of indented block for property.");
         }
+        // Skip comments strictly inside the drained property extent so they do not leak into the
+        // enclosing class body and violate range containment, while preserving outer comments.
+        while (commentCursor < comments.size() && comments.get(commentCursor).startByte() < end) {
+            commentCursor++;
+        }
         return end;
     }
 
+    /// Drains one unexpected property accessor entry locally: stays on the current logical line
+    /// (breaking at `NEWLINE`/`DEDENT` once `localIndents == 0` regardless of unclosed brackets),
+    /// always consumes at least a stalling `;`, and balances an unexpected nested suite via
+    /// `parseIsolatedSuite` only when `NEWLINE + INDENT` immediately follows in block mode.
+    private int drainUnexpectedPropertyAccessor(boolean allowNestedSuite, boolean stopAtComma) {
+        var end = previous.endByte();
+        var consumedAny = false;
+        var localIndents = 0;
+        var localParens = 0;
+        var localBrackets = 0;
+        var localBraces = 0;
+        while (!isAtEnd()) {
+            if (localIndents == 0 && (check(GdTokenType.NEWLINE) || check(GdTokenType.DEDENT))) {
+                break;
+            }
+            if (localIndents == 0 && localParens == 0 && localBrackets == 0 && localBraces == 0) {
+                if (check(GdTokenType.SEMICOLON) || (stopAtComma && check(GdTokenType.COMMA))) {
+                    break;
+                }
+            }
+            if (current.type() == GdTokenType.DEDENT && localIndents > 0) {
+                localIndents--;
+                advance();
+                consumedAny = true;
+                end = Math.max(end, previous.endByte());
+                if (localIndents == 0) {
+                    break;
+                }
+                continue;
+            }
+            switch (current.type()) {
+                case INDENT -> localIndents++;
+                case PARENTHESIS_OPEN -> localParens++;
+                case PARENTHESIS_CLOSE -> {
+                    if (localParens > 0) {
+                        localParens--;
+                    }
+                }
+                case BRACKET_OPEN -> localBrackets++;
+                case BRACKET_CLOSE -> {
+                    if (localBrackets > 0) {
+                        localBrackets--;
+                    }
+                }
+                case BRACE_OPEN -> localBraces++;
+                case BRACE_CLOSE -> {
+                    if (localBraces > 0) {
+                        localBraces--;
+                    }
+                }
+                default -> {
+                }
+            }
+            advance();
+            consumedAny = true;
+            end = Math.max(end, previous.endByte());
+        }
+        if (!consumedAny && check(GdTokenType.SEMICOLON)) {
+            advance();
+            end = Math.max(end, previous.endByte());
+        }
+        if (allowNestedSuite && check(GdTokenType.NEWLINE)) {
+            if (peekAfterCurrent() == GdTokenType.INDENT) {
+                end = Math.max(end, parseIsolatedSuite("invalid property accessor"));
+            } else {
+                advance();
+            }
+        }
+        return end;
+    }
+
+    private record PropertyAccessorOutcome(int endByte, boolean completeHeader) {
+    }
+
     /// Port of `GDScriptParser::parse_property_setter` / `parse_property_getter`. Returns the end
-    /// byte of the accessor (for the inline form: its suite's content end).
-    private int parsePropertyAccessor(boolean setter, boolean referenceForm) {
+    /// byte of the accessor (for the inline form: its suite's content end) and whether the header
+    /// syntax was complete enough to lock the property's reference-vs-block style.
+    private @NotNull PropertyAccessorOutcome parsePropertyAccessor(boolean setter, boolean referenceForm) {
         if (referenceForm) {
-            consume(GdTokenType.EQUAL, setter ? "Expected \"=\" after \"set\"" : "Expected \"=\" after \"get\"");
-            consume(GdTokenType.IDENTIFIER,
+            var hasEqual = consume(GdTokenType.EQUAL,
+                    setter ? "Expected \"=\" after \"set\"" : "Expected \"=\" after \"get\"");
+            var hasIdent = consume(GdTokenType.IDENTIFIER,
                     setter ? "Expected setter function name after \"=\"." : "Expected getter function name after \"=\".");
-            return previous.endByte();
+            return new PropertyAccessorOutcome(previous.endByte(), hasEqual && hasIdent);
         }
         if (setter) {
+            if (check(GdTokenType.EQUAL)) {
+                pushError("Expected \"(\" after \"set\".");
+                return new PropertyAccessorOutcome(drainUnexpectedPropertyAccessor(true, false), false);
+            }
             StructuralFrame setterParamFrame = null;
-            if (match(GdTokenType.PARENTHESIS_OPEN)) {
+            var hasOpen = match(GdTokenType.PARENTHESIS_OPEN);
+            if (hasOpen) {
                 setterParamFrame = pushBracketedFrame(
                         StructuralRole.PARAMETER_LIST,
                         GdTokenType.PARENTHESIS_OPEN,
@@ -3224,13 +4622,17 @@ public final class GdScriptParser {
             } else {
                 pushError("Expected \"(\" after \"set\".");
             }
-            consume(GdTokenType.IDENTIFIER, "Expected parameter name after \"(\".");
-            if (setterParamFrame != null) {
-                consumeCloser(setterParamFrame);
-            }
-            consume(GdTokenType.COLON, "Expected \":\" after \")\".");
-            return parseIsolatedSuite("setter declaration");
+            var hasParamName = consume(GdTokenType.IDENTIFIER, "Expected parameter name after \"(\".");
+            var hasClose = setterParamFrame != null && consumeCloser(setterParamFrame);
+            var hasColon = consume(GdTokenType.COLON, "Expected \":\" after \")\".");
+            var suiteEnd = parseIsolatedSuite("setter declaration");
+            return new PropertyAccessorOutcome(suiteEnd, hasOpen && hasParamName && hasClose && hasColon);
         }
+        if (check(GdTokenType.EQUAL)) {
+            pushError("Expected \":\" or \"(\" after \"get\".");
+            return new PropertyAccessorOutcome(drainUnexpectedPropertyAccessor(true, false), false);
+        }
+        boolean completeHeader;
         if (match(GdTokenType.PARENTHESIS_OPEN)) {
             var getterParamFrame = pushBracketedFrame(
                     StructuralRole.PARAMETER_LIST,
@@ -3244,20 +4646,24 @@ public final class GdScriptParser {
                     DiagnosticCodes.MISSING_CLOSER_PARAMETER_LIST,
                     DiagnosticCodes.MISMATCHED_CLOSER_PARAMETER_LIST
             );
-            consumeCloser(getterParamFrame);
-            consume(GdTokenType.COLON, "Expected \":\" after \"get()\".");
+            var hasClose = consumeCloser(getterParamFrame);
+            var hasColon = consume(GdTokenType.COLON, "Expected \":\" after \"get()\".");
+            completeHeader = hasClose && hasColon;
         } else {
-            consume(GdTokenType.COLON, "Expected \":\" or \"(\" after \"get\".");
+            completeHeader = consume(GdTokenType.COLON, "Expected \":\" or \"(\" after \"get\".");
         }
-        return parseIsolatedSuite("getter declaration");
+        return new PropertyAccessorOutcome(parseIsolatedSuite("getter declaration"), completeHeader);
     }
 
-    /// Parses an accessor suite with the outer pending annotations saved aside: the suite's
-    /// content is discarded entirely, so annotations inside it must not leak into the outer
-    /// sequence (and the outer sequence's pending annotations must not be stolen by it).
-    /// Returns the suite block's end byte for the property tail's extent.
+    /// Parses an accessor suite with the outer pending annotations saved aside and inner recovery
+    /// frames anchored onto the enclosing property frame: the suite's statements are discarded, so
+    /// annotations never leak out while diagnostics fall back onto `variable.property`.
     private int parseIsolatedSuite(String context) {
         var saved = new ArrayList<>(pendingAnnotations);
+        var previousIsolatedFallback = isolatedFallbackFrame;
+        if (isolatedFallbackFrame == null) {
+            isolatedFallbackFrame = recoveryTracker.activeFrame();
+        }
         pendingAnnotations.clear();
         Block suite;
         try {
@@ -3267,6 +4673,7 @@ public final class GdScriptParser {
             // are discarded with it instead of leaking onto the next outer member.
             pendingAnnotations.clear();
             pendingAnnotations.addAll(saved);
+            isolatedFallbackFrame = previousIsolatedFallback;
         }
         return suite.range().endByte();
     }
@@ -3278,26 +4685,162 @@ public final class GdScriptParser {
     /// Shared name-plus-optional-type prefix of constants and parameters. The name token is
     /// already consumed; a `:` immediately followed by `=` is an inferred type.
     private @NotNull NamedType parseNameAndType(@NotNull String typeFacet) {
+        return parseNameAndType(typeFacet, null, null);
+    }
+
+    private @NotNull NamedType parseNameAndType(
+            @NotNull String typeFacet,
+            @Nullable StructuralFrame enclosingParamList,
+            RecoveryTransactionTracker.@Nullable ProvisionalFrame signatureFrame
+    ) {
         var name = previous.source();
         TypeRef type = null;
         RecoveryTransactionTracker.ProvisionalFrame typeFrame = null;
-        if (match(GdTokenType.COLON)) {
-            var colonToken = previous;
-            if (check(GdTokenType.EQUAL)) {
-                type = inferredTypeRef(colonToken);
-            } else {
-                pushRecoveryOwner(typeFacet);
-                type = parseType(false);
-                typeFrame = popRecoveryOwner();
+        if (enclosingParamList == null || !shouldYieldColonToEnclosingSuite(enclosingParamList)) {
+            if (match(GdTokenType.COLON)) {
+                var colonToken = previous;
+                if (check(GdTokenType.EQUAL)) {
+                    type = inferredTypeRef(colonToken);
+                } else {
+                    pushParameterSlotOwner(typeFacet, signatureFrame);
+                    type = parseType(false);
+                    typeFrame = popRecoveryOwner();
+                }
             }
         }
         return new NamedType(name, type, typeFrame);
     }
 
-    /// Port of `GDScriptParser::parse_constant`. A missing `=` still drops the declaration (no
-    /// expression slot was opened); a failed value keeps a marker and the statement survives,
-    /// consuming the success-path `endStatement` tail (a deliberate improvement over the vendor,
-    /// which drops the node).
+    /// Checks directly on `sourceBytes` (without mutating tokenizer/queue multiline state) whether
+    /// a `:` right after a parameter name in an unclosed parameter list sits at the end of the
+    /// header line and is followed by a strictly deeper indented suite line. O(1) line-layout checks
+    /// run before any cached oracle/signature-continuation query so normal inline `a: int` types
+    /// incur zero extra scanning.
+    private boolean shouldYieldColonToEnclosingSuite(@NotNull StructuralFrame paramListFrame) {
+        if (current.type() != GdTokenType.COLON) {
+            return false;
+        }
+        var pos = current.endByte();
+        while (pos < sourceBytes.length && (sourceBytes[pos] == ' ' || sourceBytes[pos] == '\t' || sourceBytes[pos] == '\r')) {
+            pos++;
+        }
+        if (pos < sourceBytes.length && sourceBytes[pos] == '#') {
+            while (pos < sourceBytes.length && sourceBytes[pos] != '\n') {
+                pos++;
+            }
+        }
+        if (pos >= sourceBytes.length || sourceBytes[pos] != '\n') {
+            return false;
+        }
+        pos++;
+        while (pos < sourceBytes.length) {
+            while (pos < sourceBytes.length && (sourceBytes[pos] == ' ' || sourceBytes[pos] == '\t' || sourceBytes[pos] == '\r')) {
+                pos++;
+            }
+            if (pos < sourceBytes.length && sourceBytes[pos] == '#') {
+                while (pos < sourceBytes.length && sourceBytes[pos] != '\n') {
+                    pos++;
+                }
+            }
+            if (pos < sourceBytes.length && sourceBytes[pos] == '\n') {
+                pos++;
+                continue;
+            }
+            break;
+        }
+        if (pos >= sourceBytes.length) {
+            return false;
+        }
+        var first = sourceBytes[pos];
+        if (first == ')' || first == ']' || first == '}') {
+            return false;
+        }
+        if (lineIndentOf(pos) <= paramListFrame.indentBaseline) {
+            return false;
+        }
+        return isParameterListUnclosed(paramListFrame);
+    }
+
+    private boolean isParameterListUnclosed(@NotNull StructuralFrame paramListFrame) {
+        if (paramListFrame.unclosedParamListCache >= 0) {
+            return paramListFrame.unclosedParamListCache == 1;
+        }
+        var fact = bracketOracle().factFor(paramListFrame.openerStartByte);
+        boolean unclosed;
+        if (fact == null || fact.status() != BracketBalanceOracle.OpenerStatus.MATCHED) {
+            unclosed = true;
+        } else {
+            unclosed = fact.pairedCloserByte() >= 0
+                    && hasUnmatchedOuterParenFrame(paramListFrame)
+                    && !isFollowedBySignatureContinuation(fact.pairedCloserByte() + 1);
+        }
+        paramListFrame.unclosedParamListCache = unclosed ? (byte) 1 : (byte) 0;
+        return unclosed;
+    }
+
+    private boolean hasUnmatchedOuterParenFrame(@NotNull StructuralFrame innerParamList) {
+        for (var frame : structuralStack) {
+            if (frame != innerParamList && frame.expectedCloser == GdTokenType.PARENTHESIS_CLOSE) {
+                var outerFact = bracketOracle().factFor(frame.openerStartByte);
+                if (outerFact == null || outerFact.status() != BracketBalanceOracle.OpenerStatus.MATCHED) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean isFollowedBySignatureContinuation(int pos) {
+        var inLineContinuation = false;
+        while (pos < sourceBytes.length) {
+            signatureContinuationScanSteps++;
+            var b = sourceBytes[pos];
+            if (b == ' ' || b == '\t' || b == '\r') {
+                pos++;
+                continue;
+            }
+            if (b == '\\') {
+                if (pos + 1 < sourceBytes.length && sourceBytes[pos + 1] == '\n') {
+                    inLineContinuation = true;
+                    signatureContinuationScanSteps++;
+                    pos += 2;
+                    continue;
+                }
+                if (pos + 2 < sourceBytes.length && sourceBytes[pos + 1] == '\r' && sourceBytes[pos + 2] == '\n') {
+                    inLineContinuation = true;
+                    signatureContinuationScanSteps += 2;
+                    pos += 3;
+                    continue;
+                }
+                break;
+            }
+            if (inLineContinuation && b == '\n') {
+                pos++;
+                continue;
+            }
+            if (inLineContinuation && b == '#') {
+                pos++;
+                while (pos < sourceBytes.length && sourceBytes[pos] != '\n') {
+                    signatureContinuationScanSteps++;
+                    pos++;
+                }
+                if (pos < sourceBytes.length && sourceBytes[pos] == '\n') {
+                    pos++;
+                }
+                continue;
+            }
+            break;
+        }
+        if (pos >= sourceBytes.length) {
+            return false;
+        }
+        return sourceBytes[pos] == ':'
+                || (sourceBytes[pos] == '-' && pos + 1 < sourceBytes.length && sourceBytes[pos + 1] == '>');
+    }
+
+    /// Port of `GDScriptParser::parse_constant`. A missing `=` retains the constant declaration
+    /// with a zero-width `MISSING` value slot (`SLOT_CONSTANT_VALUE`); a failed value keeps a
+    /// marker and the statement survives, consuming the success-path `endStatement` tail.
     private @Nullable VariableDeclaration parseConstant() {
         var start = statementStartByte;
         if (!consume(GdTokenType.IDENTIFIER, "Expected constant name after \"const\".")) {
@@ -3305,18 +4848,29 @@ public final class GdScriptParser {
         }
         var named = parseNameAndType("constant.type");
 
-        if (!consume(GdTokenType.EQUAL, "Expected initializer after constant name.")) {
-            if (named.typeFrame() != null) {
-                recoveryTracker.abandon(named.typeFrame());
-            }
-            return null;
+        Expression value;
+        RecoveryTransactionTracker.ProvisionalFrame valueFrame;
+        if (match(GdTokenType.EQUAL)) {
+            var valueStart = current.startByte();
+            pushRecoveryOwner("constant.value");
+            var valueOutcome = parseExpression(false);
+            value = absorbSlot(valueOutcome, valueStart, "constant.value",
+                    "Expected initializer expression for constant.");
+            valueFrame = popRecoveryOwner();
+        } else {
+            var missingPos = extentEnd();
+            pushRecoveryOwner("constant.value");
+            recoveryTracker.emitError(
+                    "Expected initializer after constant name.",
+                    tokenRange(previous),
+                    DiagnosticCodes.SLOT_CONSTANT_VALUE,
+                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                    null
+            );
+            valueFrame = popRecoveryOwner();
+            value = new ErrorExpression(CstIssueKind.MISSING, "constant.value", "",
+                    range(missingPos, missingPos));
         }
-        var valueStart = current.startByte();
-        pushRecoveryOwner("constant.value");
-        var valueOutcome = parseExpression(false);
-        var value = absorbSlot(valueOutcome, valueStart, "constant.value",
-                "Expected initializer expression for constant.");
-        var valueFrame = popRecoveryOwner();
 
         var constant = new VariableDeclaration(DeclarationKind.CONST, named.name(), named.type(), value, false,
                 "const_statement", range(start, extentEnd()));
@@ -3328,26 +4882,25 @@ public final class GdScriptParser {
         return constant;
     }
 
-    /// Port of `GDScriptParser::parse_parameter` (the variadic `...` marker itself is consumed by
-    /// the signature loops, which also set {@link #parameterStartByte}). A written `=` whose
-    /// default failed keeps a marker, staying distinguishable from a never-written `=`. The
-    /// default's owner frame is returned unbound: the signature loops bind it to the final
-    /// parameter node (a rest parameter's variadic rebuild replaces the node, and a dropped
-    /// duplicate's frame is dropped with it).
     private @Nullable ParsedParameter parseParameter() {
+        return parseParameter(null);
+    }
+
+    private @Nullable ParsedParameter parseParameter(@Nullable StructuralFrame enclosingParamList) {
         // Capture the start locally: a lambda default reuses the shared field for its own
         // signature's parameters before this parameter's range is computed.
         var start = parameterStartByte;
+        var signatureFrame = recoveryTracker.activeFrame();
         if (!consume(GdTokenType.IDENTIFIER, "Expected parameter name.")) {
             return null;
         }
-        var named = parseNameAndType("parameter.type");
+        var named = parseNameAndType("parameter.type", enclosingParamList, signatureFrame);
 
         Expression defaultValue = null;
         RecoveryTransactionTracker.ProvisionalFrame defaultFrame = null;
         if (match(GdTokenType.EQUAL)) {
             var defaultStart = current.startByte();
-            pushRecoveryOwner("parameter.default");
+            pushParameterSlotOwner("parameter.default", signatureFrame);
             var defaultOutcome = parseExpression(false);
             defaultValue = absorbSlot(defaultOutcome, defaultStart, "parameter.default",
                     "Expected expression for parameter default value after \"=\".");
@@ -3396,44 +4949,49 @@ public final class GdScriptParser {
                     DiagnosticCodes.MISSING_CLOSER_PARAMETER_LIST,
                     DiagnosticCodes.MISMATCHED_CLOSER_PARAMETER_LIST
             );
-            var declaredNames = new ArrayList<String>();
+            var declaredNames = new HashSet<String>();
             do {
-                if (check(GdTokenType.PARENTHESIS_CLOSE) || isAtUnclosedMultilineStop()) {
+                if (paramListFrame.settled || nestingBudgetExceeded
+                        || check(GdTokenType.PARENTHESIS_CLOSE) || isAtUnclosedMultilineStop()) {
                     // Allow for trailing comma or escape at unclosed cross-line stop.
                     break;
                 }
-                parameterStartByte = current.startByte();
+                var itemStart = current.startByte();
+                var diagBefore = recoveryTracker.diagnosticCount();
+                parameterStartByte = itemStart;
                 var parsed = parseParameter();
-                if (parsed == null) {
-                    pushError("Expected signal parameter name.");
+                if (parsed != null) {
+                    var parameter = parsed.parameter();
+                    if (parameter.defaultValue() != null) {
+                        pushError("Signal parameters cannot have a default value.");
+                    }
+                    if (declaredNames.contains(parameter.name())) {
+                        pushError("Parameter with name \"%s\" was already declared for this signal."
+                                .formatted(parameter.name()));
+                        if (parsed.typeFrame() != null) {
+                            recoveryTracker.abandon(parsed.typeFrame());
+                        }
+                        if (parsed.defaultFrame() != null) {
+                            recoveryTracker.abandon(parsed.defaultFrame());
+                        }
+                    } else {
+                        declaredNames.add(parameter.name());
+                        parameters.add(parameter);
+                        if (parsed.typeFrame() != null) {
+                            boundTypeFrames.add(parsed.typeFrame());
+                            boundTypeOwners.add(parameter);
+                        }
+                        if (parsed.defaultFrame() != null) {
+                            boundDefaultFrames.add(parsed.defaultFrame());
+                            boundDefaultOwners.add(parameter);
+                        }
+                    }
+                }
+                if (!advanceSeparatedList(paramListFrame, itemStart, previous,
+                        recoveryTracker.diagnosticCount() > diagBefore, this::isSignalParameterStarter)) {
                     break;
                 }
-                var parameter = parsed.parameter();
-                if (parameter.defaultValue() != null) {
-                    pushError("Signal parameters cannot have a default value.");
-                }
-                if (declaredNames.contains(parameter.name())) {
-                    pushError("Parameter with name \"%s\" was already declared for this signal."
-                            .formatted(parameter.name()));
-                    if (parsed.typeFrame() != null) {
-                        recoveryTracker.abandon(parsed.typeFrame());
-                    }
-                    if (parsed.defaultFrame() != null) {
-                        recoveryTracker.abandon(parsed.defaultFrame());
-                    }
-                } else {
-                    declaredNames.add(parameter.name());
-                    parameters.add(parameter);
-                    if (parsed.typeFrame() != null) {
-                        boundTypeFrames.add(parsed.typeFrame());
-                        boundTypeOwners.add(parameter);
-                    }
-                    if (parsed.defaultFrame() != null) {
-                        boundDefaultFrames.add(parsed.defaultFrame());
-                        boundDefaultOwners.add(parameter);
-                    }
-                }
-            } while (!paramListFrame.settled && !nestingBudgetExceeded && match(GdTokenType.COMMA) && !isAtEnd());
+            } while (true);
 
             consumeCloser(paramListFrame);
             signalParamFrame = popRecoveryOwner();
@@ -3528,10 +5086,27 @@ public final class GdScriptParser {
     /// type); `_static_init` special-casing is cut with the other semantic checks.
     private @Nullable Statement parseFunction(boolean isStatic) {
         var start = statementStartByte;
-        if (!consume(GdTokenType.IDENTIFIER, "Expected function name after \"func\".")) {
+        String name;
+        RecoveryTransactionTracker.ProvisionalFrame nameFrame = null;
+        if (match(GdTokenType.IDENTIFIER)) {
+            name = previous.source();
+        } else if (check(GdTokenType.PARENTHESIS_OPEN)
+                || check(GdTokenType.FORWARD_ARROW)
+                || check(GdTokenType.COLON)) {
+            pushRecoveryOwner("function.name");
+            recoveryTracker.emitError(
+                    "Expected function name after \"func\".",
+                    tokenRange(previous),
+                    DiagnosticCodes.DECLARATION_MISSING_NAME,
+                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                    null
+            );
+            nameFrame = popRecoveryOwner();
+            name = "";
+        } else {
+            pushError("Expected function name after \"func\".");
             return null;
         }
-        var name = previous.source();
 
         pushRecoveryOwner("function.signature");
         StructuralFrame paramListFrame = null;
@@ -3577,6 +5152,9 @@ public final class GdScriptParser {
                         body, range(start, end))
                 : new FunctionDeclaration(name, signature.parameters(), signature.returnType(),
                         isStatic, body, range(start, end));
+        if (nameFrame != null) {
+            bindRecoveryOwner(nameFrame, functionNode);
+        }
         bindRecoveryOwner(signatureFrame, functionNode);
         if (signature.returnTypeFrame() != null) {
             bindRecoveryOwner(signature.returnTypeFrame(), functionNode);
@@ -3595,83 +5173,89 @@ public final class GdScriptParser {
     private @NotNull FunctionSignature parseFunctionSignature(boolean forLambda,
                                                               @Nullable StructuralFrame paramListFrame) {
         var parameters = new ArrayList<Parameter>();
-        var declaredNames = new ArrayList<String>();
+        var declaredNames = new HashSet<String>();
         if (paramListFrame != null) {
             if (!check(GdTokenType.PARENTHESIS_CLOSE) && !isAtEnd()) {
                 var defaultUsed = false;
                 var restUsed = false;
                 do {
-                    if (check(GdTokenType.PARENTHESIS_CLOSE) || isAtUnclosedMultilineStop()) {
+                    if (paramListFrame.settled || nestingBudgetExceeded
+                            || check(GdTokenType.PARENTHESIS_CLOSE) || isAtUnclosedMultilineStop()) {
                         // Allow for trailing comma or escape at unclosed cross-line stop.
                         break;
                     }
 
+                    var itemStart = current.startByte();
+                    var diagBefore = recoveryTracker.diagnosticCount();
                     var isRest = match(GdTokenType.PERIOD_PERIOD_PERIOD);
                     parameterStartByte = isRest ? previous.startByte() : current.startByte();
 
-                    var parsed = parseParameter();
-                    if (parsed == null) {
+                    var parsed = parseParameter(paramListFrame);
+                    if (parsed != null) {
+                        var parameter = parsed.parameter();
+
+                        // Ordering violations are reported but the parameter keeps its position in the
+                        // list (the vendor skips it; positions are part of this AST's recovery contract).
+                        if (restUsed) {
+                            pushError("Cannot have parameters after the rest parameter.",
+                                    DiagnosticCodes.SIGNATURE_PARAMETER_AFTER_REST);
+                        }
+                        if (parameter.defaultValue() != null) {
+                            if (isRest) {
+                                pushError("The rest parameter cannot have a default value.",
+                                        DiagnosticCodes.SIGNATURE_REST_WITH_DEFAULT);
+                            } else {
+                                defaultUsed = true;
+                            }
+                        } else if (defaultUsed && !isRest) {
+                            pushError("Cannot have mandatory parameters after optional parameters.",
+                                    DiagnosticCodes.SIGNATURE_MANDATORY_AFTER_OPTIONAL);
+                        }
+
+                        if (declaredNames.contains(parameter.name())) {
+                            pushError("Parameter with name \"%s\" was already declared for this function."
+                                    .formatted(parameter.name()));
+                            if (parsed.typeFrame() != null) {
+                                recoveryTracker.abandon(parsed.typeFrame());
+                            }
+                            if (parsed.defaultFrame() != null) {
+                                recoveryTracker.abandon(parsed.defaultFrame());
+                            }
+                            // A dropped duplicate never gets its frame bound; its closer diagnostics keep
+                            // code and range and stay consumable via range correlation.
+                        } else if (isRest) {
+                            restUsed = true;
+                            // The variadic rebuild preserves the parsed default (a marker on failure) and
+                            // the parameter range — which already spans from the `...` marker start
+                            // (parseParameter captured it before the default parse, so a lambda default
+                            // with its own parameters cannot clobber it through the shared field). The
+                            // type and default owner frames migrate to this final node.
+                            var variadic = new Parameter(parameter.name(), parameter.type(),
+                                    parameter.defaultValue(), true, parameter.range());
+                            parameters.add(variadic);
+                            declaredNames.add(parameter.name());
+                            if (parsed.typeFrame() != null) {
+                                bindRecoveryOwner(parsed.typeFrame(), variadic);
+                            }
+                            if (parsed.defaultFrame() != null) {
+                                bindRecoveryOwner(parsed.defaultFrame(), variadic);
+                            }
+                        } else {
+                            declaredNames.add(parameter.name());
+                            parameters.add(parameter);
+                            if (parsed.typeFrame() != null) {
+                                bindRecoveryOwner(parsed.typeFrame(), parameter);
+                            }
+                            if (parsed.defaultFrame() != null) {
+                                bindRecoveryOwner(parsed.defaultFrame(), parameter);
+                            }
+                        }
+                    }
+                    if (!advanceSeparatedList(paramListFrame, itemStart, previous,
+                            recoveryTracker.diagnosticCount() > diagBefore, this::isFunctionParameterStarter)) {
                         break;
                     }
-                    var parameter = parsed.parameter();
-
-                    // Ordering violations are reported but the parameter keeps its position in the
-                    // list (the vendor skips it; positions are part of this AST's recovery contract).
-                    if (restUsed) {
-                        pushError("Cannot have parameters after the rest parameter.",
-                                DiagnosticCodes.SIGNATURE_PARAMETER_AFTER_REST);
-                    }
-                    if (parameter.defaultValue() != null) {
-                        if (isRest) {
-                            pushError("The rest parameter cannot have a default value.",
-                                    DiagnosticCodes.SIGNATURE_REST_WITH_DEFAULT);
-                        } else {
-                            defaultUsed = true;
-                        }
-                    } else if (defaultUsed && !isRest) {
-                        pushError("Cannot have mandatory parameters after optional parameters.",
-                                DiagnosticCodes.SIGNATURE_MANDATORY_AFTER_OPTIONAL);
-                    }
-
-                    if (declaredNames.contains(parameter.name())) {
-                        pushError("Parameter with name \"%s\" was already declared for this function."
-                                .formatted(parameter.name()));
-                        if (parsed.typeFrame() != null) {
-                            recoveryTracker.abandon(parsed.typeFrame());
-                        }
-                        if (parsed.defaultFrame() != null) {
-                            recoveryTracker.abandon(parsed.defaultFrame());
-                        }
-                        // A dropped duplicate never gets its frame bound; its closer diagnostics keep
-                        // code and range and stay consumable via range correlation.
-                    } else if (isRest) {
-                        restUsed = true;
-                        // The variadic rebuild preserves the parsed default (a marker on failure) and
-                        // the parameter range — which already spans from the `...` marker start
-                        // (parseParameter captured it before the default parse, so a lambda default
-                        // with its own parameters cannot clobber it through the shared field). The
-                        // type and default owner frames migrate to this final node.
-                        var variadic = new Parameter(parameter.name(), parameter.type(),
-                                parameter.defaultValue(), true, parameter.range());
-                        parameters.add(variadic);
-                        declaredNames.add(parameter.name());
-                        if (parsed.typeFrame() != null) {
-                            bindRecoveryOwner(parsed.typeFrame(), variadic);
-                        }
-                        if (parsed.defaultFrame() != null) {
-                            bindRecoveryOwner(parsed.defaultFrame(), variadic);
-                        }
-                    } else {
-                        declaredNames.add(parameter.name());
-                        parameters.add(parameter);
-                        if (parsed.typeFrame() != null) {
-                            bindRecoveryOwner(parsed.typeFrame(), parameter);
-                        }
-                        if (parsed.defaultFrame() != null) {
-                            bindRecoveryOwner(parsed.defaultFrame(), parameter);
-                        }
-                    }
-                } while (!paramListFrame.settled && !nestingBudgetExceeded && match(GdTokenType.COMMA));
+                } while (true);
             }
 
             consumeCloser(paramListFrame);
@@ -3822,17 +5406,20 @@ public final class GdScriptParser {
             // touching `previous` (vendor raw `tokenizer->scan()`, not `advance()`).
             while (current.type() == GdTokenType.DEDENT || current.type() == GdTokenType.INDENT
                     || current.type() == GdTokenType.NEWLINE) {
-                current = nextScannedToken();
+                var next = nextScannedToken();
+                current = next.token();
+                currentFollowedContinuation = next.followedContinuation();
             }
             tokenizer.popExpressionIndentedBlock();
             if (current.type() == GdTokenType.EOF) {
                 var eofRestored = tokenizer.drainRestoredEofDedents();
                 if (!eofRestored.isEmpty()) {
-                    tokenQueue.addFirst(current);
+                    tokenQueue.addFirst(new QueuedToken(current, currentFollowedContinuation));
                     for (var i = eofRestored.size() - 1; i >= 1; i--) {
-                        tokenQueue.addFirst(eofRestored.get(i));
+                        tokenQueue.addFirst(new QueuedToken(eofRestored.get(i), false));
                     }
                     current = eofRestored.getFirst();
+                    currentFollowedContinuation = false;
                 }
             }
         }
@@ -3903,8 +5490,9 @@ public final class GdScriptParser {
         /// of the left operand's consumed source span, which can precede the operand node's own
         /// range (e.g. a grouping's `(`) and is the correct left edge for the combined node's
         /// range (the tree-sitter path spans enclosing CST nodes over the whole consumed text).
-        /// `left` is always healthy: the Pratt loop stops folding a non-`Ok` left operand before
-        /// reaching the infix rule.
+        /// `left` comes from either an `Ok` or a `Damaged` left-hand outcome whose local
+        /// boundaries are settled; the Pratt loop combines prior left damage with any new infix
+        /// damage by logical OR.
         @NotNull ParseOutcome<Expression> parse(@NotNull Expression left, Precedence precedence,
                                                 boolean canAssign, int extentStart);
     }
@@ -4026,24 +5614,35 @@ public final class GdScriptParser {
                     return left;
                 }
                 var infixRule = ruleFor(current.type());
-                // Vendor's infix-loop head also stops on a pending lambda end: an operator following
+                // Vendor's infix-loop head stops on a pending lambda end: an operator following
                 // the lambda boundary belongs to the enclosing flow, not to this expression
                 // (e.g. `return func(): return 1` keeps the bare lambda as the return value).
-                // A non-Ok left operand stops the fold where this parser's former nullable
-                // contract stopped on null (Godot keeps folding a non-null partial node — a
-                // deliberate difference): the partial node returns to the host instead of
-                // folding further operators into it.
+                // A `Damaged` left operand whose local boundary is settled keeps folding per Pratt
+                // precedence; only node-less `Missing`/`Failed` outcomes stop the loop.
                 if (infixRule.infix() == null || lambdaEnded
-                        || (stopOnAssign && current.type() == GdTokenType.EQUAL)
-                        || !(left instanceof ParseOutcome.Ok<Expression>(var healthyLeft))) {
+                        || (stopOnAssign && current.type() == GdTokenType.EQUAL)) {
                     return left;
                 }
+                var leftExpression = switch (left) {
+                    case ParseOutcome.Ok<Expression>(var node) -> node;
+                    case ParseOutcome.Damaged<Expression>(var node) -> node;
+                    default -> null;
+                };
+                if (leftExpression == null) {
+                    return left;
+                }
+                var leftDamaged = left instanceof ParseOutcome.Damaged<Expression>;
                 // Switch multiline mode on for infix grouping operators, before consuming the token.
                 if (current.type() == GdTokenType.PARENTHESIS_OPEN || current.type() == GdTokenType.BRACKET_OPEN) {
                     pushMultiline();
                 }
                 advance();
-                left = infixRule.infix().parse(healthyLeft, precedence, canAssign, extentStart);
+                var nextOutcome = infixRule.infix().parse(leftExpression, precedence, canAssign, extentStart);
+                // Logical OR of prior left damage and new right/infix damage: a healthy right half
+                // must never downgrade an already-damaged operand back to `Ok`.
+                left = leftDamaged && nextOutcome instanceof ParseOutcome.Ok<Expression>(var combined)
+                        ? ParseOutcome.damaged(combined)
+                        : nextOutcome;
             }
             return left;
         } finally {
@@ -4069,11 +5668,9 @@ public final class GdScriptParser {
 
     /// Port of `GDScriptParser::parse_grouping`: produces the inner expression itself (no wrapper
     /// node). Multiline was pushed by `parsePrecedence` before the `(` was consumed; the pop
-    /// happens here before the closing parenthesis (vendor order), even on failure. A healthy
-    /// inner expression consumes the closer (missing closer only records a delimiter diagnostic);
-    /// a non-Ok inner outcome leaves the closer unconsumed for outer recovery — deliberate
-    /// difference from Godot, which consumes the `)` for a non-null partial node (this parser's
-    /// damaged outcome stops folding instead, matching its former null-stop control flow).
+    /// happens here before the closing parenthesis (vendor order), even on failure. Healthy and
+    /// damaged inner expressions both consume a real closer (a missing closer records a delimiter
+    /// diagnostic), allowing subsequent infix/suffix folding once the grouping boundary settles.
     private @NotNull ParseOutcome<Expression> parseGroupingExpression() {
         var groupingFrame = pushBracketedFrame(
                 StructuralRole.GROUPING,
@@ -4142,10 +5739,15 @@ public final class GdScriptParser {
                     break;
                 }
                 var elementStart = current.startByte();
+                var diagBefore = recoveryTracker.diagnosticCount();
                 var element = parseExpression(false);
                 elements.add(absorbSlot(element, elementStart, "array.element",
                         "Expected expression as array element."));
-            } while (!arrayFrame.settled && !nestingBudgetExceeded && match(GdTokenType.COMMA) && !isAtEnd());
+                if (!advanceSeparatedList(arrayFrame, elementStart, previous,
+                        recoveryTracker.diagnosticCount() > diagBefore, this::isExpressionStarter)) {
+                    break;
+                }
+            } while (true);
         }
         consumeCloser(arrayFrame);
         return ParseOutcome.ok(new ArrayExpression(List.copyOf(elements), false,
@@ -4153,16 +5755,14 @@ public final class GdScriptParser {
     }
 
     /// Dictionary styles tracked by `parseDictionaryExpression` (vendor `DictionaryNode::Style`).
-    private enum DictStyle {PYTHON_DICT, LUA_TABLE}
+    private enum DictStyle {NONE, PYTHON_DICT, LUA_TABLE}
 
-    /// Port of `GDScriptParser::parse_dictionary`: Python (`{key: value}`) and Lua
-    /// (`{key = value}`) styles are decided by the first entry's separator and cannot be mixed.
-    /// Lua-style identifier/string keys normalize to `string_name` literals (the AST contract's
-    /// pinned shape, mirroring the tree-sitter mapper). Keys parse with `stopOnAssign` so the
-    /// Pratt loop leaves a Lua `=` separator unconsumed. A missing key or value keeps a marker in
-    /// its slot (the AST analog of Godot's dummy recovery `LiteralNode`, but with an explicit
-    /// recovery identity and an in-envelope range); the entry is dropped only when both sides
-    /// failed without consuming anything.
+    /// Port of `GDScriptParser::parse_dictionary` with an explicit `Key -> Separator -> Value ->
+    /// NextItem` state machine: style locks only on the first real `:` or `=`; mixed styles report
+    /// without consuming past the mismatched separator; missing separators emit
+    /// `MISSING_SEPARATOR_DICTIONARY` once and fill a zero-width `MISSING` value at delimiters,
+    /// outer boundaries, or cross-line next-entry starts without double-reporting a missing value,
+    /// while same-line clear value starts (e.g. `{1 2}`) still parse the value.
     private @NotNull ParseOutcome<Expression> parseDictionaryExpression() {
         var start = previous.startByte();
         var dictionaryFrame = pushBracketedFrame(
@@ -4178,7 +5778,7 @@ public final class GdScriptParser {
                 DiagnosticCodes.MISMATCHED_CLOSER_DICTIONARY
         );
         var entries = new ArrayList<DictEntry>();
-        DictStyle style = null;
+        var style = DictStyle.NONE;
         if (!check(GdTokenType.BRACE_CLOSE)) {
             do {
                 if (dictionaryFrame.settled || nestingBudgetExceeded
@@ -4187,82 +5787,119 @@ public final class GdScriptParser {
                     break;
                 }
                 var keyExtentStart = current.startByte();
+                var keyStartLine = current.startLine();
+                var diagBefore = recoveryTracker.diagnosticCount();
                 var keyOutcome = parseExpression(false, true);
                 if (dictionaryFrame.settled || nestingBudgetExceeded) {
                     break;
                 }
                 var key = absorbSlot(keyOutcome, keyExtentStart, "dictionary.key",
                         "Expected expression as dictionary key.");
-                if (style == null) {
-                    switch (current.type()) {
-                        case COLON -> style = DictStyle.PYTHON_DICT;
-                        case EQUAL -> style = DictStyle.LUA_TABLE;
-                        default -> pushError("Expected \":\" or \"=\" after dictionary key.");
-                    }
-                    // Godot's style field defaults to PYTHON_DICT when nothing valid decided it.
-                    if (style == null) {
+
+                // State 2: Separator. Lock style only when a real `:` or `=` arrives.
+                var hasSeparator = false;
+                if (match(GdTokenType.COLON)) {
+                    hasSeparator = true;
+                    if (style == DictStyle.NONE) {
                         style = DictStyle.PYTHON_DICT;
+                    } else if (style == DictStyle.LUA_TABLE) {
+                        pushError("Expected \"=\" after dictionary key. Mixing dictionary styles is not allowed.");
                     }
+                } else if (match(GdTokenType.EQUAL)) {
+                    hasSeparator = true;
+                    if (style == DictStyle.NONE) {
+                        style = DictStyle.LUA_TABLE;
+                    } else if (style == DictStyle.PYTHON_DICT) {
+                        pushError("Expected \":\" after dictionary key. Mixing dictionary styles is not allowed.");
+                    }
+                } else if (!(keyOutcome instanceof ParseOutcome.Missing<Expression>)) {
+                    var sepMessage = switch (style) {
+                        case NONE -> "Expected \":\" or \"=\" after dictionary key.";
+                        case PYTHON_DICT -> "Expected \":\" after dictionary key.";
+                        case LUA_TABLE -> "Expected \"=\" after dictionary key.";
+                    };
+                    recoveryTracker.emitError(
+                            sepMessage,
+                            tokenRange(previous),
+                            DiagnosticCodes.MISSING_SEPARATOR_DICTIONARY,
+                            RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                            null
+                    );
                 }
+
                 var normalizedKey = key;
-                if (style == DictStyle.LUA_TABLE) {
+                if (style == DictStyle.LUA_TABLE && keyOutcome instanceof ParseOutcome.Ok<Expression>) {
                     // Only a healthy key normalizes; a marker/damaged key already carries its own
                     // root-cause diagnostic, so the type complaint would double-report it.
-                    if (keyOutcome instanceof ParseOutcome.Ok<Expression>) {
-                        if (key instanceof IdentifierExpression(var name, _)) {
-                            normalizedKey = new LiteralExpression("string_name", "&\"" + name + "\"", key.range());
-                        } else if (key instanceof LiteralExpression(var kind, var sourceText, _)
-                                && "string".equals(kind)) {
-                            normalizedKey = new LiteralExpression("string_name", "&" + sourceText, key.range());
-                        } else {
-                            pushError("Expected identifier or string as Lua-style dictionary key (e.g \"{ key = value }\").");
-                        }
-                    }
-                    if (!match(GdTokenType.EQUAL)) {
-                        if (match(GdTokenType.COLON)) {
-                            pushError("Expected \"=\" after dictionary key. Mixing dictionary styles is not allowed.");
-                            // Vendor consumes one extra token here ("Consume wrong separator
-                            // anyway", though `match` already consumed it); mirrored verbatim.
-                            if (!isAtEnd()) {
-                                advance();
-                            }
-                        } else {
-                            pushError("Expected \"=\" after dictionary key.");
-                        }
-                    }
-                } else {
-                    if (!match(GdTokenType.COLON)) {
-                        if (match(GdTokenType.EQUAL)) {
-                            pushError("Expected \":\" after dictionary key. Mixing dictionary styles is not allowed.");
-                            // Same vendor extra-consumption quirk as the Lua branch above.
-                            if (!isAtEnd()) {
-                                advance();
-                            }
-                        } else {
-                            pushError("Expected \":\" after dictionary key.");
-                        }
+                    if (key instanceof IdentifierExpression(var name, _)) {
+                        normalizedKey = new LiteralExpression("string_name", "&\"" + name + "\"", key.range());
+                    } else if (key instanceof LiteralExpression(var kind, var sourceText, _)
+                            && "string".equals(kind)) {
+                        normalizedKey = new LiteralExpression("string_name", "&" + sourceText, key.range());
+                    } else {
+                        pushError("Expected identifier or string as Lua-style dictionary key (e.g \"{ key = value }\").");
                     }
                 }
-                var valueExtentStart = current.startByte();
-                var valueOutcome = parseExpression(false);
-                var value = absorbSlot(valueOutcome, valueExtentStart, "dictionary.value",
-                        "Expected expression as dictionary value.");
+
+                // State 3: Value. A written `:` or `=` parses unrestricted (including cross-line
+                // values); without a separator, stop at boundaries, cross-line breaks (relative to
+                // the key's start line), or a clear next `key:`/`key=` start with a zero-width
+                // MISSING value and parse only an unambiguous same-line value start.
+                ParseOutcome<Expression> valueOutcome;
+                Expression value;
+                if (hasSeparator) {
+                    var valueExtentStart = current.startByte();
+                    valueOutcome = parseExpression(false);
+                    value = absorbSlot(valueOutcome, valueExtentStart, "dictionary.value",
+                            "Expected expression as dictionary value.");
+                } else {
+                    var sameLineCandidate = !isAtEnd()
+                            && !check(GdTokenType.COMMA)
+                            && !check(GdTokenType.BRACE_CLOSE)
+                            && !(isCloserToken(current.type()) && hasMatchingAncestorCloser(current.type()))
+                            && !isAtUnclosedMultilineStop()
+                            && (current.startLine() == keyStartLine || currentFollowedContinuation)
+                            && isExpressionStarter();
+                    // Check for a trailing `key:`/`key=` only after boundary/escape checks pass so
+                    // `peekAfterCurrent()` never clears `tokenizer.suppressedNewline` before replay.
+                    var nextLooksLikeEntryKey = sameLineCandidate
+                            && (current.type() == GdTokenType.LITERAL || isIdentifier(current))
+                            && (peekAfterCurrent() == GdTokenType.COLON || peekAfterCurrent() == GdTokenType.EQUAL);
+                    var sameLineClearValue = sameLineCandidate && !nextLooksLikeEntryKey;
+                    if (sameLineClearValue) {
+                        var valueExtentStart = current.startByte();
+                        valueOutcome = parseExpression(false);
+                        value = absorbSlot(valueOutcome, valueExtentStart, "dictionary.value",
+                                "Expected expression as dictionary value.");
+                    } else {
+                        var missingPos = extentEnd();
+                        valueOutcome = ParseOutcome.missing();
+                        value = new ErrorExpression(CstIssueKind.MISSING, "dictionary.value", "",
+                                range(missingPos, missingPos));
+                    }
+                }
+
                 // Both sides missing means the iteration consumed nothing meaningful (e.g. `{:}`):
                 // drop the entry like today instead of materializing a marker-only pair.
-                if (keyOutcome instanceof ParseOutcome.Missing<Expression>
-                        && valueOutcome instanceof ParseOutcome.Missing<Expression>) {
-                    continue;
+                if (!(keyOutcome instanceof ParseOutcome.Missing<Expression>
+                        && valueOutcome instanceof ParseOutcome.Missing<Expression>)) {
+                    // Entry edges span the consumed text: a grouping `(`/`)` around a key belongs to
+                    // the entry even though the unwrapped key node starts inside it, and a zero-width
+                    // marker side anchors at its failure point (envelope-safe by construction).
+                    var entryStart = Math.min(keyExtentStart, key.range().startByte());
+                    entries.add(new DictEntry(
+                            normalizedKey,
+                            Objects.requireNonNull(value, "dictionary literal entry value must not be null"),
+                            range(entryStart, extentEnd())
+                    ));
                 }
-                // Entry edges span the consumed text: a grouping `(`/`)` around a key belongs to
-                // the entry even though the unwrapped key node starts inside it, and a zero-width
-                // marker side anchors at its failure point (envelope-safe by construction).
-                var entryStart = Math.min(keyExtentStart, key.range().startByte());
-                entries.add(new DictEntry(
-                        normalizedKey,
-                        Objects.requireNonNull(value, "dictionary literal entry value must not be null"),
-                        range(entryStart, extentEnd())
-                ));
-            } while (!dictionaryFrame.settled && !nestingBudgetExceeded && match(GdTokenType.COMMA) && !isAtEnd());
+
+                // State 4: NextItem.
+                if (!advanceSeparatedList(dictionaryFrame, keyExtentStart, previous,
+                        recoveryTracker.diagnosticCount() > diagBefore, this::isExpressionStarter)) {
+                    break;
+                }
+            } while (true);
         }
         consumeCloser(dictionaryFrame);
         return ParseOutcome.ok(new DictionaryExpression(List.copyOf(entries), false,
@@ -4407,13 +6044,13 @@ public final class GdScriptParser {
             return arguments instanceof ParseOutcome.Ok<List<Expression>> ? ParseOutcome.ok(call) : ParseOutcome.damaged(call);
         }
         if (!match(GdTokenType.PERIOD)) {
-            pushError("Expected \".\" or \"(\" after \"super\".", DiagnosticCodes.SUPER_MISSING_ACCESS);
+            emitInCurrentFrameOrLegacy("Expected \".\" or \"(\" after \"super\".", DiagnosticCodes.SUPER_MISSING_ACCESS);
             return ParseOutcome.damaged(superIdentifier);
         }
         if (!check(GdTokenType.IDENTIFIER)) {
             // The receiver stays visible (a chain with a missing-name step) so editor consumers
             // can still offer lexical-superclass member candidates after `super.`.
-            pushError("Expected function name after \".\".", DiagnosticCodes.SUPER_MISSING_NAME);
+            emitInCurrentFrameOrLegacy("Expected function name after \".\".", DiagnosticCodes.SUPER_MISSING_NAME);
             var missing = new MissingAttributeStep(range(extentEnd(), extentEnd()));
             return ParseOutcome.damaged(new AttributeExpression(superIdentifier, List.of(missing),
                     range(superToken.startByte(), extentEnd())));
@@ -4421,7 +6058,7 @@ public final class GdScriptParser {
         advance();
         var nameToken = previous;
         if (!check(GdTokenType.PARENTHESIS_OPEN)) {
-            pushError("Expected \"(\" after function name.", DiagnosticCodes.SUPER_MISSING_CALL);
+            emitInCurrentFrameOrLegacy("Expected \"(\" after function name.", DiagnosticCodes.SUPER_MISSING_CALL);
             var propertyStep = new AttributePropertyStep(nameToken.source(), tokenRange(nameToken));
             return ParseOutcome.damaged(new AttributeExpression(superIdentifier, List.of(propertyStep),
                     range(superToken.startByte(), extentEnd())));
@@ -4460,8 +6097,8 @@ public final class GdScriptParser {
 
     /// Port of `GDScriptParser::parse_binary_operator` (left-associative via precedence + 1 on the
     /// right operand, which also makes `**` left-associative like Godot). A failed right operand
-    /// keeps a marker in the node (vendor keeps the node with a null child); the damaged outcome
-    /// stops the enclosing fold, so `1 +` never folds a following operator into the partial node.
+    /// keeps a marker in the node (vendor keeps the node with a null child) and marks this
+    /// operator's own outcome damaged while keeping the node eligible for further Pratt folding.
     private @NotNull ParseOutcome<Expression> parseBinaryOperator(@NotNull Expression left, Precedence entryPrecedence,
                                                                   boolean canAssign, int extentStart) {
         var operator = previous;
@@ -4611,10 +6248,11 @@ public final class GdScriptParser {
     /// dot's end and the chain continues (the marker acts as a fold barrier — a following
     /// `(`/`[` no longer folds onto the previous property step, so `self.b.(1)` builds
     /// `CallExpression(callee = chain(self, [b, MISSING]))`); damaged call arguments or a
-    /// damaged subscript index build the node and return `Damaged` immediately, so no later
-    /// suffix folds into the partial node (equivalent to the former null bubbling).
+    /// damaged subscript index taint `damaged` and keep folding subsequent suffixes as long as
+    /// boundaries remain unsettled and nesting/lambda guards hold.
     private @NotNull ParseOutcome<Expression> parseSuffixChain(@NotNull Expression left, Precedence entryPrecedence,
                                                                boolean canAssign, int extentStart) {
+        var entryFrame = structuralStack.peekLast();
         var result = left;
         Expression chainBase = null;
         List<AttributeStep> steps = null;
@@ -4664,7 +6302,7 @@ public final class GdScriptParser {
                         steps = null;
                     }
                     if (argumentsOutcome instanceof ParseOutcome.Damaged<List<Expression>>) {
-                        return ParseOutcome.damaged(finishChain(result, chainBase, steps, extentStart));
+                        damaged = true;
                     }
                 }
                 case BRACKET_OPEN -> {
@@ -4698,7 +6336,7 @@ public final class GdScriptParser {
                         steps = null;
                     }
                     if (!(indexOutcome instanceof ParseOutcome.Ok<Expression>)) {
-                        return ParseOutcome.damaged(finishChain(result, chainBase, steps, extentStart));
+                        damaged = true;
                     }
                 }
                 default -> throw new IllegalStateException(
@@ -4706,9 +6344,11 @@ public final class GdScriptParser {
             }
 
             // Continue the chain on the next suffix token, honoring the same precedence cutoff
-            // as Godot's infix loop and consuming with the Pratt loop's own order (multiline
-            // push before a grouping token, then advance).
-            if (isAtUnclosedMultilineStop()) {
+            // and boundary/budget guards as `parsePrecedence`.
+            if (nestingBudgetExceeded
+                    || (entryFrame != null && entryFrame.settled)
+                    || lambdaEnded
+                    || isAtUnclosedMultilineStop()) {
                 var node = finishChain(result, chainBase, steps, extentStart);
                 return damaged ? ParseOutcome.damaged(node) : ParseOutcome.ok(node);
             }
@@ -4768,17 +6408,181 @@ public final class GdScriptParser {
                 break;
             }
             var argumentStart = current.startByte();
+            var diagBefore = recoveryTracker.diagnosticCount();
             var argumentOutcome = parseExpression(false);
             if (!(argumentOutcome instanceof ParseOutcome.Ok<Expression>)) {
                 damaged = true;
             }
             arguments.add(absorbSlot(argumentOutcome, argumentStart, "call.argument",
                     "Expected expression as the function argument."));
-        } while (!callFrame.settled && !nestingBudgetExceeded && match(GdTokenType.COMMA));
+            if (!advanceSeparatedList(callFrame, argumentStart, previous,
+                    recoveryTracker.diagnosticCount() > diagBefore, this::isExpressionStarter)) {
+                break;
+            }
+        } while (true);
 
         consumeCloser(callFrame);
         var result = List.copyOf(arguments);
         return damaged ? ParseOutcome.damaged(result) : ParseOutcome.ok(result);
+    }
+
+    private boolean isExpressionStarter() {
+        return ruleFor(isIdentifier(current) ? GdTokenType.IDENTIFIER : current.type()).prefix() != null;
+    }
+
+    private boolean isFunctionParameterStarter() {
+        return check(GdTokenType.IDENTIFIER) || check(GdTokenType.PERIOD_PERIOD_PERIOD);
+    }
+
+    private boolean isSignalParameterStarter() {
+        return check(GdTokenType.IDENTIFIER);
+    }
+
+    private boolean isArrayPatternStarter() {
+        return current.type() == GdTokenType.VAR
+                || current.type() == GdTokenType.UNDERSCORE
+                || current.type() == GdTokenType.PERIOD_PERIOD
+                || isExpressionStarter();
+    }
+
+    private boolean isDictionaryPatternKeyStarter() {
+        return current.type() == GdTokenType.PERIOD_PERIOD || isExpressionStarter();
+    }
+
+    /// Bounded list-advancement step shared by comma-delimited containers and parameter lists:
+    /// yields on closer/outer boundaries, consumes true commas, inserts at most one zero-width
+    /// `MISSING_SEPARATOR_COMMA` when the previous item advanced and the next token is a trusted
+    /// item starter on the same logical line or inside an oracle-matched container, and otherwise
+    /// skips malformed item tails at balanced local bracket depth without crossing layout/ancestor
+    /// boundaries or absorbing cross-line statements from unclosed openers.
+    private boolean advanceSeparatedList(
+            @NotNull StructuralFrame frame,
+            int itemStartExtent,
+            @NotNull GdToken itemAnchor,
+            boolean itemEmittedDiagnostic,
+            @NotNull BooleanSupplier isTrustedNextItemStarter
+    ) {
+        if (frame.settled || nestingBudgetExceeded || isAtEnd()) {
+            return false;
+        }
+        if (current.type() == frame.expectedCloser
+                || (isCloserToken(current.type()) && hasMatchingAncestorCloser(current.type()))
+                || current.type() == GdTokenType.DEDENT
+                || current.type() == GdTokenType.NEWLINE
+                || isAtUnclosedMultilineStop()) {
+            return false;
+        }
+        if (match(GdTokenType.COMMA)) {
+            return !frame.settled && !nestingBudgetExceeded;
+        }
+        // Let `consumeCloser` handle any remaining unowned closer (single-layer mismatch).
+        if (isCloserToken(current.type())) {
+            return false;
+        }
+        if (frame.role == StructuralRole.PARAMETER_LIST
+                && (current.type() == GdTokenType.COLON || current.type() == GdTokenType.FORWARD_ARROW)
+                && isParameterListUnclosed(frame)) {
+            // Signature parameter lists yield immediately to an enclosing `->` return type or `:`
+            // body introducer instead of eating them as list garbage.
+            return false;
+        }
+        var sameLogicalLine = current.startLine() <= itemAnchor.endLine() || currentFollowedContinuation;
+        var fact = bracketOracle().factFor(frame.openerStartByte);
+        var oracleMatched = fact != null && fact.status() == BracketBalanceOracle.OpenerStatus.MATCHED;
+        if (!sameLogicalLine && !oracleMatched) {
+            // Never turn the next physical line of an unclosed container into a missing-comma item
+            // or skip it as malformed tail garbage.
+            return false;
+        }
+        if (extentEnd() > itemStartExtent && isTrustedNextItemStarter.getAsBoolean()) {
+            var point = extentEnd();
+            recoveryTracker.emitError(
+                    "Expected \",\" between %s.".formatted(frame.constructDescription),
+                    range(point, point),
+                    DiagnosticCodes.MISSING_SEPARATOR_COMMA,
+                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                    null
+            );
+            return true;
+        }
+        if (!itemEmittedDiagnostic) {
+            recoveryTracker.emitError(
+                    "Unexpected \"%s\" in %s.".formatted(current.type().displayName(), frame.constructDescription),
+                    tokenRange(current),
+                    DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN,
+                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                    null
+            );
+        }
+        var skipLine = current.startLine();
+        var localParens = 0;
+        var localBrackets = 0;
+        var localBraces = 0;
+        while (!isAtEnd() && !nestingBudgetExceeded && !frame.settled) {
+            if (current.type() == GdTokenType.DEDENT
+                    || current.type() == GdTokenType.NEWLINE
+                    || isAtUnclosedMultilineStop()
+                    || (frame.role == StructuralRole.PARAMETER_LIST
+                            && (current.type() == GdTokenType.COLON || current.type() == GdTokenType.FORWARD_ARROW)
+                            && isParameterListUnclosed(frame))
+                    || (!oracleMatched && current.startLine() > skipLine && !currentFollowedContinuation)) {
+                break;
+            }
+            if (isCloserToken(current.type())) {
+                var matchingLocalOpeners = switch (current.type()) {
+                    case PARENTHESIS_CLOSE -> localParens;
+                    case BRACKET_CLOSE -> localBrackets;
+                    case BRACE_CLOSE -> localBraces;
+                    default -> 0;
+                };
+                if ((localParens == 0 && localBrackets == 0 && localBraces == 0)
+                        || (matchingLocalOpeners == 0
+                                && (current.type() == frame.expectedCloser || hasMatchingAncestorCloser(current.type())))) {
+                    break;
+                }
+            }
+            if (localParens == 0 && localBrackets == 0 && localBraces == 0 && match(GdTokenType.COMMA)) {
+                return !frame.settled && !nestingBudgetExceeded;
+            }
+            switch (current.type()) {
+                case PARENTHESIS_OPEN -> localParens++;
+                case PARENTHESIS_CLOSE -> {
+                    if (localParens > 0) {
+                        localParens--;
+                    }
+                }
+                case BRACKET_OPEN -> localBrackets++;
+                case BRACKET_CLOSE -> {
+                    if (localBrackets > 0) {
+                        localBrackets--;
+                    }
+                }
+                case BRACE_OPEN -> localBraces++;
+                case BRACE_CLOSE -> {
+                    if (localBraces > 0) {
+                        localBraces--;
+                    }
+                }
+                default -> {
+                }
+            }
+            advance();
+        }
+        return false;
+    }
+
+    private void emitInCurrentFrameOrLegacy(@NotNull String message, @NotNull String code) {
+        if (recoveryTracker.activeFrame() != null) {
+            recoveryTracker.emitError(
+                    message,
+                    tokenRange(previous),
+                    code,
+                    RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
+                    null
+            );
+        } else {
+            pushError(message, code);
+        }
     }
 
     // ---------------------------------------------------------------------------------------------

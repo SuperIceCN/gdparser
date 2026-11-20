@@ -1092,16 +1092,19 @@ class GdScriptParserTest {
 
     @Test
     void callArgumentRecovery() {
-        // An empty argument slot reports and recovers at the comma; a missing comma reports the
-        // closing parenthesis while keeping the successfully parsed arguments (vendor shape).
+        // An empty argument slot reports and recovers at the comma; a missing comma inserts a
+        // zero-width MISSING_SEPARATOR_COMMA diagnostic and preserves subsequent arguments.
         var empty = parse("func f():\n\tfoo(,)\n");
         assertTrue(errorMessages(empty).contains("Expected expression as the function argument."));
         var missingComma = parse("func f():\n\tfoo(1 2)\n");
-        assertTrue(errorMessages(missingComma).contains("Expected closing \")\" after call arguments."));
+        assertEquals(List.of("Expected \",\" between call arguments."), errorMessages(missingComma),
+                () -> errorMessages(missingComma).toString());
         var function = assertInstanceOf(FunctionDeclaration.class, missingComma.ast().statements().getFirst());
         var call = assertInstanceOf(CallExpression.class,
                 assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst()).expression());
-        assertEquals(1, call.arguments().size());
+        assertEquals(2, call.arguments().size());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, call.arguments().getFirst()).sourceText());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
     }
 
     @Test
@@ -1186,35 +1189,48 @@ class GdScriptParserTest {
 
     @Test
     void mixedDictionaryStylesAreRejected() {
-        // Python style decided first; the `=` separator is rejected. The vendor consumes one
-        // extra token after the wrong separator, so the value parse starts at `}` and fails
-        // (mirrored quirk); the value slot keeps a MISSING marker.
+        // Style-conflict separators are consumed only once; the actual following value token is
+        // still parsed rather than skipped by a redundant advance().
         var pythonFirst = parse("var d = {\"a\": 1, b = 2}\n");
-        var pythonErrors = errorMessages(pythonFirst);
-        assertTrue(pythonErrors.contains("Expected \":\" after dictionary key. Mixing dictionary styles is not allowed."));
-        assertTrue(pythonErrors.contains("Expected expression as dictionary value."));
+        assertEquals(List.of("Expected \":\" after dictionary key. Mixing dictionary styles is not allowed."),
+                errorMessages(pythonFirst), () -> errorMessages(pythonFirst).toString());
         var dict = assertInstanceOf(DictionaryExpression.class,
                 assertInstanceOf(VariableDeclaration.class, pythonFirst.ast().statements().getFirst()).value());
         assertEquals(2, dict.entries().size());
-        var marker = assertInstanceOf(ErrorExpression.class, dict.entries().get(1).value());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, dict.entries().get(1).value()).sourceText());
+
+        var pythonMissingValue = parse("var dEmpty = {\"a\": 1, b = }\n");
+        assertEquals(List.of(
+                "Expected \":\" after dictionary key. Mixing dictionary styles is not allowed.",
+                "Expected expression as dictionary value."
+        ), errorMessages(pythonMissingValue), () -> errorMessages(pythonMissingValue).toString());
+        var dictEmpty = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, pythonMissingValue.ast().statements().getFirst()).value());
+        assertEquals(2, dictEmpty.entries().size());
+        var marker = assertInstanceOf(ErrorExpression.class, dictEmpty.entries().get(1).value());
         assertEquals(CstIssueKind.MISSING, marker.kind());
         assertEquals("dictionary.value", marker.nodeType());
 
         var luaFirst = parse("var e = {a = 1, \"b\": 2}\n");
-        assertTrue(errorMessages(luaFirst)
-                .contains("Expected \"=\" after dictionary key. Mixing dictionary styles is not allowed."));
+        assertEquals(List.of("Expected \"=\" after dictionary key. Mixing dictionary styles is not allowed."),
+                errorMessages(luaFirst), () -> errorMessages(luaFirst).toString());
+        var luaDict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, luaFirst.ast().statements().getFirst()).value());
+        assertEquals(2, luaDict.entries().size());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, luaDict.entries().get(1).value()).sourceText());
     }
 
     @Test
     void dictionaryRecovery() {
-        // A key-only entry reports the separator and value errors; the pair is kept with a
-        // zero-width MISSING marker in the value slot (the AST analog of Godot's dummy recovery
-        // literal, with an explicit recovery identity).
+        // A key-only entry emits a single separator diagnostic and fills the value slot with a
+        // zero-width MISSING marker without emitting duplicate missing-value noise.
         var keyOnly = parse("var d = {name}\n");
-        var keyOnlyErrors = errorMessages(keyOnly);
-        assertTrue(keyOnlyErrors.contains("Expected \":\" or \"=\" after dictionary key."));
-        assertTrue(keyOnlyErrors.contains("Expected \":\" after dictionary key."));
-        assertTrue(keyOnlyErrors.contains("Expected expression as dictionary value."));
+        var keyOnlyErrors = keyOnly.diagnostics().stream()
+                .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
+                .toList();
+        assertEquals(1, keyOnlyErrors.size(), () -> keyOnlyErrors.toString());
+        assertEquals(DiagnosticCodes.MISSING_SEPARATOR_DICTIONARY, keyOnlyErrors.getFirst().code());
+        assertEquals("Expected \":\" or \"=\" after dictionary key.", keyOnlyErrors.getFirst().message());
         var keyOnlyDict = assertInstanceOf(DictionaryExpression.class,
                 assertInstanceOf(VariableDeclaration.class, keyOnly.ast().statements().getFirst()).value());
         assertEquals(1, keyOnlyDict.entries().size());
@@ -1232,9 +1248,10 @@ class GdScriptParserTest {
     @Test
     void dictionaryMissingValueEntrySpansGroupedKey() {
         // Recovery branch range: the entry spans the key's whole consumed span, including a
-        // grouping's closing parenthesis (review-driven range completion on an illegal source).
+        // grouping's closing parenthesis.
         var result = parse("var d = {(a)}\n");
-        assertTrue(errorMessages(result).contains("Expected expression as dictionary value."));
+        assertEquals(List.of("Expected \":\" or \"=\" after dictionary key."), errorMessages(result),
+                () -> errorMessages(result).toString());
         var dict = assertInstanceOf(DictionaryExpression.class,
                 assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value());
         assertEquals(new Range(9, 12, new Point(0, 9), new Point(0, 12)), dict.entries().getFirst().range());
@@ -1242,13 +1259,11 @@ class GdScriptParserTest {
 
     @Test
     void dictionaryMissingSeparatorKeepsKeyAndValue() {
-        // `{1 2}`: the invalid separator leaves the style undecided-then-defaulted; Godot still
-        // parses the following token as the value and keeps the pair (vendor `decided_style`
-        // is set unconditionally, gdscript_parser.cpp:3285).
+        // `{1 2}` reports the missing separator once while still parsing the clear same-line
+        // expression starter `2` as the entry value.
         var result = parse("var d = {1 2}\n");
-        var errors = errorMessages(result);
-        assertTrue(errors.contains("Expected \":\" or \"=\" after dictionary key."));
-        assertTrue(errors.contains("Expected \":\" after dictionary key."));
+        assertEquals(List.of("Expected \":\" or \"=\" after dictionary key."), errorMessages(result),
+                () -> errorMessages(result).toString());
         var dict = assertInstanceOf(DictionaryExpression.class,
                 assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value());
         assertEquals(1, dict.entries().size());
@@ -1434,30 +1449,41 @@ class GdScriptParserTest {
 
     @Test
     void damagedSuperPrefixDiscardsStatementOffBoundary() {
-        // `super. var y = 1`: the damaged chain is not at a statement boundary, so the statement
-        // is dropped and the same-line garbage is swallowed by synchronization (the `var` must
-        // be consumed, not re-parsed as a declaration).
+        // `super. var y = 1`: the damaged chain stays retained in its ExpressionStatement while
+        // `endStatement` consumes same-line trailing tokens without turning `var y = 1` into a
+        // valid sibling declaration.
         var sameLine = parse("func f():\n\tsuper. var y = 1\n");
-        assertEquals(List.of("Expected function name after \".\"."), errorMessages(sameLine),
-                () -> errorMessages(sameLine).toString());
-        assertTrue(assertInstanceOf(FunctionDeclaration.class, sameLine.ast().statements().getFirst())
-                .body().statements().isEmpty());
+        assertEquals(List.of(
+                "Expected function name after \".\".",
+                "Expected end of statement after expression, found \"var\" instead."
+        ), errorMessages(sameLine), () -> errorMessages(sameLine).toString());
+        var sameLineBody = assertInstanceOf(FunctionDeclaration.class, sameLine.ast().statements().getFirst())
+                .body().statements();
+        assertEquals(1, sameLineBody.size());
+        var superStmt = assertInstanceOf(ExpressionStatement.class, sameLineBody.getFirst());
+        assertInstanceOf(MissingAttributeStep.class,
+                assertInstanceOf(AttributeExpression.class, superStmt.expression()).steps().getFirst());
 
-        // `super.ba + 1`: the damaged chain stops folding at `+`; the statement is discarded.
+        // `super.ba + 1`: the damaged chain continues folding `+ 1` and retains the statement.
         var trailing = parse("func f():\n\tsuper.ba + 1\n");
         assertEquals(List.of("Expected \"(\" after function name."), errorMessages(trailing),
                 () -> errorMessages(trailing).toString());
-        assertTrue(assertInstanceOf(FunctionDeclaration.class, trailing.ast().statements().getFirst())
-                .body().statements().isEmpty());
+        var trailingBody = assertInstanceOf(FunctionDeclaration.class, trailing.ast().statements().getFirst())
+                .body().statements();
+        assertEquals(1, trailingBody.size());
+        var binary = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(ExpressionStatement.class, trailingBody.getFirst()).expression());
+        assertEquals("+", binary.operator());
+        assertInstanceOf(AttributeExpression.class, binary.left());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, binary.right()).sourceText());
     }
 
     @Test
     void damagedSuperInsideLambdaArgumentStopsFold() {
-        // `f(func(): super. + 1)`: the damaged `super.` ends the lambda body without consuming
-        // `+`; the lambda stays the call's argument and the enclosing statement survives. (The
-        // call's own `)` is then eaten by the panic tail hook — pinned current behavior.)
+        // `f(func(): super. + 1)`: the damaged `super.` continues folding `+ 1` inside the
+        // lambda body while preserving the closing `)` and the outer call statement.
         var result = parse("func f():\n\tf(func(): super. + 1)\n");
-        assertTrue(errorMessages(result).contains("Expected function name after \".\"."),
+        assertEquals(List.of("Expected function name after \".\"."), errorMessages(result),
                 () -> errorMessages(result).toString());
         var body = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst())
                 .body().statements();
@@ -1465,18 +1491,23 @@ class GdScriptParserTest {
         var call = assertInstanceOf(CallExpression.class,
                 assertInstanceOf(ExpressionStatement.class, body.getFirst()).expression());
         var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
-        assertTrue(lambda.body().statements().isEmpty());
+        assertEquals(1, lambda.body().statements().size());
+        var folded = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(ExpressionStatement.class, lambda.body().statements().getFirst()).expression());
+        assertEquals("+", folded.operator());
+        assertInstanceOf(AttributeExpression.class, folded.left());
 
         // `f(func(): super., 1)`: the outer `,` is an ancestor-owned separator, so synchronization
-        // ends the inline lambda at `,` and preserves the second call argument `1`.
+        // ends the inline lambda at `,` and preserves both the damaged `super.` statement and `1`.
         var comma = parse("func f():\n\tf(func(): super., 1)\n");
-        assertTrue(errorMessages(comma).contains("Expected function name after \".\"."),
+        assertEquals(List.of("Expected function name after \".\"."), errorMessages(comma),
                 () -> errorMessages(comma).toString());
         var commaCall = assertInstanceOf(CallExpression.class,
                 assertInstanceOf(ExpressionStatement.class, assertInstanceOf(FunctionDeclaration.class,
                         comma.ast().statements().getFirst()).body().statements().getFirst()).expression());
         assertEquals(2, commaCall.arguments().size());
-        assertInstanceOf(LambdaExpression.class, commaCall.arguments().getFirst());
+        var commaLambda = assertInstanceOf(LambdaExpression.class, commaCall.arguments().getFirst());
+        assertEquals(1, commaLambda.body().statements().size());
         assertEquals("1", assertInstanceOf(LiteralExpression.class, commaCall.arguments().get(1)).sourceText());
     }
 
@@ -1898,17 +1929,32 @@ class GdScriptParserTest {
 
     @Test
     void circuitBreakerCountsAnnotatedFailuresLikeGodot() {
-        // Each pair counts twice (the annotation-only round and the failed declaration), so 60
-        // pairs pass the 102-failure threshold.
-        var source = "func f():\n" + "\t@x\n\tvar =\n".repeat(60);
-        var errors = errorMessages(parse(source));
-        assertTrue(errors.contains("Too many statement errors."), () -> "count=" + errors.size());
+        // Legal leading annotations return ConsumedPrefix and never consume the failure budget:
+        // 120 valid `@warning_ignore(...)` prefixes before a target statement parse cleanly.
+        var validMany = "func f():\n" + "\t@warning_ignore(\"unused_variable\")\n".repeat(120) + "\tvar ok = 1\n";
+        var clean = cleanAst(validMany);
+        var cleanFn = assertInstanceOf(FunctionDeclaration.class, clean.statements().getFirst());
+        assertEquals(121, cleanFn.body().statements().size());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, cleanFn.body().statements().getLast()).name());
+
+        // 60 pairs of `@x` + failing `var` only count 60 real failures, below the 102 threshold.
+        var underLimit = parse("func f():\n" + "\t@x\n\tvar\n".repeat(60));
+        assertFalse(errorMessages(underLimit).contains("Too many statement errors."),
+                () -> errorMessages(underLimit).toString());
+
+        // 105 genuinely failing `var` lines preceded by `@x` still trip STATEMENT_TOO_MANY_ERRORS.
+        var overLimit = parse("func f():\n" + "\t@x\n\tvar\n".repeat(105));
+        assertTrue(overLimit.diagnostics().stream()
+                .anyMatch(d -> DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS.equals(d.code())),
+                () -> overLimit.diagnostics().toString());
     }
 
     @Test
     void signalRejectsRestParameter() {
-        var errors = errorMessages(parse("signal s(...a)\n"));
-        assertTrue(errors.contains("Expected signal parameter name."), errors::toString);
+        var result = parse("signal s(...a)\n");
+        var errors = errorMessages(result);
+        assertTrue(errors.contains("Expected parameter name."), errors::toString);
+        assertFalse(errors.contains("Expected signal parameter name."), errors::toString);
     }
 
     @Test

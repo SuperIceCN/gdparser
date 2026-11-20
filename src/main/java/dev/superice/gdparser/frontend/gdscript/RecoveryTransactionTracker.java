@@ -147,6 +147,10 @@ final class RecoveryTransactionTracker {
         return frame;
     }
 
+    @Nullable ProvisionalFrame activeFrame() {
+        return frameStack.peekLast();
+    }
+
     void commit(@NotNull ProvisionalFrame frame, @NotNull Node owner) {
         requireOwnedFrame(frame);
         Objects.requireNonNull(owner, "owner must not be null");
@@ -176,6 +180,10 @@ final class RecoveryTransactionTracker {
 
     boolean isBalanced() {
         return frameStack.isEmpty();
+    }
+
+    int diagnosticCount() {
+        return entries.size();
     }
 
     void reset() {

@@ -53,6 +53,7 @@ final class StructuralFrame {
     boolean allowsTypeComma;
     boolean pendingSync;
     boolean settled;
+    byte unclosedParamListCache = -1;
 
     private StructuralFrame(
             @NotNull StructuralRole role,

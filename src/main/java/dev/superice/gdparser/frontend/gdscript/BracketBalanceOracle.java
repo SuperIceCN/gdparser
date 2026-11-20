@@ -26,12 +26,14 @@ final class BracketBalanceOracle {
     /// @param openerType opener token kind
     /// @param status pairing outcome determined by a single balanced scan
     /// @param pairedCloserByte UTF-8 start byte offset of the paired closer, or `-1` when missing
+    /// @param pairedCloserLine 1-based physical line of the paired closer, or `-1` when missing
     /// @param effectiveRecoveryEnd UTF-8 byte offset where an unclosed construct should stop
     record OpenerFact(
             int openerByte,
             GdTokenType openerType,
             OpenerStatus status,
             int pairedCloserByte,
+            int pairedCloserLine,
             int effectiveRecoveryEnd
     ) {
     }
@@ -53,6 +55,7 @@ final class BracketBalanceOracle {
     private final int[] byteOffsets;
     private final Map<Integer, OpenerFact> factsByOpenerByte = new HashMap<>();
     private int scanCount;
+    private int scanLine = 1;
 
     BracketBalanceOracle(int[] chars, int[] byteOffsets) {
         this.chars = chars;
@@ -83,6 +86,7 @@ final class BracketBalanceOracle {
         var lineContinuation = false;
         var len = chars.length;
         var pos = 0;
+        scanLine = 1;
 
         while (pos < len) {
             var ch = chars[pos];
@@ -93,6 +97,7 @@ final class BracketBalanceOracle {
             }
             if (ch == '\n') {
                 pos++;
+                scanLine++;
                 if (!lineContinuation) {
                     firstTokenOnLine = true;
                 }
@@ -111,6 +116,7 @@ final class BracketBalanceOracle {
                 }
                 if (pos < len && chars[pos] == '\n') {
                     pos++;
+                    scanLine++;
                     lineContinuation = true;
                 }
                 continue;
@@ -125,7 +131,7 @@ final class BracketBalanceOracle {
             if (ch == '"' || ch == '\''
                     || ((ch == 'r' || ch == '&' || ch == '^') && pos + 1 < len
                     && (chars[pos + 1] == '"' || chars[pos + 1] == '\''))) {
-                pos = skipString(pos);
+                pos = skipString(pos, true);
                 continue;
             }
 
@@ -160,7 +166,7 @@ final class BracketBalanceOracle {
             }
 
             if (ch == ')' || ch == ']' || ch == '}') {
-                settleCloser((char) ch, byteOffsets[tokenStart], byteOffsets[pos + 1],
+                settleCloser((char) ch, byteOffsets[tokenStart], byteOffsets[pos + 1], scanLine,
                         stack, parenIndices, bracketIndices, braceIndices);
                 pos++;
                 continue;
@@ -190,7 +196,7 @@ final class BracketBalanceOracle {
             var entry = popTop(stack, parenIndices, bracketIndices, braceIndices);
             var end = entry.firstStopByte >= 0 ? entry.firstStopByte : eofByte;
             factsByOpenerByte.put(entry.openerByte,
-                    new OpenerFact(entry.openerByte, entry.openerType, OpenerStatus.MISSING, -1, end));
+                    new OpenerFact(entry.openerByte, entry.openerType, OpenerStatus.MISSING, -1, -1, end));
         }
     }
 
@@ -211,7 +217,7 @@ final class BracketBalanceOracle {
         }
     }
 
-    private void settleCloser(char closerChar, int closerStartByte, int closerEndByte,
+    private void settleCloser(char closerChar, int closerStartByte, int closerEndByte, int closerLine,
                               List<OpenEntry> stack,
                               List<Integer> parenIndices,
                               List<Integer> bracketIndices,
@@ -224,7 +230,7 @@ final class BracketBalanceOracle {
             var popped = popTop(stack, parenIndices, bracketIndices, braceIndices);
             factsByOpenerByte.put(popped.openerByte,
                     new OpenerFact(popped.openerByte, popped.openerType, OpenerStatus.MATCHED,
-                            closerStartByte, closerEndByte));
+                            closerStartByte, closerLine, closerEndByte));
             propagateStopDown(stack, popped.firstStopByte);
             return;
         }
@@ -238,20 +244,20 @@ final class BracketBalanceOracle {
                         ? skipped.firstStopByte
                         : closerStartByte;
                 factsByOpenerByte.put(skipped.openerByte,
-                        new OpenerFact(skipped.openerByte, skipped.openerType, OpenerStatus.MISSING, -1, end));
+                        new OpenerFact(skipped.openerByte, skipped.openerType, OpenerStatus.MISSING, -1, -1, end));
                 propagateStopDown(stack, skipped.firstStopByte);
             }
             var matched = popTop(stack, parenIndices, bracketIndices, braceIndices);
             factsByOpenerByte.put(matched.openerByte,
                     new OpenerFact(matched.openerByte, matched.openerType, OpenerStatus.MATCHED,
-                            closerStartByte, closerEndByte));
+                            closerStartByte, closerLine, closerEndByte));
             propagateStopDown(stack, matched.firstStopByte);
             return;
         }
         var replaced = popTop(stack, parenIndices, bracketIndices, braceIndices);
         factsByOpenerByte.put(replaced.openerByte,
                 new OpenerFact(replaced.openerByte, replaced.openerType, OpenerStatus.REPLACED,
-                        closerStartByte, closerEndByte));
+                        closerStartByte, closerLine, closerEndByte));
         propagateStopDown(stack, replaced.firstStopByte);
     }
 
@@ -340,7 +346,7 @@ final class BracketBalanceOracle {
             if (ch == '"' || ch == '\''
                     || ((ch == 'r' || ch == '&' || ch == '^') && pos + 1 < len
                     && (chars[pos + 1] == '"' || chars[pos + 1] == '\''))) {
-                pos = skipString(pos);
+                pos = skipString(pos, false);
                 continue;
             }
             if (ch == '(' || ch == '[' || ch == '{') {
@@ -377,7 +383,7 @@ final class BracketBalanceOracle {
         return false;
     }
 
-    private int skipString(int pos) {
+    private int skipString(int pos, boolean countLines) {
         var len = chars.length;
         var isRaw = false;
         var ch = chars[pos];
@@ -404,6 +410,9 @@ final class BracketBalanceOracle {
                         pos++;
                     }
                 } else {
+                    if (countLines && chars[pos] == '\n') {
+                        scanLine++;
+                    }
                     pos++;
                 }
                 continue;
@@ -419,6 +428,9 @@ final class BracketBalanceOracle {
                     return pos;
                 }
                 continue;
+            }
+            if (countLines && c == '\n') {
+                scanLine++;
             }
             pos++;
         }

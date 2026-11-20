@@ -7,6 +7,7 @@ import dev.superice.gdparser.frontend.ast.AssignmentExpression;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AstMappingResult;
+import dev.superice.gdparser.frontend.ast.AttributeCallStep;
 import dev.superice.gdparser.frontend.ast.AttributeExpression;
 import dev.superice.gdparser.frontend.ast.AttributePropertyStep;
 import dev.superice.gdparser.frontend.ast.AttributeSubscriptStep;
@@ -14,6 +15,8 @@ import dev.superice.gdparser.frontend.ast.BinaryExpression;
 import dev.superice.gdparser.frontend.ast.CallExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.CommentStatement;
+import dev.superice.gdparser.frontend.ast.DeclarationKind;
+import dev.superice.gdparser.frontend.ast.DictEntry;
 import dev.superice.gdparser.frontend.ast.DictionaryExpression;
 import dev.superice.gdparser.frontend.ast.EnumDeclaration;
 import dev.superice.gdparser.frontend.ast.ErrorExpression;
@@ -24,13 +27,19 @@ import dev.superice.gdparser.frontend.ast.IdentifierExpression;
 import dev.superice.gdparser.frontend.ast.IfStatement;
 import dev.superice.gdparser.frontend.ast.LambdaExpression;
 import dev.superice.gdparser.frontend.ast.LiteralExpression;
+import dev.superice.gdparser.frontend.ast.MatchSection;
 import dev.superice.gdparser.frontend.ast.MatchStatement;
 import dev.superice.gdparser.frontend.ast.MissingAttributeStep;
 import dev.superice.gdparser.frontend.ast.Node;
 import dev.superice.gdparser.frontend.ast.Parameter;
 import dev.superice.gdparser.frontend.ast.PassStatement;
 import dev.superice.gdparser.frontend.ast.PatternBindingExpression;
+import dev.superice.gdparser.frontend.ast.Point;
+import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.RecoveryLink;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
+import dev.superice.gdparser.frontend.ast.SignalStatement;
+import dev.superice.gdparser.frontend.ast.SubscriptExpression;
 import dev.superice.gdparser.frontend.ast.TypeRef;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import dev.superice.gdparser.frontend.ast.WhileStatement;
@@ -472,23 +481,25 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     /// Godot comparison: in `func f(a, b:` the `:` is consumed as b's *type-annotation* colon
-    /// (vendor parse_parameter → parse_type, gdscript_parser.cpp:1536-1544), so the parameter
-    /// `)` is reported missing, the header colon is then absent, and Godot takes the bodyless
-    /// (abstract) function path (`has_body == false`, gdscript_parser.cpp:1834-1840); the class
-    /// body's panic-mode synchronize() swallows the following `pass`. This test pins that exact
-    /// chain: the function and both parameters survive, the body is empty, and `pass` is gone.
+    /// An unclosed parameter list followed by a header-end `:` and a strictly deeper suite line
+    /// yields the `:` back as the function body introducer instead of eating it as a missing
+    /// parameter type slot, emitting only MISSING_CLOSER_PARAMETER_LIST and retaining the body.
     @Test
     void missingClosingParenInFunctionParametersRecovers() {
         var result = recoverableParse("func f(a, b:\n\tpass\n");
-        assertTrue(errorMessages(result).contains("Expected closing \")\" after function parameters."),
-                () -> errorMessages(result).toString());
+        var errors = errorsOf(result);
+        assertEquals(1, errors.size(), () -> errors.toString());
+        assertEquals(DiagnosticCodes.MISSING_CLOSER_PARAMETER_LIST, errors.getFirst().code());
+        assertEquals("Expected closing \")\" after function parameters.", errors.getFirst().message());
         var statements = result.ast().statements();
         assertEquals(1, statements.size(), () -> "members: " + statements);
         var function = assertInstanceOf(FunctionDeclaration.class, statements.getFirst());
         assertEquals("f", function.name());
         assertEquals(List.of("a", "b"),
                 function.parameters().stream().map(Parameter::name).toList());
-        assertTrue(function.body().statements().isEmpty(), () -> function.body().toString());
+        assertNull(function.parameters().get(1).type());
+        assertEquals(1, function.body().statements().size(), () -> function.body().toString());
+        assertInstanceOf(PassStatement.class, function.body().statements().getFirst());
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1306,13 +1317,12 @@ class GdScriptParserErrorRecoveryTest {
     @Test
     void circuitBreakerCountsNullStatementsWithoutHealthyReset() {
         // Healthy statements interleaved between failures must not reset the cumulative count:
-        // 105 failing `var =` statements (parser-level nulls) interleaved with healthy `pass`
-        // lines still trip the breaker at the 102nd failure. (`)` lines would not work here:
-        // the tokenizer rejects the unmatched closer and the preceding statement's
-        // endStatement consumes the line's NEWLINE, so they never reach statement dispatch.)
-        var source = "func f():\n" + "\tvar =\n\tpass\n".repeat(105);
-        var errors = errorMessages(parse(source));
-        assertTrue(errors.contains("Too many statement errors."), () -> "count=" + errors.size());
+        // 105 genuinely failing `var` statements (parser-level nulls) interleaved with healthy
+        // `pass` lines still trip the breaker at the 102nd failure.
+        var source = "func f():\n" + "\tvar\n\tpass\n".repeat(105);
+        var result = recoverableParse(source);
+        var breaker = findErrorByCode(result, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertEquals("Too many statement errors.", breaker.message());
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1373,51 +1383,65 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void dictionaryPatternHomelessKeyFallsBackToErrorFragment() {
-        // A damaged key without a carrier (no `:` here) cannot be represented, so the whole
-        // dictionary pattern degrades to an ERROR fragment; the key-only warning stays silent.
+        // A key-only damaged entry stays as DictEntry(DamagedKey, null) inside the
+        // DictionaryExpression rather than collapsing the whole pattern to an ERROR fragment.
         var result = recoverableParse("func f():\n\tmatch x:\n\t\t{1+}: pass\n");
         assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(result),
                 () -> errorMessages(result).toString());
         var match = assertInstanceOf(MatchStatement.class,
                 onlyFunction(result).body().statements().getFirst());
-        var fragment = assertInstanceOf(ErrorExpression.class,
+        var dictionary = assertInstanceOf(DictionaryExpression.class,
                 match.sections().getFirst().patterns().getFirst());
-        assertEquals(CstIssueKind.ERROR, fragment.kind());
-        assertEquals("{1+}", fragment.sourceText());
+        assertEquals(1, dictionary.entries().size());
+        assertInstanceOf(BinaryExpression.class, dictionary.entries().getFirst().key());
+        assertNull(dictionary.entries().getFirst().value());
         assertEquals(1, match.sections().getFirst().body().statements().size());
     }
 
     @Test
     void dictionaryPatternMixedEntriesFallBackTogether() {
-        // The fallback granularity is the whole dictionary pattern: the healthy sibling entry
-        // is lost with the homeless damaged key (registered trade-off).
+        // Key-only damaged entries and healthy `key: value` entries coexist in the same
+        // DictionaryExpression pattern.
         var result = recoverableParse("func f():\n\tmatch x:\n\t\t{1+, 2: 3}: pass\n");
+        assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(result),
+                () -> errorMessages(result).toString());
         var match = assertInstanceOf(MatchStatement.class,
                 onlyFunction(result).body().statements().getFirst());
-        var fragment = assertInstanceOf(ErrorExpression.class,
+        var dictionary = assertInstanceOf(DictionaryExpression.class,
                 match.sections().getFirst().patterns().getFirst());
-        assertEquals(CstIssueKind.ERROR, fragment.kind());
-        assertEquals("{1+, 2: 3}", fragment.sourceText());
+        assertEquals(2, dictionary.entries().size());
+        assertInstanceOf(BinaryExpression.class, dictionary.entries().getFirst().key());
+        assertNull(dictionary.entries().getFirst().value());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, dictionary.entries().get(1).key()).sourceText());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, dictionary.entries().get(1).value()).sourceText());
     }
 
     @Test
     void dictionaryPatternNoCommaTailStopsLoopAndReportsCloser() {
-        // The pattern loop advances on commas/closers only: after the damaged key `{1+`, the
-        // loop stops at `var` (no comma), the missing `}` is reported, and the match section's
-        // colon recovery consumes the rest of the line. (The plan table's `{1+ 2: 3}` input
-        // cannot exercise this path: `1+ 2` folds into a healthy binary key.)
+        // After `{1+`, `var x: 3` is not a legal key starter: bounded same-level sync skips to
+        // the real `}`, preserves the damaged entry, consumes `}`, and retains `: pass` without
+        // piling a secondary error on top of the damaged key.
         var result = recoverableParse("func f():\n\tmatch x:\n\t\t{1+ var x: 3}: pass\n");
-        assertTrue(errorMessages(result).contains("Expected expression after \"+\" operator."),
-                () -> errorMessages(result).toString());
-        assertTrue(errorMessages(result).contains("Expected \"}\" to close the dictionary pattern."),
-                () -> errorMessages(result).toString());
+        assertEquals(List.of("Expected expression after \"+\" operator."),
+                errorMessages(result), () -> errorMessages(result).toString());
         var match = assertInstanceOf(MatchStatement.class,
                 onlyFunction(result).body().statements().getFirst());
-        var fragment = assertInstanceOf(ErrorExpression.class,
-                match.sections().getFirst().patterns().getFirst());
-        assertEquals(CstIssueKind.ERROR, fragment.kind());
-        // The fragment covers the consumed prefix `{1+` only.
-        assertEquals("{1+", fragment.sourceText());
+        var section = match.sections().getFirst();
+        var dictionary = assertInstanceOf(DictionaryExpression.class, section.patterns().getFirst());
+        assertEquals(1, dictionary.entries().size());
+        assertInstanceOf(BinaryExpression.class, dictionary.entries().getFirst().key());
+        assertNull(dictionary.entries().getFirst().value());
+        assertEquals(1, section.body().statements().size());
+        assertInstanceOf(PassStatement.class, section.body().statements().getFirst());
+
+        // When the key itself is healthy (`1`), the unexpected non-comma tail `var x: 3` emits
+        // SYNTAX_UNEXPECTED_TOKEN once while still keeping the entry and `: pass`.
+        var healthyKeyResult = recoverableParse("func f():\n\tmatch x:\n\t\t{1 var x: 3}: pass\n");
+        assertEquals(List.of("Unexpected \"var\" in dictionary pattern."),
+                errorMessages(healthyKeyResult), () -> errorMessages(healthyKeyResult).toString());
+        var healthyMatch = assertInstanceOf(MatchStatement.class,
+                onlyFunction(healthyKeyResult).body().statements().getFirst());
+        assertEquals(1, healthyMatch.sections().getFirst().body().statements().size());
     }
 
     @Test
@@ -1455,19 +1479,29 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void damagedSubscriptOrGroupingDoesNotFoldFollowingOperators() {
-        // A damaged index builds the subscript node but folds nothing further: the statement is
-        // not at a boundary (the trailing `]+2` follows), so it is discarded and synchronized.
+        // Settled subscript and grouping boundaries remain damaged but continue folding trailing
+        // infix `+ 2`, retaining the full BinaryExpression statement.
         var subscript = recoverableParse("func f():\n\ta[1+]+2\n");
         assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(subscript),
                 () -> errorMessages(subscript).toString());
-        assertTrue(onlyFunction(subscript).body().statements().isEmpty());
+        var subBody = onlyFunction(subscript).body().statements();
+        assertEquals(1, subBody.size());
+        var subBin = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(ExpressionStatement.class, subBody.getFirst()).expression());
+        assertEquals("+", subBin.operator());
+        assertInstanceOf(SubscriptExpression.class, subBin.left());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, subBin.right()).sourceText());
 
-        // A damaged grouping inner expression floats up without consuming the closer; the
-        // enclosing statement is discarded at the `)` non-boundary.
         var grouped = recoverableParse("func f():\n\t(1+)+2\n");
         assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(grouped),
                 () -> errorMessages(grouped).toString());
-        assertTrue(onlyFunction(grouped).body().statements().isEmpty());
+        var grpBody = onlyFunction(grouped).body().statements();
+        assertEquals(1, grpBody.size());
+        var grpBin = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(ExpressionStatement.class, grpBody.getFirst()).expression());
+        assertEquals("+", grpBin.operator());
+        assertInstanceOf(BinaryExpression.class, grpBin.left());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, grpBin.right()).sourceText());
     }
 
     @Test
@@ -1496,14 +1530,30 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void damagedArgumentsStopTheSuffixChain() {
-        // After damaged call arguments the chain returns immediately: `foo(1+)(2)` does not
-        // fold the second call, `a[1+][2]` does not fold the second subscript.
-        for (var source : List.of("func f():\n\tfoo(1+)(2)\n", "func f():\n\ta[1+][2]\n")) {
-            var result = recoverableParse(source);
-            assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(result),
-                    () -> source + " -> " + errorMessages(result));
-            assertTrue(onlyFunction(result).body().statements().isEmpty(), () -> source);
-        }
+        // After damaged call arguments or subscript indices, the settled suffix chain continues
+        // folding subsequent `(2)` / `[2]` suffixes and preserves both argument/index slots.
+        var callResult = recoverableParse("func f():\n\tfoo(1+)(2)\n");
+        assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(callResult),
+                () -> errorMessages(callResult).toString());
+        var callBody = onlyFunction(callResult).body().statements();
+        assertEquals(1, callBody.size());
+        var outerCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(ExpressionStatement.class, callBody.getFirst()).expression());
+        assertEquals(List.of("2"), outerCall.arguments().stream()
+                .map(arg -> assertInstanceOf(LiteralExpression.class, arg).sourceText()).toList());
+        var innerCall = assertInstanceOf(CallExpression.class, outerCall.callee());
+        assertInstanceOf(BinaryExpression.class, innerCall.arguments().getFirst());
+
+        var subResult = recoverableParse("func f():\n\ta[1+][2]\n");
+        assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(subResult),
+                () -> errorMessages(subResult).toString());
+        var subBody = onlyFunction(subResult).body().statements();
+        assertEquals(1, subBody.size());
+        var outerSub = assertInstanceOf(SubscriptExpression.class,
+                assertInstanceOf(ExpressionStatement.class, subBody.getFirst()).expression());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, outerSub.arguments().getFirst()).sourceText());
+        var innerSub = assertInstanceOf(SubscriptExpression.class, outerSub.base());
+        assertInstanceOf(BinaryExpression.class, innerSub.arguments().getFirst());
     }
 
     @Test
@@ -1534,12 +1584,20 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void superCallWithDamagedArgumentStopsFold() {
-        // `super(1+)+2`: the damaged argument list marks the super-call damaged; the enclosing
-        // statement is not at a boundary and is discarded.
+        // `super(1+)+2`: the damaged argument list still settles `)` so `+ 2` folds onto the
+        // CallExpression(SuperExpression, ...) and the statement survives.
         var result = recoverableParse("func f():\n\tsuper(1+)+2\n");
         assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(result),
                 () -> errorMessages(result).toString());
-        assertTrue(onlyFunction(result).body().statements().isEmpty());
+        var body = onlyFunction(result).body().statements();
+        assertEquals(1, body.size());
+        var binary = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(ExpressionStatement.class, body.getFirst()).expression());
+        assertEquals("+", binary.operator());
+        var call = assertInstanceOf(CallExpression.class, binary.left());
+        assertEquals("super", assertInstanceOf(IdentifierExpression.class, call.callee()).name());
+        assertInstanceOf(BinaryExpression.class, call.arguments().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, binary.right()).sourceText());
     }
 
     @Test
@@ -2334,6 +2392,1743 @@ class GdScriptParserErrorRecoveryTest {
         assertEquals("y", y2.name());
         var attr = assertInstanceOf(AttributeExpression.class, x2.value());
         assertEquals("match", assertInstanceOf(AttributePropertyStep.class, attr.steps().getFirst()).name());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Expression folding, dictionary literals, comma-delimited lists/patterns, property blocks,
+    // header/suite recovery, and diagnostic attribution.
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    void phase4DamagedContinuationAndNegativeGuards() {
+        // `super. + 1` folds `+ 1` onto the damaged attribute chain and attributes `SUPER_MISSING_NAME`.
+        var superPlus = recoverableParse("func f():\n\tsuper. + 1\n");
+        var superDiag = findErrorByCode(superPlus, DiagnosticCodes.SUPER_MISSING_NAME);
+        var superStmt = assertInstanceOf(ExpressionStatement.class,
+                onlyFunction(superPlus).body().statements().getFirst());
+        assertEquals(new RecoveryLink(superStmt, "expression"), superDiag.recovery());
+        var superBin = assertInstanceOf(BinaryExpression.class, superStmt.expression());
+        assertEquals("+", superBin.operator());
+        var superChain = assertInstanceOf(AttributeExpression.class, superBin.left());
+        assertInstanceOf(MissingAttributeStep.class, superChain.steps().getFirst());
+
+        // `foo(1+)(2)` preserves outer call and both argument ranges accurately.
+        var doubleCall = recoverableParse("func f():\n\tfoo(1+)(2)\n");
+        var outerCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(ExpressionStatement.class,
+                        onlyFunction(doubleCall).body().statements().getFirst()).expression());
+        var innerCall = assertInstanceOf(CallExpression.class, outerCall.callee());
+        assertTrue(innerCall.arguments().getFirst().range().startByte()
+                < outerCall.arguments().getFirst().range().startByte());
+
+        // Negative guard: `self.b.(1)` keeps MissingAttributeStep as the CallExpression callee
+        // instead of folding `(1)` into a named call on `b`, with only the missing-name error.
+        var missingAttrCall = recoverableParse("var x = self.b.(1)\n");
+        assertEquals(1, errorsOf(missingAttrCall).size(), () -> errorsOf(missingAttrCall).toString());
+        findErrorByCode(missingAttrCall, DiagnosticCodes.ATTRIBUTE_MISSING_NAME);
+        var varDecl = assertInstanceOf(VariableDeclaration.class, missingAttrCall.ast().statements().getFirst());
+        var call = assertInstanceOf(CallExpression.class, varDecl.value());
+        var chain = assertInstanceOf(AttributeExpression.class, call.callee());
+        assertEquals("b", assertInstanceOf(AttributePropertyStep.class, chain.steps().getFirst()).name());
+        assertInstanceOf(MissingAttributeStep.class, chain.steps().get(1));
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, call.arguments().getFirst()).sourceText());
+    }
+
+    @Test
+    void phase4DictionaryStateMachineCrossLineAndNestedIsolation() {
+        // Cross-line missing separator `{"a"\n\t"b": 1}` leaves first entry with zero-width MISSING
+        // value and keeps `"b": 1` intact without emitting duplicate missing-value diagnostics.
+        var crossLineMissing = recoverableParse("var d = {\n\t\"a\"\n\t\"b\": 1\n}\n");
+        assertEquals(List.of(
+                DiagnosticCodes.MISSING_SEPARATOR_DICTIONARY,
+                DiagnosticCodes.MISSING_SEPARATOR_COMMA
+        ), errorsOf(crossLineMissing).stream().map(AstDiagnostic::code).toList(),
+                () -> errorsOf(crossLineMissing).toString());
+        var dict1 = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, crossLineMissing.ast().statements().getFirst()).value());
+        assertEquals(2, dict1.entries().size());
+        var firstMissing = assertInstanceOf(ErrorExpression.class, dict1.entries().getFirst().value());
+        assertEquals(CstIssueKind.MISSING, firstMissing.kind());
+        assertEquals("dictionary.value", firstMissing.nodeType());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, dict1.entries().get(1).value()).sourceText());
+
+        // With comma `{"a",\n\t"b": 1}`, only the single MISSING_SEPARATOR_DICTIONARY fires.
+        var crossLineWithComma = recoverableParse("var d = {\n\t\"a\",\n\t\"b\": 1\n}\n");
+        assertEquals(1, errorsOf(crossLineWithComma).size(), () -> errorsOf(crossLineWithComma).toString());
+        findErrorByCode(crossLineWithComma, DiagnosticCodes.MISSING_SEPARATOR_DICTIONARY);
+
+        // Healthy cross-line dictionary values after explicit `:` or `=` remain legal with 0 errors.
+        var healthyCrossLine = parse("""
+                var py = {
+                \t"a":
+                \t\t1,
+                \t"b":
+                \t\t2
+                }
+                var lua = {
+                \ta =
+                \t\t1,
+                \tb =
+                \t\t2
+                }
+                """);
+        assertEquals(List.of(), errorsOf(healthyCrossLine), () -> errorsOf(healthyCrossLine).toString());
+
+        // Nested dictionary failure isolates inside the inner dictionary; outer `"ok": 2` survives.
+        var nested = recoverableParse("var d = {\"outer\": {name}, \"ok\": 2}\n");
+        assertEquals(1, errorsOf(nested).size(), () -> errorsOf(nested).toString());
+        findErrorByCode(nested, DiagnosticCodes.MISSING_SEPARATOR_DICTIONARY);
+        var outerDict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, nested.ast().statements().getFirst()).value());
+        assertEquals(2, outerDict.entries().size());
+        var innerDict = assertInstanceOf(DictionaryExpression.class, outerDict.entries().getFirst().value());
+        assertEquals(1, innerDict.entries().size());
+        assertInstanceOf(ErrorExpression.class, innerDict.entries().getFirst().value());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, outerDict.entries().get(1).value()).sourceText());
+
+        // Grouping key range includes real closing parenthesis `(a)`.
+        var groupedKey = parse("var d = {(a): 1}\n");
+        assertEquals(List.of(), errorsOf(groupedKey));
+        var groupedDict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, groupedKey.ast().statements().getFirst()).value());
+        assertEquals(new Range(9, 15, new Point(0, 9), new Point(0, 15)),
+                groupedDict.entries().getFirst().range());
+    }
+
+    @Test
+    void phase4MissingCommaSyncAcrossListsAndNegativeProtection() {
+        // Array `[1 2]` emits one MISSING_SEPARATOR_COMMA and retains both elements.
+        var arrayRes = recoverableParse("var a = [1 2]\n");
+        assertEquals(1, errorsOf(arrayRes).size(), () -> errorsOf(arrayRes).toString());
+        findErrorByCode(arrayRes, DiagnosticCodes.MISSING_SEPARATOR_COMMA);
+        var array = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, arrayRes.ast().statements().getFirst()).value());
+        assertEquals(List.of("1", "2"), array.elements().stream()
+                .map(e -> assertInstanceOf(LiteralExpression.class, e).sourceText()).toList());
+
+        // Function and signal parameter lists emit one MISSING_SEPARATOR_COMMA and keep both params.
+        var fnRes = recoverableParse("func f(a b):\n\tpass\n");
+        assertEquals(1, errorsOf(fnRes).size(), () -> errorsOf(fnRes).toString());
+        findErrorByCode(fnRes, DiagnosticCodes.MISSING_SEPARATOR_COMMA);
+        assertEquals(List.of("a", "b"),
+                onlyFunction(fnRes).parameters().stream().map(Parameter::name).toList());
+
+        var sigRes = recoverableParse("signal s(a b)\n");
+        assertEquals(1, errorsOf(sigRes).size(), () -> errorsOf(sigRes).toString());
+        findErrorByCode(sigRes, DiagnosticCodes.MISSING_SEPARATOR_COMMA);
+        var sig = assertInstanceOf(SignalStatement.class, sigRes.ast().statements().getFirst());
+        assertEquals(List.of("a", "b"),
+                sig.parameters().stream().map(Parameter::name).toList());
+
+        // Match dictionary pattern `{1+ var x: 3, 2: 3}` skips bad tail to comma and keeps `2: 3`.
+        var dictComma = recoverableParse("func f():\n\tmatch x:\n\t\t{1+ var x: 3, 2: 3}: pass\n");
+        var dictPattern = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(MatchStatement.class, onlyFunction(dictComma).body().statements().getFirst())
+                        .sections().getFirst().patterns().getFirst());
+        assertEquals(2, dictPattern.entries().size());
+        assertNull(dictPattern.entries().getFirst().value());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, dictPattern.entries().get(1).key()).sourceText());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, dictPattern.entries().get(1).value()).sourceText());
+
+        // Without real `}`, `{1+ var x: 3` stops at layout boundary and protects outer `var after = 1`.
+        var unclosedDictPattern = recoverableParse("func f():\n\tmatch x:\n\t\t{1+ var x: 3\nvar after = 1\n");
+        assertEquals(2, unclosedDictPattern.ast().statements().size(),
+                () -> unclosedDictPattern.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class,
+                unclosedDictPattern.ast().statements().get(1)).name());
+
+        // Negative: unclosed cross-line `print(1\n\tprint(2)` never absorbs `print(2)` as missing-comma arg.
+        var crossLineCall = recoverableParse("func f():\n\tprint(1\n\tprint(2)\n");
+        var fnBody = onlyFunction(crossLineCall).body().statements();
+        assertEquals(2, fnBody.size(), () -> fnBody.toString());
+        assertTrue(errorsOf(crossLineCall).stream()
+                .noneMatch(d -> DiagnosticCodes.MISSING_SEPARATOR_COMMA.equals(d.code())));
+    }
+
+    @Test
+    void phase4PropertyBlockDrainsDuplicatesAndUnknownAccessorsWithAttribution() {
+        // Legal property forms remain 0-diagnostic.
+        var legal = parse("""
+                var ref_prop: get = _get, set = _set
+                var block_prop: int:
+                \tget:
+                \t\treturn 1
+                \tset(value):
+                \t\tpass
+                """);
+        assertEquals(List.of(), errorsOf(legal), () -> errorsOf(legal).toString());
+
+        // Single-line duplicate get/set keeps variable declaration and subsequent members.
+        var singleLine = recoverableParse("""
+                var x: get = g1, get = g2, set = s1, set = s2
+                var after_var = 1
+                func after_fn(): pass
+                enum AfterEnum { A }
+                """);
+        assertEquals(4, singleLine.ast().statements().size());
+        var xDecl = assertInstanceOf(VariableDeclaration.class, singleLine.ast().statements().getFirst());
+        var dupGetter = findErrorByCode(singleLine, DiagnosticCodes.PROPERTY_DUPLICATE_GETTER);
+        var dupSetter = findErrorByCode(singleLine, DiagnosticCodes.PROPERTY_DUPLICATE_SETTER);
+        assertSame(xDecl, dupGetter.recovery().owner());
+        assertEquals("variable.property", dupGetter.recovery().facet());
+        assertSame(xDecl, dupSetter.recovery().owner());
+        assertEquals("variable.property", dupSetter.recovery().facet());
+        assertEquals("after_var", assertInstanceOf(VariableDeclaration.class,
+                singleLine.ast().statements().get(1)).name());
+        assertEquals("after_fn", assertInstanceOf(FunctionDeclaration.class,
+                singleLine.ast().statements().get(2)).name());
+        assertEquals("AfterEnum", assertInstanceOf(EnumDeclaration.class,
+                singleLine.ast().statements().get(3)).name());
+
+        // Indented triple get + mixed get/set/get + unknown accessor (nested suite & line) drain
+        // all parts cleanly without borrowing outer DEDENT or killing following members.
+        var tripleAndUnknown = recoverableParse("""
+                var p1:
+                \tget:
+                \t\tpass
+                \tget:
+                \t\tpass
+                \tget:
+                \t\tpass
+                var p2:
+                \tget:
+                \t\tpass
+                \tset(v):
+                \t\tpass
+                \tget:
+                \t\tpass
+                \tfoo:
+                \t\tvar inner = 1
+                \tbar
+                var ok = 42
+                func g():
+                \tpass
+                enum E { X }
+                """);
+        assertEquals(5, tripleAndUnknown.ast().statements().size(),
+                () -> tripleAndUnknown.ast().statements().toString());
+        var p1 = assertInstanceOf(VariableDeclaration.class, tripleAndUnknown.ast().statements().getFirst());
+        var p2 = assertInstanceOf(VariableDeclaration.class, tripleAndUnknown.ast().statements().get(1));
+        assertEquals(2, errorsOf(tripleAndUnknown).stream()
+                .filter(d -> DiagnosticCodes.PROPERTY_DUPLICATE_GETTER.equals(d.code())
+                        && d.recovery() != null && d.recovery().owner() == p1)
+                .count());
+        var invalidAccessors = errorsOf(tripleAndUnknown).stream()
+                .filter(d -> DiagnosticCodes.PROPERTY_INVALID_ACCESSOR.equals(d.code()))
+                .toList();
+        assertEquals(2, invalidAccessors.size(), () -> errorsOf(tripleAndUnknown).toString());
+        for (var inv : invalidAccessors) {
+            assertSame(p2, inv.recovery().owner());
+            assertEquals("variable.property", inv.recovery().facet());
+        }
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class,
+                tripleAndUnknown.ast().statements().get(2)).name());
+        assertEquals("g", assertInstanceOf(FunctionDeclaration.class,
+                tripleAndUnknown.ast().statements().get(3)).name());
+        assertEquals("E", assertInstanceOf(EnumDeclaration.class,
+                tripleAndUnknown.ast().statements().get(4)).name());
+    }
+
+    @Test
+    void phase4UnclosedSignatureYieldAndNegativeControls() {
+        // Legal bodyless signature and legal multiline parameter type both pass with 0 diagnostics.
+        var legalBodyless = parse("func f(a)\nvar x = 1\n");
+        assertEquals(List.of(), errorsOf(legalBodyless), () -> errorsOf(legalBodyless).toString());
+        assertEquals(2, legalBodyless.ast().statements().size());
+        var bodylessFn = assertInstanceOf(FunctionDeclaration.class, legalBodyless.ast().statements().getFirst());
+        assertTrue(bodylessFn.body().statements().isEmpty());
+
+        var legalMultilineType = parse("func f(\n\ta:\n\tint\n):\n\tpass\n");
+        assertEquals(List.of(), errorsOf(legalMultilineType), () -> errorsOf(legalMultilineType).toString());
+
+        // Negative: unclosed param list followed by `:` and same-indent outer member must NOT steal `var after`.
+        var noDeepSuite = recoverableParse("func f(a, b:\nvar after = 1\n");
+        assertEquals(2, noDeepSuite.ast().statements().size(),
+                () -> noDeepSuite.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class,
+                noDeepSuite.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void phase4MatchSectionMissingColonWithBodyAndSibling() {
+        // Missing `:` followed by indented body retains both the current section's body and later `2:`.
+        var withBody = recoverableParse("""
+                func f():
+                \tmatch x:
+                \t\t1
+                \t\t\tpass
+                \t\t2:
+                \t\t\tpass
+                """);
+        assertEquals(1, errorsOf(withBody).size(), () -> errorsOf(withBody).toString());
+        var colonErr = findErrorByCode(withBody, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON);
+        var match = assertInstanceOf(MatchStatement.class,
+                onlyFunction(withBody).body().statements().getFirst());
+        assertEquals(2, match.sections().size());
+        var firstSection = assertInstanceOf(MatchSection.class, match.sections().getFirst());
+        assertSame(firstSection, colonErr.recovery().owner());
+        assertEquals("match.section", colonErr.recovery().facet());
+        assertInstanceOf(PassStatement.class, firstSection.body().statements().getFirst());
+        assertInstanceOf(PassStatement.class, match.sections().get(1).body().statements().getFirst());
+
+        // Missing `:` without an indented body does not steal `2:` or ancestor DEDENT.
+        var withoutBody = recoverableParse("""
+                func f():
+                \tmatch x:
+                \t\t1
+                \t\t2:
+                \t\t\tpass
+                \tvar after = 1
+                """);
+        findErrorByCode(withoutBody, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON);
+        var fnBody = onlyFunction(withoutBody).body().statements();
+        assertEquals(2, fnBody.size());
+        var match2 = assertInstanceOf(MatchStatement.class, fnBody.getFirst());
+        assertEquals(2, match2.sections().size());
+        assertTrue(match2.sections().getFirst().body().statements().isEmpty());
+        assertEquals(1, match2.sections().get(1).body().statements().size());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, fnBody.get(1)).name());
+    }
+
+    @Test
+    void phase4MissingHeaderNamesAndControlNegative() {
+        // `for in arr:` retains ForStatement, iterable, and body with FOR_MISSING_ITERATOR.
+        var forRes = recoverableParse("func f():\n\tfor in arr:\n\t\tpass\n");
+        var forErr = findErrorByCode(forRes, DiagnosticCodes.FOR_MISSING_ITERATOR);
+        var forStmt = assertInstanceOf(ForStatement.class,
+                onlyFunction(forRes).body().statements().getFirst());
+        assertSame(forStmt, forErr.recovery().owner());
+        assertEquals("for.iterator", forErr.recovery().facet());
+        assertEquals("", forStmt.iterator());
+        assertEquals("arr", assertInstanceOf(IdentifierExpression.class, forStmt.iterable()).name());
+        assertInstanceOf(PassStatement.class, forStmt.body().statements().getFirst());
+
+        // `const A` retains VariableDeclaration(CONST, "A", Missing("constant.value")).
+        var constRes = recoverableParse("const A\nvar ok = 1\n");
+        var constErr = findErrorByCode(constRes, DiagnosticCodes.SLOT_CONSTANT_VALUE);
+        var constDecl = assertInstanceOf(VariableDeclaration.class, constRes.ast().statements().getFirst());
+        assertEquals(DeclarationKind.CONST, constDecl.kind());
+        assertEquals("A", constDecl.name());
+        assertSame(constDecl, constErr.recovery().owner());
+        assertEquals("constant.value", constErr.recovery().facet());
+        var constMarker = assertInstanceOf(ErrorExpression.class, constDecl.value());
+        assertEquals(CstIssueKind.MISSING, constMarker.kind());
+        assertEquals("constant.value", constMarker.nodeType());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, constRes.ast().statements().get(1)).name());
+
+        // `var = 1` retains VariableDeclaration(VAR, "", 1) with DECLARATION_MISSING_NAME.
+        var varRes = recoverableParse("var = 1\n");
+        var varErr = findErrorByCode(varRes, DiagnosticCodes.DECLARATION_MISSING_NAME);
+        var varDecl = assertInstanceOf(VariableDeclaration.class, varRes.ast().statements().getFirst());
+        assertEquals(DeclarationKind.VAR, varDecl.kind());
+        assertEquals("", varDecl.name());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, varDecl.value()).sourceText());
+        assertSame(varDecl, varErr.recovery().owner());
+        assertEquals("declaration.name", varErr.recovery().facet());
+
+        // Class-body `func (a: int):\n\tpass\n` retains FunctionDeclaration with DECLARATION_MISSING_NAME.
+        var fnRes = recoverableParse("func (a: int):\n\tpass\n");
+        var fnErr = findErrorByCode(fnRes, DiagnosticCodes.DECLARATION_MISSING_NAME);
+        var fnDecl = assertInstanceOf(FunctionDeclaration.class, fnRes.ast().statements().getFirst());
+        assertEquals("", fnDecl.name());
+        assertEquals(List.of("a"), fnDecl.parameters().stream().map(Parameter::name).toList());
+        assertInstanceOf(PassStatement.class, fnDecl.body().statements().getFirst());
+        assertSame(fnDecl, fnErr.recovery().owner());
+        assertEquals("function.name", fnErr.recovery().facet());
+
+        // Negative: legal anonymous enum has 0 diagnostics; suite-level bare `func` stays distinct.
+        assertEquals(List.of(), errorsOf(parse("enum { A, B }\n")));
+        var suiteBareFunc = recoverableParse("func f():\n\tfunc ()\n\tpass\n");
+        assertEquals(2, onlyFunction(suiteBareFunc).body().statements().size());
+    }
+
+    @Test
+    void phase4PrefixAnnotationProgressAndDanglingSeparation() {
+        // Same-logical-line prefix annotations advance cleanly without failing.
+        var sameLine = parse("func f(): @warning_ignore(\"a\") pass\n");
+        assertEquals(List.of(), errorsOf(sameLine), () -> errorsOf(sameLine).toString());
+        var fnBody = onlyFunction(sameLine).body().statements();
+        assertEquals(2, fnBody.size());
+        assertInstanceOf(AnnotationStatement.class, fnBody.getFirst());
+        assertInstanceOf(PassStatement.class, fnBody.get(1));
+
+        // 120 trailing annotations at scope end never falsely consume circuit-breaker budget.
+        var danglingMany = parse("func f():\n" + "\t@warning_ignore(\"a\")\n".repeat(120));
+        assertTrue(errorsOf(danglingMany).stream()
+                .noneMatch(d -> DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS.equals(d.code())),
+                () -> errorsOf(danglingMany).toString());
+        assertEquals(120, onlyFunction(danglingMany).body().statements().size());
+    }
+
+    @Test
+    void phase4LinearScanBoundsAndParserReuseBalanceInvariant() {
+        // Large missing-comma and missing-separator lists stay single-pass without rescanning.
+        var parser = new GdScriptParser();
+        for (var n : List.of(128, 512)) {
+            var missingCommaCall = "var x = foo(" + "1 ".repeat(n) + ")\n";
+            var callRes = parser.parse(missingCommaCall);
+            assertTrue(parser.bracketOracleScanCount() <= 1,
+                    () -> "unexpected rescan for missing-comma call n=" + n + ": " + parser.bracketOracleScanCount());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, callRes.ast().statements().getFirst()).value());
+            assertEquals(n, call.arguments().size());
+
+            var missingSepDict = "var d = {" + "\"k\"\n".repeat(n) + "}\n";
+            var dictRes = parser.parse(missingSepDict);
+            assertTrue(parser.bracketOracleScanCount() <= 1,
+                    () -> "unexpected rescan for missing-separator dict n=" + n + ": " + parser.bracketOracleScanCount());
+            var dict = assertInstanceOf(DictionaryExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, dictRes.ast().statements().getFirst()).value());
+            assertEquals(n, dict.entries().size());
+        }
+
+        // Repeated recovery parses followed by a clean parse leave stacks balanced and reusable.
+        for (var sample : List.of(
+                "var x: get = g1, get = g2, foo\n",
+                "func f(a, b:\n\tpass\n",
+                "func f():\n\tmatch x:\n\t\t1\n\t\t\tpass\n",
+                "for in arr:\n",
+                "const A\nvar = 1\nfunc ():\n\tpass\n")) {
+            parser.parse(sample);
+        }
+        var clean = parser.parse("var ok = 1\n");
+        assertEquals(List.of(), errorsOf(clean));
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, clean.ast().statements().getFirst()).name());
+    }
+
+    @Test
+    @Timeout(5)
+    void propertyBlockSemicolonUnclosedDrainAndMixedReferenceRecovery() {
+        // Semicolon inside an indented property block must terminate and attribute to `x`.
+        var semiRes = recoverableParse("var x:\n\t;\nvar after = 1\n");
+        var semiProp = assertInstanceOf(VariableDeclaration.class, semiRes.ast().statements().getFirst());
+        assertEquals("x", semiProp.name());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, semiRes.ast().statements().get(1)).name());
+        var semiDiag = findErrorByCode(semiRes, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+        assertEquals(new RecoveryLink(semiProp, "variable.property"), semiDiag.recovery());
+
+        // Single-line reference list ending with comma + newline must not swallow `var after = 1`.
+        var inlineNewlineRes = recoverableParse("var x: get = g,\nvar after = 1\n");
+        assertEquals(2, inlineNewlineRes.ast().statements().size(),
+                () -> inlineNewlineRes.ast().statements().toString());
+        assertEquals("x", assertInstanceOf(VariableDeclaration.class, inlineNewlineRes.ast().statements().getFirst()).name());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, inlineNewlineRes.ast().statements().get(1)).name());
+
+        // Unclosed `(` inside an unknown property line must still stop at NEWLINE/DEDENT.
+        var unclosedParenRes = recoverableParse("var x:\n\tunknown(\n\t\tpass\nvar after = 1\n");
+        var unclosedProp = assertInstanceOf(VariableDeclaration.class, unclosedParenRes.ast().statements().getFirst());
+        assertEquals("x", unclosedProp.name());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, unclosedParenRes.ast().statements().get(1)).name());
+        assertEquals(new RecoveryLink(unclosedProp, "variable.property"),
+                findErrorByCode(unclosedParenRes, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR).recovery());
+
+        // Indented property block starting with `= fn` continues draining through unknown block items.
+        var mixedRefThenUnknown = recoverableParse("var x:\n\tget = getter\n\tunknown:\n\t\tpass\nvar after = 1\n");
+        var mixedProp = assertInstanceOf(VariableDeclaration.class, mixedRefThenUnknown.ast().statements().getFirst());
+        assertEquals("x", mixedProp.name());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, mixedRefThenUnknown.ast().statements().get(1)).name());
+        assertEquals(new RecoveryLink(mixedProp, "variable.property"),
+                findErrorByCode(mixedRefThenUnknown, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR).recovery());
+
+        // Mixing `= fn` with a subsequent block `set(v):` in an indented block still reports an error.
+        var mixedRefThenBlockSet = recoverableParse("var x:\n\tget = getter\n\tset(v):\n\t\tpass\nvar after = 1\n");
+        assertEquals(2, mixedRefThenBlockSet.ast().statements().size());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, mixedRefThenBlockSet.ast().statements().get(1)).name());
+
+        // Positive control: multi-line indented comma-separated property references stay diagnostic-free.
+        var legalMultilineRef = parse("var x:\n\tget = g,\n\tset = s\nvar after = 1\n");
+        assertEquals(List.of(), errorsOf(legalMultilineRef), () -> errorsOf(legalMultilineRef).toString());
+        assertEquals(2, legalMultilineRef.ast().statements().size());
+    }
+
+    @Test
+    void badSeparatedItemSkipStopsAtExpectedCloserEvenWithUnclosedLocalParen() {
+        var res = recoverableParse("func f():\n\tmatch x:\n\t\t{1+ var y(}: pass\n\t\t_: pass\nvar after = 1\n");
+        assertEquals(2, res.ast().statements().size(), () -> res.ast().statements().toString());
+        var fn = assertInstanceOf(FunctionDeclaration.class, res.ast().statements().getFirst());
+        var match = assertInstanceOf(MatchStatement.class, fn.body().statements().getFirst());
+        assertEquals(2, match.sections().size(), () -> match.sections().toString());
+        assertInstanceOf(PassStatement.class, match.sections().getFirst().body().statements().getFirst());
+        assertInstanceOf(PassStatement.class, match.sections().get(1).body().statements().getFirst());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void nestedLambdaUnclosedParameterListYieldsAndPositiveControlsStayClean() {
+        // Positive controls: balanced nested lambda signatures keep their typed parameters cleanly.
+        var posColon = parse("var x = g(func(a:\n\tint): pass, 2)\n");
+        assertEquals(List.of(), errorsOf(posColon), () -> errorsOf(posColon).toString());
+        var posColonCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, posColon.ast().statements().getFirst()).value());
+        assertEquals(2, posColonCall.arguments().size());
+        var posColonLambda = assertInstanceOf(LambdaExpression.class, posColonCall.arguments().getFirst());
+        assertEquals("int", posColonLambda.parameters().getFirst().type().sourceText());
+
+        var posArrow = parse("var x = g(func(a:\n\tint) -> int:\n\treturn a, 2)\n");
+        assertEquals(List.of(), errorsOf(posArrow), () -> errorsOf(posArrow).toString());
+        var posArrowCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, posArrow.ast().statements().getFirst()).value());
+        assertEquals(2, posArrowCall.arguments().size());
+        var posArrowLambda = assertInstanceOf(LambdaExpression.class, posArrowCall.arguments().getFirst());
+        assertEquals("int", posArrowLambda.parameters().getFirst().type().sourceText());
+        assertEquals("int", posArrowLambda.returnType().sourceText());
+        assertInstanceOf(ReturnStatement.class, posArrowLambda.body().statements().getFirst());
+
+        var posBodylessFn = parse("func f(a:\n\tint\n)\n");
+        assertEquals(List.of(), errorsOf(posBodylessFn), () -> errorsOf(posBodylessFn).toString());
+        var bodylessFn = onlyFunction(posBodylessFn);
+        assertEquals("int", bodylessFn.parameters().getFirst().type().sourceText());
+
+        // Negative: outer `g(` stole the only `)`, so inner `func(a:` yields `:` to its suite.
+        var neg = recoverableParse("var x = g(func(a:\n\tpass\n)\nvar ok = 1\n");
+        findErrorByCode(neg, DiagnosticCodes.MISSING_CLOSER_PARAMETER_LIST);
+        assertEquals(2, neg.ast().statements().size(), () -> neg.ast().statements().toString());
+        var negCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, neg.ast().statements().getFirst()).value());
+        var negLambda = assertInstanceOf(LambdaExpression.class, negCall.arguments().getFirst());
+        assertEquals("a", negLambda.parameters().getFirst().name());
+        assertNull(negLambda.parameters().getFirst().type());
+        assertInstanceOf(PassStatement.class, negLambda.body().statements().getFirst());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, neg.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void matchSectionMissingColonAfterLambdaGuardPreservesNextBranch() {
+        var inlineGuard = recoverableParse("func f():\n\tmatch x:\n\t\t1 when func(): pass\n\t\t2: pass\n");
+        var inlineMatch = assertInstanceOf(MatchStatement.class,
+                onlyFunction(inlineGuard).body().statements().getFirst());
+        assertEquals(2, inlineMatch.sections().size(), () -> inlineMatch.sections().toString());
+        var inlineFirst = inlineMatch.sections().getFirst();
+        assertInstanceOf(LambdaExpression.class, inlineFirst.guard());
+        assertEquals(List.of(), inlineFirst.body().statements());
+        assertEquals(new RecoveryLink(inlineFirst, "match.section"),
+                findErrorByCode(inlineGuard, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON).recovery());
+        assertInstanceOf(PassStatement.class, inlineMatch.sections().get(1).body().statements().getFirst());
+
+        var multilineGuard = recoverableParse("func f():\n\tmatch x:\n\t\t1 when func():\n\t\t\tpass\n\t\t2: pass\n");
+        var multiMatch = assertInstanceOf(MatchStatement.class,
+                onlyFunction(multilineGuard).body().statements().getFirst());
+        assertEquals(2, multiMatch.sections().size(), () -> multiMatch.sections().toString());
+        var multiFirst = multiMatch.sections().getFirst();
+        assertInstanceOf(LambdaExpression.class, multiFirst.guard());
+        assertEquals(List.of(), multiFirst.body().statements());
+        assertEquals(new RecoveryLink(multiFirst, "match.section"),
+                findErrorByCode(multilineGuard, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON).recovery());
+        assertInstanceOf(PassStatement.class, multiMatch.sections().get(1).body().statements().getFirst());
+    }
+
+    @Test
+    void endStatementDrainsSameLineResidueWithoutStealingSemicolonOrOuterComma() {
+        var sameLineGarbage = recoverableParse("func f():\n\tsuper. 0 var y = 1\n\tvar z = 2\n");
+        var body = onlyFunction(sameLineGarbage).body().statements();
+        assertEquals(2, body.size(), () -> body.toString());
+        var superStmt = assertInstanceOf(ExpressionStatement.class, body.getFirst());
+        var superChain = assertInstanceOf(AttributeExpression.class, superStmt.expression());
+        assertInstanceOf(MissingAttributeStep.class, superChain.steps().getFirst());
+        assertEquals("z", assertInstanceOf(VariableDeclaration.class, body.get(1)).name());
+
+        var afterSemicolon = recoverableParse("func f():\n\tsuper. 0 var y = 1; var z = 2\n");
+        var semiBody = onlyFunction(afterSemicolon).body().statements();
+        assertEquals(2, semiBody.size(), () -> semiBody.toString());
+        assertInstanceOf(ExpressionStatement.class, semiBody.getFirst());
+        assertEquals("z", assertInstanceOf(VariableDeclaration.class, semiBody.get(1)).name());
+
+        var lambdaInCall = recoverableParse("var r = f(func(): super. 0 var y = 1, 2)\n");
+        var outerCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, lambdaInCall.ast().statements().getFirst()).value());
+        assertInstanceOf(LambdaExpression.class, outerCall.arguments().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, outerCall.arguments().getLast()).sourceText());
+    }
+
+    @Test
+    void arrayPatternMissingCommaRecognizesWildcardStarterAndSynchronizeReclaimsIndentedContinuation() {
+        var arrayWildcard = recoverableParse("func f():\n\tmatch x:\n\t\t[1 _]: pass\n");
+        assertEquals(List.of(DiagnosticCodes.MISSING_SEPARATOR_COMMA),
+                errorsOf(arrayWildcard).stream().map(AstDiagnostic::code).toList());
+        var match = assertInstanceOf(MatchStatement.class,
+                onlyFunction(arrayWildcard).body().statements().getFirst());
+        var pattern = assertInstanceOf(ArrayExpression.class, match.sections().getFirst().patterns().getFirst());
+        assertEquals(2, pattern.elements().size(), () -> pattern.elements().toString());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, pattern.elements().getFirst()).sourceText());
+        assertEquals("_", assertInstanceOf(IdentifierExpression.class, pattern.elements().get(1)).name());
+
+        var deeperCall = recoverableParse("func f():\n\tprint(1\n\t\t1 + 2\n\tprint(2)\n");
+        assertEquals(1, deeperCall.ast().statements().size(), () -> deeperCall.ast().statements().toString());
+        var fnBody = onlyFunction(deeperCall).body().statements();
+        assertEquals(3, fnBody.size(), () -> fnBody.toString());
+        assertInstanceOf(ExpressionStatement.class, fnBody.getFirst());
+        var midExpr = assertInstanceOf(ExpressionStatement.class, fnBody.get(1));
+        assertInstanceOf(BinaryExpression.class, midExpr.expression());
+        assertInstanceOf(ExpressionStatement.class, fnBody.get(2));
+        assertFalse(errorsOf(deeperCall).stream().anyMatch(d -> d.message().contains("class body")),
+                () -> errorsOf(deeperCall).toString());
+
+        var deeperArray = recoverableParse("func f():\n\tvar a = [1\n\t\t2\nvar y = 3\n");
+        assertEquals(2, deeperArray.ast().statements().size(), () -> deeperArray.ast().statements().toString());
+        var arrayFnBody = assertInstanceOf(FunctionDeclaration.class, deeperArray.ast().statements().getFirst())
+                .body().statements();
+        assertEquals(2, arrayFnBody.size(), () -> arrayFnBody.toString());
+        assertEquals("a", assertInstanceOf(VariableDeclaration.class, arrayFnBody.getFirst()).name());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class,
+                assertInstanceOf(ExpressionStatement.class, arrayFnBody.get(1)).expression()).sourceText());
+        assertEquals("y", assertInstanceOf(VariableDeclaration.class, deeperArray.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void dictionaryMultilineKeyDoesNotStealNextEntryAndPreservesValidMultilineForms() {
+        var multiKeyNoComma = recoverableParse("var d = {\"a\"\n\t+ 1 \"b\": 2}\n");
+        var dict1 = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, multiKeyNoComma.ast().statements().getFirst()).value());
+        assertEquals(2, dict1.entries().size(), () -> dict1.entries().toString());
+        assertInstanceOf(BinaryExpression.class, dict1.entries().getFirst().key());
+        var missingVal1 = assertInstanceOf(ErrorExpression.class, dict1.entries().getFirst().value());
+        assertEquals(CstIssueKind.MISSING, missingVal1.kind());
+        assertEquals("\"b\"", assertInstanceOf(LiteralExpression.class, dict1.entries().get(1).key()).sourceText());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, dict1.entries().get(1).value()).sourceText());
+
+        var sameLineNextKey = recoverableParse("var d = {\"a\" \"b\": 2}\n");
+        var dict2 = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, sameLineNextKey.ast().statements().getFirst()).value());
+        assertEquals(2, dict2.entries().size(), () -> dict2.entries().toString());
+        assertEquals("\"a\"", assertInstanceOf(LiteralExpression.class, dict2.entries().getFirst().key()).sourceText());
+        assertEquals(CstIssueKind.MISSING,
+                assertInstanceOf(ErrorExpression.class, dict2.entries().getFirst().value()).kind());
+        assertEquals("\"b\"", assertInstanceOf(LiteralExpression.class, dict2.entries().get(1).key()).sourceText());
+
+        var validMultiKey = parse("var d = {\"a\"\n\t+ \"b\": 1}\n");
+        assertEquals(List.of(), errorsOf(validMultiKey), () -> errorsOf(validMultiKey).toString());
+        var dict3 = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, validMultiKey.ast().statements().getFirst()).value());
+        assertEquals(1, dict3.entries().size());
+
+        var validMultiValue = parse("var d = {\"a\":\n\t1 + 2}\n");
+        assertEquals(List.of(), errorsOf(validMultiValue), () -> errorsOf(validMultiValue).toString());
+        var dict4 = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, validMultiValue.ast().statements().getFirst()).value());
+        assertEquals(1, dict4.entries().size());
+
+        var sameLineMissingSep = recoverableParse("var d = {1 2}\n");
+        findErrorByCode(sameLineMissingSep, DiagnosticCodes.MISSING_SEPARATOR_DICTIONARY);
+        var dict5 = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, sameLineMissingSep.ast().statements().getFirst()).value());
+        assertEquals(1, dict5.entries().size());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, dict5.entries().getFirst().value()).sourceText());
+    }
+
+    @Test
+    void isolatedPropertySuiteAndDuplicateParameterDiagnosticsAttributeToOuterOwners() {
+        var isolatedProp = recoverableParse("var x:\n\tget:\n\t\tvar = 1\n\t\tvar y = [1 2]\n");
+        var propVar = assertInstanceOf(VariableDeclaration.class, isolatedProp.ast().statements().getFirst());
+        var missingNameDiag = findErrorByCode(isolatedProp, DiagnosticCodes.DECLARATION_MISSING_NAME);
+        var missingCommaDiag = findErrorByCode(isolatedProp, DiagnosticCodes.MISSING_SEPARATOR_COMMA);
+        assertEquals(new RecoveryLink(propVar, "variable.property"), missingNameDiag.recovery());
+        assertEquals(new RecoveryLink(propVar, "variable.property"), missingCommaDiag.recovery());
+
+        var dupParamArray = recoverableParse("func f(a, a = [1 2]): pass\n");
+        var fn = onlyFunction(dupParamArray);
+        assertEquals(1, fn.parameters().size());
+        var dupCommaDiag = findErrorByCode(dupParamArray, DiagnosticCodes.MISSING_SEPARATOR_COMMA);
+        assertEquals(new RecoveryLink(fn, "function.signature"), dupCommaDiag.recovery());
+
+        // Unsupported codes inside a dropped duplicate parameter degrade cleanly without throwing.
+        var dupParamSlot = recoverableParse("func f(a, a = ): pass\n");
+        var slotDiag = findErrorByCode(dupParamSlot, DiagnosticCodes.SLOT_PARAMETER_DEFAULT);
+        assertNull(slotDiag.recovery());
+    }
+
+    @Test
+    void unexpectedIndentBalancingKeepsSuiteAndClassBodyOwnershipWithoutSynchronizeGuessing() {
+        var suiteSibling = recoverableParse("func f():\n\tpass\n\t\tvar garbage = 0\n\tvar ok = 1\nvar top = 2\n");
+        assertEquals(2, suiteSibling.ast().statements().size(), () -> suiteSibling.ast().statements().toString());
+        var fn = assertInstanceOf(FunctionDeclaration.class, suiteSibling.ast().statements().getFirst());
+        assertEquals(3, fn.body().statements().size(), () -> fn.body().statements().toString());
+        assertInstanceOf(PassStatement.class, fn.body().statements().getFirst());
+        assertEquals("garbage", assertInstanceOf(VariableDeclaration.class, fn.body().statements().get(1)).name());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, fn.body().statements().get(2)).name());
+        assertEquals("top", assertInstanceOf(VariableDeclaration.class, suiteSibling.ast().statements().get(1)).name());
+
+        var nestedClass = recoverableParse("class C:\n\tvar a = 1\n\t\tvar b = 2\n\tvar c = 3\nvar top = 4\n");
+        assertEquals(2, nestedClass.ast().statements().size(), () -> nestedClass.ast().statements().toString());
+        var innerClass = assertInstanceOf(ClassDeclaration.class, nestedClass.ast().statements().getFirst());
+        assertEquals(List.of("a", "b", "c"), innerClass.body().statements().stream()
+                .map(stmt -> assertInstanceOf(VariableDeclaration.class, stmt).name())
+                .toList());
+        assertEquals("top", assertInstanceOf(VariableDeclaration.class, nestedClass.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void propertyBlockLocalDedentStopAndIndentedReferenceListMissingComma() {
+        var nestedGarbage = recoverableParse("var x:\n\tget = g\n\t\tjunk\n\tget = g2\nvar after = 1\n");
+        assertEquals(2, nestedGarbage.ast().statements().size(), () -> nestedGarbage.ast().statements().toString());
+        var propVar = assertInstanceOf(VariableDeclaration.class, nestedGarbage.ast().statements().getFirst());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, nestedGarbage.ast().statements().get(1)).name());
+        var invalidDiag = findErrorByCode(nestedGarbage, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+        var dupGetterDiag = findErrorByCode(nestedGarbage, DiagnosticCodes.PROPERTY_DUPLICATE_GETTER);
+        assertEquals(new RecoveryLink(propVar, "variable.property"), invalidDiag.recovery());
+        assertEquals(new RecoveryLink(propVar, "variable.property"), dupGetterDiag.recovery());
+
+        var missingCommaRef = recoverableParse("var x:\n\tget = g\n\tset = s\n");
+        var missingCommaProp = assertInstanceOf(VariableDeclaration.class, missingCommaRef.ast().statements().getFirst());
+        var missingCommaDiag = findErrorByCode(missingCommaRef, DiagnosticCodes.MISSING_SEPARATOR_COMMA);
+        assertEquals(new RecoveryLink(missingCommaProp, "variable.property"), missingCommaDiag.recovery());
+
+        var validCommaRef = parse("var x:\n\tget = g,\n\tset = s\n");
+        assertEquals(List.of(), errorsOf(validCommaRef), () -> errorsOf(validCommaRef).toString());
+    }
+
+    @Test
+    void unclosedParameterListYieldsReturnArrowAndSingleLineColonWithLinearSignatureScanning() {
+        var arrowLambda = recoverableParse("var x = g(func(a -> int:\n\tpass\n)\nvar ok = 1\n");
+        assertEquals(2, arrowLambda.ast().statements().size(), () -> arrowLambda.ast().statements().toString());
+        var initCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, arrowLambda.ast().statements().getFirst()).value());
+        var lambda = assertInstanceOf(LambdaExpression.class, initCall.arguments().getFirst());
+        assertEquals(1, lambda.parameters().size());
+        assertEquals("a", lambda.parameters().getFirst().name());
+        assertEquals("int", lambda.returnType().sourceText());
+        assertInstanceOf(PassStatement.class, lambda.body().statements().getFirst());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, arrowLambda.ast().statements().get(1)).name());
+
+        var singleLineColonFn = recoverableParse("func f(a = 1: pass\nvar ok = 1\n");
+        assertEquals(2, singleLineColonFn.ast().statements().size(), () -> singleLineColonFn.ast().statements().toString());
+        var fn = assertInstanceOf(FunctionDeclaration.class, singleLineColonFn.ast().statements().getFirst());
+        assertEquals(1, fn.parameters().size());
+        assertEquals("a", fn.parameters().getFirst().name());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, fn.parameters().getFirst().defaultValue()).sourceText());
+        assertInstanceOf(PassStatement.class, fn.body().statements().getFirst());
+        findErrorByCode(singleLineColonFn, DiagnosticCodes.MISSING_CLOSER_PARAMETER_LIST);
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, singleLineColonFn.ast().statements().get(1)).name());
+
+        var inlineTypeParser = new GdScriptParser();
+        inlineTypeParser.parse("var x = g(func(" + "a: int, ".repeat(200) + "z)" + " ".repeat(2000));
+        assertEquals(0, inlineTypeParser.signatureContinuationScanSteps());
+
+        var multilineColonParser = new GdScriptParser();
+        multilineColonParser.parse("var x = g(func(" + "a:\n\tint, ".repeat(50) + "z:\n\tpass\n)" + " ".repeat(1000));
+        assertTrue(multilineColonParser.signatureContinuationScanSteps() <= 1050,
+                () -> "Expected linear scan budget <= 1050, got: " + multilineColonParser.signatureContinuationScanSteps());
+    }
+
+    @Test
+    void lineContinuationDrainsEndStatementLogicalLineAndPreservesDictionaryValueAfterPeek() {
+        var superVar = recoverableParse("func f():\n\tsuper. \\\n\tvar y = 1\n\tvar ok = 2\n");
+        var fn1Body = onlyFunction(superVar).body().statements();
+        assertEquals(2, fn1Body.size(), () -> fn1Body.toString());
+        assertInstanceOf(ExpressionStatement.class, fn1Body.getFirst());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, fn1Body.get(1)).name());
+
+        var superZeroVar = recoverableParse("func f():\n\tsuper. \\\n\t0 var y = 1\n\tvar ok = 2\n");
+        var fn2Body = onlyFunction(superZeroVar).body().statements();
+        assertEquals(2, fn2Body.size(), () -> fn2Body.toString());
+        assertInstanceOf(ExpressionStatement.class, fn2Body.getFirst());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, fn2Body.get(1)).name());
+
+        var dictContinuation = recoverableParse("var d = {1 \\\n\t2}\n");
+        assertEquals(List.of(DiagnosticCodes.MISSING_SEPARATOR_DICTIONARY),
+                errorsOf(dictContinuation).stream().map(AstDiagnostic::code).toList());
+        var dict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, dictContinuation.ast().statements().getFirst()).value());
+        assertEquals(1, dict.entries().size(), () -> dict.entries().toString());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, dict.entries().getFirst().key()).sourceText());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, dict.entries().getFirst().value()).sourceText());
+    }
+
+    @Test
+    void unclosedDictionaryEscapeDoesNotClearSuppressedNewlineBeforeReplay() {
+        var result = recoverableParse("func f():\n\tif true:\n\t\tvar d = {1\n\tprint(2)\n\tvar ok = 1\nvar top = 2\n");
+        assertEquals(2, result.ast().statements().size(), () -> result.ast().statements().toString());
+        var fn = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        assertEquals(3, fn.body().statements().size(), () -> fn.body().statements().toString());
+        assertInstanceOf(IfStatement.class, fn.body().statements().getFirst());
+        var printStmt = assertInstanceOf(ExpressionStatement.class, fn.body().statements().get(1));
+        assertInstanceOf(CallExpression.class, printStmt.expression());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, fn.body().statements().get(2)).name());
+        assertEquals("top", assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void signatureContinuationLookaheadSkipsCommentOnlyLinesAfterBackslash() {
+        var unclosedOuter = recoverableParse("var x = g(func(a:\n\tint) \\\n\t# comment\n\t: pass\n");
+        assertEquals(List.of(DiagnosticCodes.MISSING_CLOSER_CALL),
+                errorsOf(unclosedOuter).stream().map(AstDiagnostic::code).toList());
+        var call = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, unclosedOuter.ast().statements().getFirst()).value());
+        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+        assertEquals(1, lambda.parameters().size());
+        assertEquals("a", lambda.parameters().getFirst().name());
+        assertEquals("int", lambda.parameters().getFirst().type().sourceText());
+        assertInstanceOf(PassStatement.class, lambda.body().statements().getFirst());
+
+        var validOuter = parse("var x = g(func(a:\n\tint) \\\n\t# comment\n\t: pass)\n");
+        assertEquals(List.of(), errorsOf(validOuter), () -> errorsOf(validOuter).toString());
+    }
+
+    @Test
+    void circuitBreakerDrainsClaimedUnexpectedIndentsAndOwnSuiteDedent() {
+        var source = "class C:\n\tfunc f():\n\t\tpass\n\t\t\t"
+                + "var\n\t\t\t".repeat(102)
+                + "var extra = 0\n\t\tvar ok = 1\n\tvar inner = 2\nvar top = 3\n";
+        var result = recoverableParse(source);
+        findErrorByCode(result, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertEquals(2, result.ast().statements().size(), () -> result.ast().statements().toString());
+        var innerClass = assertInstanceOf(ClassDeclaration.class, result.ast().statements().getFirst());
+        assertEquals(2, innerClass.body().statements().size(), () -> innerClass.body().statements().toString());
+        assertEquals("f", assertInstanceOf(FunctionDeclaration.class, innerClass.body().statements().getFirst()).name());
+        assertEquals("inner", assertInstanceOf(VariableDeclaration.class, innerClass.body().statements().get(1)).name());
+        assertEquals("top", assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void indentedPropertyReferenceTrailingCommaReportsInvalidAccessor() {
+        var singleTrailingComma = recoverableParse("var x:\n\tget = g,\nvar after = 1\n");
+        assertEquals(2, singleTrailingComma.ast().statements().size(), () -> singleTrailingComma.ast().statements().toString());
+        var prop1 = assertInstanceOf(VariableDeclaration.class, singleTrailingComma.ast().statements().getFirst());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, singleTrailingComma.ast().statements().get(1)).name());
+        var diag1 = findErrorByCode(singleTrailingComma, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+        assertEquals(new RecoveryLink(prop1, "variable.property"), diag1.recovery());
+
+        var twoItemsTrailingComma = recoverableParse("var x:\n\tget = g,\n\tset = s,\nvar after = 1\n");
+        assertEquals(2, twoItemsTrailingComma.ast().statements().size(), () -> twoItemsTrailingComma.ast().statements().toString());
+        var prop2 = assertInstanceOf(VariableDeclaration.class, twoItemsTrailingComma.ast().statements().getFirst());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, twoItemsTrailingComma.ast().statements().get(1)).name());
+        var diag2 = findErrorByCode(twoItemsTrailingComma, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+        assertEquals(new RecoveryLink(prop2, "variable.property"), diag2.recovery());
+
+        var valid = parse("var x:\n\tget = g,\n\tset = s\n");
+        assertEquals(List.of(), errorsOf(valid), () -> errorsOf(valid).toString());
+    }
+
+    @Test
+    void lambdaCircuitBreakerYieldsOuterCallCommaAndPreservesSubsequentDeclarations() {
+        var source = "var x = g(func():\n" + "\tvar\n".repeat(102) + "\tpass, 2)\nvar after=1\n";
+        var result = recoverableParse(source);
+        findErrorByCode(result, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(result).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(result).toString());
+        assertEquals(2, result.ast().statements().size(), () -> result.ast().statements().toString());
+        var call = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value());
+        assertEquals(2, call.arguments().size(), () -> call.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void propertyRecoveryConsumesInternalCommentsWithoutLeakingIntoClassBody() {
+        var internalComment = recoverableParse("class A:\n\tvar z:\n\t\tget = g # c\n\t\t\tpass\n");
+        var clsA = assertInstanceOf(ClassDeclaration.class, internalComment.ast().statements().getFirst());
+        assertEquals(1, clsA.body().statements().size(), () -> clsA.body().statements().toString());
+        var propZ = assertInstanceOf(VariableDeclaration.class, clsA.body().statements().getFirst());
+        assertEquals("z", propZ.name());
+        assertTrue(clsA.body().range().startByte() <= propZ.range().startByte()
+                        && propZ.range().endByte() <= clsA.body().range().endByte(),
+                () -> "class body " + clsA.body().range() + " must enclose " + propZ.range());
+
+        var outerComment = parse("class A:\n\tvar z:\n\t\tget = g\n\t# outer\n\tvar ok = 1\n");
+        assertEquals(List.of(), errorsOf(outerComment), () -> errorsOf(outerComment).toString());
+        var clsA2 = assertInstanceOf(ClassDeclaration.class, outerComment.ast().statements().getFirst());
+        assertEquals(3, clsA2.body().statements().size(), () -> clsA2.body().statements().toString());
+        assertEquals("z", assertInstanceOf(VariableDeclaration.class, clsA2.body().statements().getFirst()).name());
+        assertEquals("# outer", assertInstanceOf(CommentStatement.class, clsA2.body().statements().get(1)).text());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, clsA2.body().statements().get(2)).name());
+    }
+
+    @Test
+    void backslashLookaheadRejectsTrailingSpaceOrInlineCommentBeforeNewline() {
+        for (var source : List.of(
+                "var x = g(func(a:\n\tpass\n) \\ \n: pass\nvar after=1\n",
+                "var x = g(func(a:\n\tpass\n) \\ # c\n: pass\nvar after=1\n")) {
+            var result = recoverableParse(source);
+            findErrorByCode(result, DiagnosticCodes.MISSING_CLOSER_PARAMETER_LIST);
+            var nonComments = result.ast().statements().stream()
+                    .filter(s -> !(s instanceof CommentStatement))
+                    .toList();
+            assertEquals(2, nonComments.size(), () -> source + " -> " + nonComments);
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, nonComments.getFirst()).value());
+            var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertTrue(lambda.body().statements().stream().anyMatch(PassStatement.class::isInstance),
+                    () -> source + " -> " + lambda.body().statements());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, nonComments.get(1)).name());
+        }
+    }
+
+    @Test
+    void leadingUnknownPropertyAccessorDoesNotLockStyleForLaterValidAccessors() {
+        for (var source : List.of(
+                "var x:\n\toops = g\n\tget:\n\t\tpass\nvar after=1\n",
+                "var x:\n\toops:\n\t\tpass\n\tget = g,\n\tset = s\nvar after=1\n")) {
+            var result = recoverableParse(source);
+            assertEquals(2, result.ast().statements().size(), () -> source + " -> " + result.ast().statements());
+            var propX = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1)).name());
+            var errors = errorsOf(result);
+            assertEquals(1, errors.size(), () -> source + " -> " + errors);
+            assertEquals(DiagnosticCodes.PROPERTY_INVALID_ACCESSOR, errors.getFirst().code());
+            assertEquals(new RecoveryLink(propX, "variable.property"), errors.getFirst().recovery());
+        }
+    }
+
+    @Test
+    void lambdaCircuitBreakerKeepsMatchBranchCommaAndRespectsTypedAncestorClosers() {
+        var matchBranchSource = "var x = g(func():\n" + "\tvar\n".repeat(102)
+                + "\tmatch 1:\n\t\t1, 2: pass\n, 3)\nvar after=1\n";
+        var matchRes = recoverableParse(matchBranchSource);
+        findErrorByCode(matchRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(matchRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(matchRes).toString());
+        assertEquals(2, matchRes.ast().statements().size(), () -> matchRes.ast().statements().toString());
+        var matchCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, matchRes.ast().statements().getFirst()).value());
+        assertEquals(2, matchCall.arguments().size(), () -> matchCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, matchCall.arguments().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, matchCall.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, matchRes.ast().statements().get(1)).name());
+
+        var unclosedBracketSource = "var x = g(func():\n" + "\tvar\n".repeat(102) + "\t[1)\nvar after=1\n";
+        var bracketRes = recoverableParse(unclosedBracketSource);
+        findErrorByCode(bracketRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(bracketRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(bracketRes).toString());
+        assertEquals(2, bracketRes.ast().statements().size(), () -> bracketRes.ast().statements().toString());
+        var bracketCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, bracketRes.ast().statements().getFirst()).value());
+        assertEquals(1, bracketCall.arguments().size(), () -> bracketCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, bracketCall.arguments().getFirst());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, bracketRes.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void incompletePropertyAccessorHeaderDoesNotLockStyleForSubsequentValidAccessors() {
+        var missingGetterTarget = recoverableParse("var p:\n\tget =\n\tset(v):\n\t\tpass\nvar ok=1\n");
+        assertEquals(2, missingGetterTarget.ast().statements().size(),
+                () -> missingGetterTarget.ast().statements().toString());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, missingGetterTarget.ast().statements().get(1)).name());
+        var errors1 = errorMessages(missingGetterTarget);
+        assertTrue(errors1.contains("Expected getter function name after \"=\"."), () -> errors1.toString());
+        assertFalse(errors1.contains("Expected \"=\" after \"set\""), () -> errors1.toString());
+
+        var unclosedSetterHeader = recoverableParse("var p:\n\tset(v\n\tget = g,\n\tset = s\nvar ok=1\n");
+        assertEquals(2, unclosedSetterHeader.ast().statements().size(),
+                () -> unclosedSetterHeader.ast().statements().toString());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, unclosedSetterHeader.ast().statements().get(1)).name());
+        var errors2 = errorMessages(unclosedSetterHeader);
+        assertFalse(errors2.contains("Expected \"(\" after \"set\"."), () -> errors2.toString());
+        assertFalse(errors2.contains("Expected \":\" or \"(\" after \"get\"."), () -> errors2.toString());
+    }
+
+    @Test
+    void lambdaCircuitBreakerIgnoresAttributeMatchCallAndSettlesUnclosedLocalBracketsOnHardLineStarts() {
+        var attrMatchSource = "var x = g(func():\n" + "\tvar\n".repeat(102)
+                + "\tif obj.match():\n\t\tpass, 2)\nvar after=1\n";
+        var attrMatchRes = recoverableParse(attrMatchSource);
+        findErrorByCode(attrMatchRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(attrMatchRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(attrMatchRes).toString());
+        assertEquals(2, attrMatchRes.ast().statements().size(), () -> attrMatchRes.ast().statements().toString());
+        var attrMatchCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, attrMatchRes.ast().statements().getFirst()).value());
+        assertEquals(2, attrMatchCall.arguments().size(), () -> attrMatchCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, attrMatchCall.arguments().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, attrMatchCall.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, attrMatchRes.ast().statements().get(1)).name());
+
+        for (var unclosedSource : List.of(
+                "var x = g(func():\n" + "\tvar\n".repeat(102) + "\tvar z = (1\n\tpass, 2)\nvar after=1\n",
+                "var x = g(func():\n" + "\tvar\n".repeat(102) + "\tvar z = [1\n\tpass, 2)\nvar after=1\n")) {
+            var res = recoverableParse(unclosedSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                    () -> unclosedSource + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(), () -> unclosedSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> unclosedSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var validMultilineGroupingSource = "var x = g(func():\n" + "\tvar\n".repeat(102)
+                + "\tvar z = (\n\t\t1,\n\t\t2\n\t), 3)\nvar after=1\n";
+        var validGroupingRes = recoverableParse(validMultilineGroupingSource);
+        findErrorByCode(validGroupingRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(validGroupingRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(validGroupingRes).toString());
+        assertEquals(2, validGroupingRes.ast().statements().size(), () -> validGroupingRes.ast().statements().toString());
+        var groupingCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, validGroupingRes.ast().statements().getFirst()).value());
+        assertEquals(2, groupingCall.arguments().size(), () -> groupingCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, groupingCall.arguments().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, groupingCall.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, validGroupingRes.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void lambdaCircuitBreakerHandlesMultilineMatchHeaderExitedSubsuiteAndIfLineContinuations() {
+        var prefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        var multilineMatchRes = recoverableParse(
+                prefix + "\tmatch (\n\t\t1\n\t):\n\t\t1, 2: pass\n, 3)\nvar after=1\n");
+        findErrorByCode(multilineMatchRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorMessages(multilineMatchRes).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                () -> errorMessages(multilineMatchRes).toString());
+        assertEquals(2, multilineMatchRes.ast().statements().size(),
+                () -> multilineMatchRes.ast().statements().toString());
+        var multilineMatchCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, multilineMatchRes.ast().statements().getFirst()).value());
+        assertEquals(2, multilineMatchCall.arguments().size(), () -> multilineMatchCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, multilineMatchCall.arguments().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, multilineMatchCall.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, multilineMatchRes.ast().statements().get(1)).name());
+
+        for (var exitedSubsuiteNegative : List.of(
+                prefix + "\tif true:\n\t\tvar z = (1\n\t, 2)\nvar after=1\n",
+                prefix + "\tif true:\n\t\tvar z = [1\n\t, 2)\nvar after=1\n")) {
+            var res = recoverableParse(exitedSubsuiteNegative);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                    () -> exitedSubsuiteNegative + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(), () -> exitedSubsuiteNegative + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> exitedSubsuiteNegative + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var pairedParenRes = recoverableParse(prefix + "\tif true:\n\t\tvar z = (\n\t1\n\t), 2)\nvar after=1\n");
+        findErrorByCode(pairedParenRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(pairedParenRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(pairedParenRes).toString());
+        assertEquals(2, pairedParenRes.ast().statements().size());
+        var pairedParenCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, pairedParenRes.ast().statements().getFirst()).value());
+        assertEquals(2, pairedParenCall.arguments().size());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, pairedParenCall.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, pairedParenRes.ast().statements().get(1)).name());
+
+        var pairedCallRes = recoverableParse(prefix + "\tif true:\n\t\tvar z = f(\n\t1\n\t, 2\n\t), 3)\nvar after=1\n");
+        findErrorByCode(pairedCallRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(pairedCallRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(pairedCallRes).toString());
+        assertEquals(2, pairedCallRes.ast().statements().size());
+        var pairedCallOuter = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, pairedCallRes.ast().statements().getFirst()).value());
+        assertEquals(2, pairedCallOuter.arguments().size());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, pairedCallOuter.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, pairedCallRes.ast().statements().get(1)).name());
+
+        for (var ifHeaderPositive : List.of(
+                prefix + "\tvar z = (1\n\tif \"a\nb\":\n\t\tpass, 2)\nvar after=1\n",
+                prefix + "\tvar z = (1\n\tif true \\\n\t# c\n\t:\n\t\tpass, 2)\nvar after=1\n")) {
+            var res = recoverableParse(ifHeaderPositive);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                    () -> ifHeaderPositive + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(), () -> ifHeaderPositive + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> ifHeaderPositive + " -> " + call.arguments());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var invalidBackslashIfRes = recoverableParse(
+                prefix + "\tvar z = (1\n\tif true \\ # bad\n\t:\n\t\tpass, 2), 3)\nvar after=1\n");
+        findErrorByCode(invalidBackslashIfRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertEquals(2, invalidBackslashIfRes.ast().statements().size(),
+                () -> invalidBackslashIfRes.ast().statements().toString());
+        var invalidBackslashCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, invalidBackslashIfRes.ast().statements().getFirst()).value());
+        assertEquals(2, invalidBackslashCall.arguments().size(), () -> invalidBackslashCall.arguments().toString());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, invalidBackslashCall.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, invalidBackslashIfRes.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void propertyBadAccessorContinuesSiblingAccessorsAndUnknownFormDoesNotLockStyle() {
+        for (var source : List.of(
+                "var p: get = g, 123, get = h\nvar after = 1\n",
+                "var p: int: 123, get = g, get = h\nvar after = 1\n")) {
+            var res = recoverableParse(source);
+            assertEquals(2, res.ast().statements().size(), () -> source + " -> " + res.ast().statements());
+            var prop = assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+            findErrorByCode(res, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+            findErrorByCode(res, DiagnosticCodes.PROPERTY_DUPLICATE_GETTER);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("end of property")),
+                    () -> source + " -> " + errorMessages(res));
+            assertEquals(source.indexOf("get = h") + "get = h".length(), prop.range().endByte());
+        }
+
+        var indentedUnknownRes = recoverableParse("var p:\n\toops = f, get = g, get = h\nvar after = 1\n");
+        assertEquals(2, indentedUnknownRes.ast().statements().size(),
+                () -> indentedUnknownRes.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, indentedUnknownRes.ast().statements().get(1)).name());
+        findErrorByCode(indentedUnknownRes, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+        findErrorByCode(indentedUnknownRes, DiagnosticCodes.PROPERTY_DUPLICATE_GETTER);
+
+        var unknownFollowedByBlockRes = recoverableParse(
+                "var p:\n\toops = f\n\tget:\n\t\treturn 1\nvar after = 1\n");
+        assertEquals(2, unknownFollowedByBlockRes.ast().statements().size(),
+                () -> unknownFollowedByBlockRes.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, unknownFollowedByBlockRes.ast().statements().get(1)).name());
+        var errors = errorsOf(unknownFollowedByBlockRes);
+        assertEquals(1, errors.size(), () -> errors.toString());
+        assertEquals(DiagnosticCodes.PROPERTY_INVALID_ACCESSOR, errors.getFirst().code());
+        assertFalse(errorMessages(unknownFollowedByBlockRes).stream().anyMatch(m -> m.contains("Expected \"=\" after \"get\"")),
+                () -> errorMessages(unknownFollowedByBlockRes).toString());
+    }
+
+    @Test
+    void circuitBreakerLocalBracketStackOperationsStayLinear() {
+        var n = 2_000;
+        var source = "func f():\n" + "\tvar\n".repeat(102) + "\t" + "(".repeat(n) + "1" + "]".repeat(n) + "\nvar after = 1\n";
+        var parser = new GdScriptParser();
+        var result = parser.parse(source);
+        assertEquals(2, result.ast().statements().size(), () -> result.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1)).name());
+        assertTrue(parser.circuitBreakerStackOps() <= 4 * n,
+                () -> "Expected linear circuit-breaker stack ops <= " + (4 * n) + " but got " + parser.circuitBreakerStackOps());
+    }
+
+    @Test
+    void lambdaCircuitBreakerHandlesContinuationIndentedMatchAndTypedCloserIsolation() {
+        var prefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        for (var matchSource : List.of(
+                prefix + "\tmatch (\n\t\t1):\n\t\t1, 2: pass\n, 3)\nvar after = 1\n",
+                prefix + "\tmatch (\n\t\t1):\n\t\t\t1, 2: pass\n, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(matchSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                    () -> matchSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(), () -> matchSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> matchSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var mismatchedTypeSource = prefix + "\tif true:\n\t\tvar z = [\n\t\t\t1\n\t, 2]\nvar after = 1\n";
+        var arrayRes = recoverableParse(mismatchedTypeSource);
+        findErrorByCode(arrayRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        findErrorByCode(arrayRes, DiagnosticCodes.MISSING_CLOSER_CALL);
+        assertFalse(errorsOf(arrayRes).stream().anyMatch(d -> DiagnosticCodes.MISMATCHED_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(arrayRes).toString());
+        assertEquals(2, arrayRes.ast().statements().size(), () -> arrayRes.ast().statements().toString());
+        var arrayCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, arrayRes.ast().statements().getFirst()).value());
+        assertEquals(1, arrayCall.arguments().size(), () -> arrayCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, arrayCall.arguments().getFirst());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, arrayRes.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void bareUnknownPropertyItemContinuesSiblingAccessorsWithoutDisruptingBlockForm() {
+        var inlineBareUnknown = recoverableParse("var p: int: oops, get = g, get = h\nvar after = 1\n");
+        assertEquals(2, inlineBareUnknown.ast().statements().size(),
+                () -> inlineBareUnknown.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, inlineBareUnknown.ast().statements().get(1)).name());
+        findErrorByCode(inlineBareUnknown, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+        findErrorByCode(inlineBareUnknown, DiagnosticCodes.PROPERTY_DUPLICATE_GETTER);
+        assertFalse(errorMessages(inlineBareUnknown).stream().anyMatch(m -> m.contains("Unexpected \"Newline\"")),
+                () -> errorMessages(inlineBareUnknown).toString());
+
+        var indentedBareUnknown = recoverableParse("var p:\n\toops, get = g, get = h\nvar after = 1\n");
+        assertEquals(2, indentedBareUnknown.ast().statements().size(),
+                () -> indentedBareUnknown.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, indentedBareUnknown.ast().statements().get(1)).name());
+        findErrorByCode(indentedBareUnknown, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+        findErrorByCode(indentedBareUnknown, DiagnosticCodes.PROPERTY_DUPLICATE_GETTER);
+
+        for (var blockControl : List.of(
+                "var p:\n\toops:\n\t\tpass\n\tget:\n\t\treturn 1\nvar after = 1\n",
+                "var p:\n\tget:\n\t\treturn 1\n\toops:\n\t\tpass\nvar after = 1\n")) {
+            var res = recoverableParse(blockControl);
+            assertEquals(2, res.ast().statements().size(), () -> blockControl + " -> " + res.ast().statements());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+            var errors = errorsOf(res);
+            assertEquals(1, errors.size(), () -> blockControl + " -> " + errors);
+            assertEquals(DiagnosticCodes.PROPERTY_INVALID_ACCESSOR, errors.getFirst().code());
+        }
+    }
+
+    @Test
+    void lambdaCircuitBreakerHandlesSteppedMatchHeaderEmptyMatchAndPairedCloserProtection() {
+        var prefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        for (var matchSource : List.of(
+                prefix + "\tmatch (\n\t\t(\n\t\t\t1)):\n\t\t1, 2: pass\n, 3)\nvar after = 1\n",
+                prefix + "\tmatch (\n\t\t1):\n, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(matchSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                    () -> matchSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(), () -> matchSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> matchSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        for (var pairedInnerSource : List.of(
+                prefix + "\tif true:\n\t\tvar z = f(\n\t\t\t1\n\t, 2\n\t\t)\n\tpass\nvar after = 1\n",
+                prefix + "\tif true:\n\t\tvar z = f(\n\t\t\t1\n\t, 2\n\t)\n\tpass\nvar after = 1\n")) {
+            var res = recoverableParse(pairedInnerSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            findErrorByCode(res, DiagnosticCodes.MISSING_CLOSER_CALL);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \"Indent\"")),
+                    () -> pairedInnerSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(), () -> pairedInnerSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(1, call.arguments().size(), () -> pairedInnerSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var topCloserStolenSource = prefix + "\tif true:\n\t\tvar z = (1\n\t, 2\n)\nvar after = 1\n";
+        var topCloserRes = recoverableParse(topCloserStolenSource);
+        findErrorByCode(topCloserRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(topCloserRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(topCloserRes).toString());
+        assertEquals(2, topCloserRes.ast().statements().size(), () -> topCloserRes.ast().statements().toString());
+        var topCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, topCloserRes.ast().statements().getFirst()).value());
+        assertEquals(2, topCall.arguments().size(), () -> topCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, topCall.arguments().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, topCall.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, topCloserRes.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void lambdaCircuitBreakerProtectsMultilineMatchPatternAndCommaOwningCall() {
+        var prefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        for (var matchSource : List.of(
+                prefix + "\tmatch 1:\n\t\t[\n\t\t\t1\n\t\t\t], 2: pass\n, 3)\nvar after = 1\n",
+                prefix + "\tmatch 1:\n\t\t[1\n, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(matchSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                    () -> matchSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(), () -> matchSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> matchSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var pairedCallSource = prefix + "\tif true:\n\t\tvar z = f(1\n\t, 2)\n\tpass\nvar after = 1\n";
+        var pairedCallRes = recoverableParse(pairedCallSource);
+        findErrorByCode(pairedCallRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        findErrorByCode(pairedCallRes, DiagnosticCodes.MISSING_CLOSER_CALL);
+        assertFalse(errorMessages(pairedCallRes).stream().anyMatch(m -> m.contains("Unexpected \"Indent\"")),
+                () -> errorMessages(pairedCallRes).toString());
+        assertEquals(2, pairedCallRes.ast().statements().size(), () -> pairedCallRes.ast().statements().toString());
+        var pairedCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, pairedCallRes.ast().statements().getFirst()).value());
+        assertEquals(1, pairedCall.arguments().size(), () -> pairedCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, pairedCall.arguments().getFirst());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, pairedCallRes.ast().statements().get(1)).name());
+
+        for (var groupingSource : List.of(
+                prefix + "\tif true:\n\t\tvar z = (1\n\t, 2)\nvar after = 1\n",
+                prefix + "\tif true:\n\t\tvar z = (\"a\nb\"\n\t, 2)\nvar after = 1\n")) {
+            var groupingRes = recoverableParse(groupingSource);
+            findErrorByCode(groupingRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(groupingRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                    () -> groupingSource + " -> " + errorsOf(groupingRes));
+            assertEquals(2, groupingRes.ast().statements().size(), () -> groupingSource + " -> " + groupingRes.ast().statements());
+            var groupingCall = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, groupingRes.ast().statements().getFirst()).value());
+            assertEquals(2, groupingCall.arguments().size(), () -> groupingSource + " -> " + groupingCall.arguments());
+            assertInstanceOf(LambdaExpression.class, groupingCall.arguments().getFirst());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, groupingCall.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, groupingRes.ast().statements().get(1)).name());
+        }
+    }
+
+    @Test
+    void blockPropertyBadItemsStopAtSiblingCommaWithoutSplittingNestedParenCommas() {
+        for (var badWithComma : List.of(
+                "var p:\n\tget:\n\t\tpass\n\toops, get:\n\t\tpass\nvar after = 1\n",
+                "var p:\n\tget:\n\t\tpass\n\t123, get:\n\t\tpass\nvar after = 1\n")) {
+            var res = recoverableParse(badWithComma);
+            assertEquals(2, res.ast().statements().size(), () -> badWithComma + " -> " + res.ast().statements());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+            findErrorByCode(res, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+            findErrorByCode(res, DiagnosticCodes.PROPERTY_DUPLICATE_GETTER);
+        }
+
+        var nestedCommaControl = recoverableParse(
+                "var p:\n\toops(1, 2):\n\t\tpass\n\tget:\n\t\treturn 1\nvar after = 1\n");
+        assertEquals(2, nestedCommaControl.ast().statements().size(),
+                () -> nestedCommaControl.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, nestedCommaControl.ast().statements().get(1)).name());
+        var errors = errorsOf(nestedCommaControl);
+        assertEquals(1, errors.size(), () -> errors.toString());
+        assertEquals(DiagnosticCodes.PROPERTY_INVALID_ACCESSOR, errors.getFirst().code());
+    }
+
+    @Test
+    void circuitBreakerOracleResolutionPerExitedSubsuiteOpenerStaysConstant() {
+        var n = 2_000;
+        var prefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        var callSource = prefix + "\tif true:\n\t\tvar z = f(1\n\t"
+                + ", 2".repeat(n) + "\n\t)\n\tpass\n" + "\n".repeat(n) + "var after = 1\n";
+        var callParser = new GdScriptParser();
+        var callRes = callParser.parse(callSource);
+        assertTrue(callParser.circuitBreakerOracleResolutions() <= 4,
+                () -> "Expected O(1) oracle resolutions <= 4, got " + callParser.circuitBreakerOracleResolutions());
+        findErrorByCode(callRes, DiagnosticCodes.MISSING_CLOSER_CALL);
+        assertEquals(2, callRes.ast().statements().size(), () -> callRes.ast().statements().toString());
+        var call = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, callRes.ast().statements().getFirst()).value());
+        assertEquals(1, call.arguments().size(), () -> call.arguments().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, callRes.ast().statements().get(1)).name());
+
+        var groupingSource = prefix + "\tif true:\n\t\tvar z = (1\n\t"
+                + ", 2".repeat(n) + "\n\t)\n)\nvar after = 1\n";
+        var groupingParser = new GdScriptParser();
+        var groupingRes = groupingParser.parse(groupingSource);
+        assertTrue(groupingParser.circuitBreakerOracleResolutions() <= 4,
+                () -> "Expected O(1) oracle resolutions <= 4, got " + groupingParser.circuitBreakerOracleResolutions());
+        assertEquals(2, groupingRes.ast().statements().size(), () -> groupingRes.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, groupingRes.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void lambdaCircuitBreakerDistinguishesSubscriptBracketsAndKeywordMemberCalls() {
+        var arrayPrefix = "var x = [func():\n" + "\tvar\n".repeat(102);
+
+        for (var subscriptSource : List.of(
+                arrayPrefix + "\tif true:\n\t\tvar z = a[1\n\t, 2]\nvar after = 1\n",
+                arrayPrefix + "\tif true:\n\t\tvar z = obj.match[1\n\t, 2]\nvar after = 1\n")) {
+            var res = recoverableParse(subscriptSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_ARRAY.equals(d.code())),
+                    () -> subscriptSource + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(), () -> subscriptSource + " -> " + res.ast().statements());
+            var array = assertInstanceOf(ArrayExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, array.elements().size(), () -> subscriptSource + " -> " + array.elements());
+            assertInstanceOf(LambdaExpression.class, array.elements().getFirst());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, array.elements().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        for (var commaOwningBracketSource : List.of(
+                arrayPrefix + "\tif true:\n\t\tvar z = [1\n\t, 2]\n\tpass\nvar after = 1\n",
+                arrayPrefix + "\tif true:\n\t\tvar d: Dictionary[String\n\t, int]\n\tpass\nvar after = 1\n")) {
+            var res = recoverableParse(commaOwningBracketSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            findErrorByCode(res, DiagnosticCodes.MISSING_CLOSER_ARRAY);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \"Indent\"")),
+                    () -> commaOwningBracketSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(), () -> commaOwningBracketSource + " -> " + res.ast().statements());
+            var array = assertInstanceOf(ArrayExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(1, array.elements().size(), () -> commaOwningBracketSource + " -> " + array.elements());
+            assertInstanceOf(LambdaExpression.class, array.elements().getFirst());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var callPrefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        for (var memberCallSource : List.of(
+                callPrefix + "\tif true:\n\t\tvar z = obj.match(1\n\t, 2)\n\tpass\nvar after = 1\n",
+                callPrefix + "\tif true:\n\t\tvar z = obj.if(1\n\t, 2)\n\tpass\nvar after = 1\n")) {
+            var res = recoverableParse(memberCallSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            findErrorByCode(res, DiagnosticCodes.MISSING_CLOSER_CALL);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \"Indent\"")),
+                    () -> memberCallSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(), () -> memberCallSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(1, call.arguments().size(), () -> memberCallSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var matchGroupingSource = callPrefix + "\tif true:\n\t\tmatch (1\n\t, 2)\nvar after = 1\n";
+        var matchGroupingRes = recoverableParse(matchGroupingSource);
+        findErrorByCode(matchGroupingRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(matchGroupingRes).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(matchGroupingRes).toString());
+        assertEquals(2, matchGroupingRes.ast().statements().size(), () -> matchGroupingRes.ast().statements().toString());
+        var matchGroupingCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, matchGroupingRes.ast().statements().getFirst()).value());
+        assertEquals(2, matchGroupingCall.arguments().size(), () -> matchGroupingCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, matchGroupingCall.arguments().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, matchGroupingCall.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, matchGroupingRes.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void lambdaCircuitBreakerDistinguishesExpressionMatchCallsAndTypeColonContext() {
+        var callPrefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        var exprMatchCallSource = callPrefix + "\tif true:\n\t\tvar z = match(1\n\t, 2)\n\tpass\nvar after = 1\n";
+        var exprMatchCallRes = recoverableParse(exprMatchCallSource);
+        findErrorByCode(exprMatchCallRes, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        findErrorByCode(exprMatchCallRes, DiagnosticCodes.MISSING_CLOSER_CALL);
+        assertFalse(errorMessages(exprMatchCallRes).stream().anyMatch(m -> m.contains("Unexpected \"Indent\"")),
+                () -> errorMessages(exprMatchCallRes).toString());
+        assertEquals(2, exprMatchCallRes.ast().statements().size(), () -> exprMatchCallRes.ast().statements().toString());
+        var exprMatchCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, exprMatchCallRes.ast().statements().getFirst()).value());
+        assertEquals(1, exprMatchCall.arguments().size(), () -> exprMatchCall.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, exprMatchCall.arguments().getFirst());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, exprMatchCallRes.ast().statements().get(1)).name());
+
+        for (var stmtMatchGrouping : List.of(
+                callPrefix + "\tif true:\n\t\tmatch (1\n\t, 2)\nvar after = 1\n",
+                callPrefix + "\tif true:\n\t\tif true: match (1\n\t, 2)\nvar after = 1\n")) {
+            var res = recoverableParse(stmtMatchGrouping);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                    () -> stmtMatchGrouping + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(), () -> stmtMatchGrouping + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> stmtMatchGrouping + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var arrayPrefix = "var x = [func():\n" + "\tvar\n".repeat(102);
+
+        for (var suiteColonSubscript : List.of(
+                arrayPrefix + "\tif true:\n\t\tif true: Dictionary[1\n\t, 2]\nvar after = 1\n",
+                arrayPrefix + "\tif true:\n\t\tif cond: Dictionary[1\n\t, 2]\nvar after = 1\n")) {
+            var res = recoverableParse(suiteColonSubscript);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_ARRAY.equals(d.code())),
+                    () -> suiteColonSubscript + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(), () -> suiteColonSubscript + " -> " + res.ast().statements());
+            var array = assertInstanceOf(ArrayExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, array.elements().size(), () -> suiteColonSubscript + " -> " + array.elements());
+            assertInstanceOf(LambdaExpression.class, array.elements().getFirst());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, array.elements().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        for (var typeContextDict : List.of(
+                arrayPrefix + "\tif true:\n\t\tvar d: Dictionary[String\n\t, int]\n\tpass\nvar after = 1\n",
+                arrayPrefix + "\tif true:\n\t\tfunc h() -> Dictionary[String\n\t, int]:\n\t\t\tpass\nvar after = 1\n")) {
+            var res = recoverableParse(typeContextDict);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            findErrorByCode(res, DiagnosticCodes.MISSING_CLOSER_ARRAY);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \"Indent\"")),
+                    () -> typeContextDict + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(), () -> typeContextDict + " -> " + res.ast().statements());
+            var array = assertInstanceOf(ArrayExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(1, array.elements().size(), () -> typeContextDict + " -> " + array.elements());
+            assertInstanceOf(LambdaExpression.class, array.elements().getFirst());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+    }
+
+    @Test
+    @Timeout(5)
+    void matchSectionMissingColonAlwaysAdvancesAndKeepsFollowingBranches() {
+        var withFollowUp = recoverableParse("func f():\n\tmatch 0:\n\t\t1: pass\n\t\t= 1\n\t\t2: pass\nvar after = 1\n");
+        assertEquals(2, withFollowUp.ast().statements().size(), () -> withFollowUp.ast().statements().toString());
+        var fn1 = assertInstanceOf(FunctionDeclaration.class, withFollowUp.ast().statements().getFirst());
+        var match1 = assertInstanceOf(MatchStatement.class, fn1.body().statements().getFirst());
+        assertEquals(3, match1.sections().size(), () -> match1.sections().toString());
+        assertInstanceOf(PassStatement.class, match1.sections().getFirst().body().statements().getFirst());
+        assertInstanceOf(PassStatement.class, match1.sections().get(2).body().statements().getFirst());
+        findErrorByCode(withFollowUp, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON);
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, withFollowUp.ast().statements().get(1)).name());
+
+        var atMatchEnd = recoverableParse("func f():\n\tmatch 0:\n\t\t1: pass\n\t\t= 1\n");
+        assertEquals(1, atMatchEnd.ast().statements().size(), () -> atMatchEnd.ast().statements().toString());
+        var fn2 = assertInstanceOf(FunctionDeclaration.class, atMatchEnd.ast().statements().getFirst());
+        var match2 = assertInstanceOf(MatchStatement.class, fn2.body().statements().getFirst());
+        assertEquals(2, match2.sections().size(), () -> match2.sections().toString());
+        assertInstanceOf(PassStatement.class, match2.sections().getFirst().body().statements().getFirst());
+        findErrorByCode(atMatchEnd, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON);
+    }
+
+    @Test
+    void lambdaCircuitBreakerHandlesLineStartMatchCallAnnotationPrefixAndIsNotType() {
+        var callPrefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        var lineStartMatchCall = recoverableParse(callPrefix + "\tvar z = f(\n\tmatch(1), 2)\n, 3)\nvar after = 1\n");
+        findErrorByCode(lineStartMatchCall, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(lineStartMatchCall).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                () -> errorsOf(lineStartMatchCall).toString());
+        assertEquals(2, lineStartMatchCall.ast().statements().size(), () -> lineStartMatchCall.ast().statements().toString());
+        var matchCallOuter = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, lineStartMatchCall.ast().statements().getFirst()).value());
+        assertEquals(2, matchCallOuter.arguments().size(), () -> matchCallOuter.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, matchCallOuter.arguments().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, matchCallOuter.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, lineStartMatchCall.ast().statements().get(1)).name());
+
+        var lineStartMatchStmt = recoverableParse(
+                callPrefix + "\tvar z = (1\n\tmatch 1:\n\t\t1, 2: pass\n, 3)\nvar after = 1\n");
+        findErrorByCode(lineStartMatchStmt, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorMessages(lineStartMatchStmt).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                () -> errorMessages(lineStartMatchStmt).toString());
+        assertEquals(2, lineStartMatchStmt.ast().statements().size(), () -> lineStartMatchStmt.ast().statements().toString());
+        var matchStmtOuter = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, lineStartMatchStmt.ast().statements().getFirst()).value());
+        assertEquals(2, matchStmtOuter.arguments().size(), () -> matchStmtOuter.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, matchStmtOuter.arguments().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, matchStmtOuter.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, lineStartMatchStmt.ast().statements().get(1)).name());
+
+        var annotatedMatch = recoverableParse(
+                callPrefix + "\t@warning_ignore(\"unused_variable\") match 1:\n\t\t1, 2: pass\n, 3)\nvar after = 1\n");
+        findErrorByCode(annotatedMatch, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorMessages(annotatedMatch).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                () -> errorMessages(annotatedMatch).toString());
+        assertEquals(2, annotatedMatch.ast().statements().size(), () -> annotatedMatch.ast().statements().toString());
+        var annotatedMatchOuter = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, annotatedMatch.ast().statements().getFirst()).value());
+        assertEquals(2, annotatedMatchOuter.arguments().size(), () -> annotatedMatchOuter.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, annotatedMatchOuter.arguments().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, annotatedMatchOuter.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, annotatedMatch.ast().statements().get(1)).name());
+
+        var arrayPrefix = "var x = [func():\n" + "\tvar\n".repeat(102);
+
+        for (var typeContextSource : List.of(
+                arrayPrefix + "\t@export var d: Dictionary[String\n\t, int]\n\tpass\nvar after = 1\n",
+                arrayPrefix + "\tif true:\n\t\tvar d = v is not Dictionary[String\n\t, int]\n\tpass\nvar after = 1\n")) {
+            var res = recoverableParse(typeContextSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            findErrorByCode(res, DiagnosticCodes.MISSING_CLOSER_ARRAY);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \"Indent\"")),
+                    () -> typeContextSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(), () -> typeContextSource + " -> " + res.ast().statements());
+            var array = assertInstanceOf(ArrayExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(1, array.elements().size(), () -> typeContextSource + " -> " + array.elements());
+            assertInstanceOf(LambdaExpression.class, array.elements().getFirst());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var bareNotSubscript = recoverableParse(
+                arrayPrefix + "\tif true:\n\t\tvar d = not Dictionary[1\n\t, 2]\nvar after = 1\n");
+        findErrorByCode(bareNotSubscript, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorsOf(bareNotSubscript).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_ARRAY.equals(d.code())),
+                () -> errorsOf(bareNotSubscript).toString());
+        assertEquals(2, bareNotSubscript.ast().statements().size(), () -> bareNotSubscript.ast().statements().toString());
+        var bareNotArray = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(VariableDeclaration.class, bareNotSubscript.ast().statements().getFirst()).value());
+        assertEquals(2, bareNotArray.elements().size(), () -> bareNotArray.elements().toString());
+        assertInstanceOf(LambdaExpression.class, bareNotArray.elements().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, bareNotArray.elements().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, bareNotSubscript.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void indentedPropertyDoubleCommaReportsSingleInvalidAccessorWithoutDuplicateMissingComma() {
+        var doubleCommaMiddle = recoverableParse("var x:\n\tget = g,, set = s\nvar after = 1\n");
+        assertEquals(2, doubleCommaMiddle.ast().statements().size(), () -> doubleCommaMiddle.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, doubleCommaMiddle.ast().statements().get(1)).name());
+        var midErrors = errorsOf(doubleCommaMiddle);
+        assertEquals(1, midErrors.size(), () -> midErrors.toString());
+        assertEquals(DiagnosticCodes.PROPERTY_INVALID_ACCESSOR, midErrors.getFirst().code());
+        assertFalse(midErrors.stream().anyMatch(d -> DiagnosticCodes.MISSING_SEPARATOR_COMMA.equals(d.code())),
+                () -> midErrors.toString());
+
+        var doubleCommaTrailing = recoverableParse("var x:\n\tget = g,,\nvar after = 1\n");
+        assertEquals(2, doubleCommaTrailing.ast().statements().size(), () -> doubleCommaTrailing.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, doubleCommaTrailing.ast().statements().get(1)).name());
+        var trailingErrors = errorsOf(doubleCommaTrailing);
+        assertEquals(1, trailingErrors.size(), () -> trailingErrors.toString());
+        assertEquals(DiagnosticCodes.PROPERTY_INVALID_ACCESSOR, trailingErrors.getFirst().code());
+
+        var missingCommaControl = recoverableParse("var x:\n\tget = g\n\tset = s\nvar after = 1\n");
+        assertEquals(2, missingCommaControl.ast().statements().size(), () -> missingCommaControl.ast().statements().toString());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, missingCommaControl.ast().statements().get(1)).name());
+        findErrorByCode(missingCommaControl, DiagnosticCodes.MISSING_SEPARATOR_COMMA);
+    }
+
+    @Test
+    void lambdaCircuitBreakerProtectsMatchedDictMatchKeysAndMultilineAnnotationArgs() {
+        var callPrefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        for (var dictMatchKeySource : List.of(
+                callPrefix + "\tvar z = {\n\tmatch(1): 2, 4: 5}\n, 3)\nvar after = 1\n",
+                callPrefix + "\tvar z = {\n\tmatch(1):\n\t\t2, 4: 5}\n, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(dictMatchKeySource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISMATCHED_CLOSER_CALL.equals(d.code())),
+                    () -> dictMatchKeySource + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(), () -> dictMatchKeySource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> dictMatchKeySource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        var unclosedDictThenRealMatch = recoverableParse(
+                callPrefix + "\tvar z = {1\n\tmatch 1:\n\t\t1, 2: pass\n, 3)\nvar after = 1\n");
+        findErrorByCode(unclosedDictThenRealMatch, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorMessages(unclosedDictThenRealMatch).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                () -> errorMessages(unclosedDictThenRealMatch).toString());
+        assertEquals(2, unclosedDictThenRealMatch.ast().statements().size(),
+                () -> unclosedDictThenRealMatch.ast().statements().toString());
+        var unclosedDictOuter = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, unclosedDictThenRealMatch.ast().statements().getFirst()).value());
+        assertEquals(2, unclosedDictOuter.arguments().size(), () -> unclosedDictOuter.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, unclosedDictOuter.arguments().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, unclosedDictOuter.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, unclosedDictThenRealMatch.ast().statements().get(1)).name());
+
+        for (var multilineAnnotationMatch : List.of(
+                callPrefix + "\t@warning_ignore(\n\t\"unused_variable\") match 1:\n\t\t1, 2: pass\n, 3)\nvar after = 1\n",
+                callPrefix + "\t@warning_ignore(\n\t\t\"unused_variable\"\n\t) match 1:\n\t\t1, 2: pass\n, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(multilineAnnotationMatch);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                    () -> multilineAnnotationMatch + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(),
+                    () -> multilineAnnotationMatch + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> multilineAnnotationMatch + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+    }
+
+    @Test
+    void lambdaCircuitBreakerSettlesReplacedDictCloserBeforeRealMatchStatement() {
+        var callPrefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+        var replacedCloserSource = callPrefix + "\tvar z = {1\n\tmatch 1:\n\t\t1, 2: pass\n\t, 3])\nvar after = 1\n";
+        var res = recoverableParse(replacedCloserSource);
+        findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+        assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                () -> errorMessages(res).toString());
+        assertEquals(2, res.ast().statements().size(), () -> res.ast().statements().toString());
+        var call = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+        assertEquals(2, call.arguments().size(), () -> call.arguments().toString());
+        assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+    }
+
+    @Test
+    void lambdaCircuitBreakerHandlesMultilineHeaderJumpAnnotationDepthAndLocalReplacedClosers() {
+        var callPrefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        for (var multilineHeaderSource : List.of(
+                callPrefix + "\tvar z = (1\n\tmatch (\n\t\t1\n\t):\n\t\t1, 2: pass\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\tvar z = (1\n\tmatch (1):\n\t\t1, 2: pass\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\tvar z = (1\n\tif (\n\t\ttrue\n\t):\n\t\tpass\n\t, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(multilineHeaderSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISSING_CLOSER_CALL.equals(d.code())),
+                    () -> multilineHeaderSource + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(),
+                    () -> multilineHeaderSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> multilineHeaderSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        for (var annotationDepthSource : List.of(
+                callPrefix + "\t@warning_ignore(\n\t\t\"x\") match 1:\n\t\t1, 2: pass\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\t@warning_ignore(\n\t\t\"x\"\n\t)\n\tmatch 1:\n\t\t1, 2: pass\n\t, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(annotationDepthSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                    () -> annotationDepthSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(),
+                    () -> annotationDepthSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> annotationDepthSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        for (var localReplacedSource : List.of(
+                callPrefix + "\tvar z = {1: 2]\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\tvar z = {1: 2}\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\tvar z = {\n\t\tmatch(1):\n\t\t\t2, 4: 5]\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\tvar z = {\n\tmatch(1):\n\t\t2, 4: 5]\n\t, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(localReplacedSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorsOf(res).stream().anyMatch(d -> DiagnosticCodes.MISMATCHED_CLOSER_CALL.equals(d.code())),
+                    () -> localReplacedSource + " -> " + errorsOf(res));
+            assertEquals(2, res.ast().statements().size(),
+                    () -> localReplacedSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> localReplacedSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+    }
+
+    @Test
+    void lambdaCircuitBreakerPreservesAnnotationDepthAcrossInnerMatchAndUnwindsSkippedLocalOpeners() {
+        var callPrefix = "var x = g(func():\n" + "\tvar\n".repeat(102);
+
+        for (var innerMatchAnnotationSource : List.of(
+                callPrefix + "\t@warning_ignore(\n\t\twarnings.match) match 1:\n\t\t1, 2: pass\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\t@warning_ignore(\n\t\tmatch(\"x\")) match 1:\n\t\t1, 2: pass\n\t, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(innerMatchAnnotationSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertFalse(errorMessages(res).stream().anyMatch(m -> m.contains("Unexpected \":\"")),
+                    () -> innerMatchAnnotationSource + " -> " + errorMessages(res));
+            assertEquals(2, res.ast().statements().size(),
+                    () -> innerMatchAnnotationSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> innerMatchAnnotationSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
+
+        for (var nestedLocalCloserSource : List.of(
+                callPrefix + "\tvar z = [{1: 2]\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\tvar z = [({1: 2]\n\t, 3)\nvar after = 1\n",
+                callPrefix + "\tvar z = [{1: 2}]\n\t, 3)\nvar after = 1\n")) {
+            var res = recoverableParse(nestedLocalCloserSource);
+            findErrorByCode(res, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertEquals(2, res.ast().statements().size(),
+                    () -> nestedLocalCloserSource + " -> " + res.ast().statements());
+            var call = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, res.ast().statements().getFirst()).value());
+            assertEquals(2, call.arguments().size(), () -> nestedLocalCloserSource + " -> " + call.arguments());
+            assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, call.arguments().get(1)).sourceText());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, res.ast().statements().get(1)).name());
+        }
     }
 
     private static AstDiagnostic findErrorByCode(AstMappingResult result, String code) {

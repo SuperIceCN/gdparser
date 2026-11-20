@@ -5,6 +5,7 @@ import dev.superice.gdparser.frontend.ast.IdentifierExpression;
 import dev.superice.gdparser.frontend.ast.Node;
 import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.SourceFile;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -516,7 +517,32 @@ class GdCompletionContextTest {
     }
 
     @Test
-    void pathFallbackTestsActuallyDiscardTheTargetChain() {
+    void pathFallbackWorksIndependentlyWithEmptyAst() {
+        var emptyAst = new SourceFile(List.of(), new Range(0, 0, new Point(0, 0), new Point(0, 0)));
+        for (var expression : List.of("$Root/\"Child\"", "$Root/%Child", "%Child",
+                "a % (b)", "value%-name", "a % b",
+                "a % b / %Child", "a / await %Child", "a % await %Child")) {
+            var expectedReceiver = expression.equals("a % (b)") ? "(b)"
+                    : expression.equals("value%-name") ? "name"
+                    : expression.equals("a % b") ? "b"
+                    : (expression.equals("a % b / %Child") || expression.equals("a / await %Child")
+                            || expression.equals("a % await %Child")) ? "%Child"
+                    : expression;
+            var source = "func f():\n    " + expression + ".method(1+) + 2";
+            var cursor = source.indexOf(".method") + ".method".length();
+            var context = CompletionContextAnalyzer.analyze(source, emptyAst, cursor);
+            assertEquals(MEMBER_ACCESS, context.kind(), source);
+            assertEquals("method", source.substring(context.replaceableRange().startByte(),
+                    context.replaceableRange().endByte()), source);
+            var receiverRange = context.receiverRange();
+            assertNotNull(receiverRange, source);
+            assertEquals(expectedReceiver, source.substring(receiverRange.startByte(),
+                    receiverRange.endByte()), source);
+        }
+    }
+
+    @Test
+    void damagedPathCallSurvivesInParsedAst() {
         for (var expression : List.of("$Root/\"Child\"", "$Root/%Child", "%Child",
                 "a % (b)", "value%-name", "a % b",
                 "a % b / %Child", "a / await %Child", "a % await %Child")) {
@@ -533,7 +559,7 @@ class GdCompletionContextTest {
                     }
                     nodes.addAll(node.getChildren());
                 }
-                assertEquals(damaged ? 0 : 1, chains, source);
+                assertEquals(1, chains, source);
             }
         }
     }
