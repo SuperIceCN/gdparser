@@ -5,13 +5,13 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.Objects;
 
-/// Completion context at a UTF-8 cursor byte offset, without parser-specific node identities.
+/// Syntactic completion context at a UTF-8 cursor byte offset, independent of AST identities.
 /// At a name/punctuation boundary the name ending at the cursor wins. String and comment
 /// interiors suppress completion; a cursor before their first byte remains in code context.
 ///
 /// @param kind the cursor's syntactic context
 /// @param replaceableRange the entire name under the cursor, including any suffix after it;
-/// a missing name or argument uses a zero-width range
+/// an empty slot uses a zero-width range
 /// @param receiverRange the source fragment to the left of the member-access dot, present
 /// exactly when kind is `MEMBER_ACCESS`
 public record CompletionContext(Kind kind, Range replaceableRange, @Nullable Range receiverRange) {
@@ -27,11 +27,23 @@ public record CompletionContext(Kind kind, Range replaceableRange, @Nullable Ran
         }
     }
 
+    /// Classifies the slot without prescribing how a client supplies candidates.
     public enum Kind {
+        /// A member name after a receiver and dot.
         MEMBER_ACCESS,
+        /// A bare identifier or an empty value expression.
         IDENTIFIER,
+        /// A type name or an empty type slot.
         TYPE_POSITION,
+        /// An argument position inside a call expression.
         CALL_ARGUMENT,
+        /// A new parameter name in a function or signal signature.
+        PARAMETER_NAME,
+        /// The empty body on the same logical line as a function or lambda header.
+        SUITE_START,
+        /// The `in` keyword expected immediately after an infix `not`.
+        EXPECTED_KEYWORD,
+        /// No supported slot could be inferred at the cursor.
         UNKNOWN
     }
 }

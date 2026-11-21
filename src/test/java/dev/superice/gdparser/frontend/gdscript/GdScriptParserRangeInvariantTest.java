@@ -61,6 +61,8 @@ class GdScriptParserRangeInvariantTest {
             "var hp = $/!!\nvar mp = 2\n",
             "var hp = (1",
             "var x = target(1",
+            "var a = target(\n\t[func():\n\t\tvar x = 1\n\t, §",
+            "var a = target(\r\n\t[func():\r\n\t\tvar x = 1\r\n\t, §",
             "var cb = (func(): return 1\n",
             "var cb = func(): return (1\n",
             "func f():\n\treturn 1+\n",

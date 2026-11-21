@@ -41,12 +41,16 @@ final class CompletionContextAnalyzer {
             return context(CompletionContext.Kind.TYPE_POSITION,
                     name >= 0 && entries.get(name).typePosition() ? range(token(name)) : zeroRange());
         }
+        if (stream.isTrustedTypeContinuation(offset, name)) {
+            return context(CompletionContext.Kind.TYPE_POSITION, name >= 0 ? range(token(name)) : zeroRange());
+        }
         var dot = memberDot(name);
-        if (dot >= 0) {
+        if (dot >= 0 && !stream.hasHardStopBetween(token(dot).endByte(), offset)) {
             var receiver = receiverBefore(dot);
             if (receiver != null) {
                 var next = dot + 1;
                 var replacement = next < entries.size() && CompletionTokenStream.isNodeName(token(next))
+                        && !stream.hasHardStopBetween(token(dot).endByte(), token(next).startByte())
                         ? range(token(next)) : index.rangeOf(token(dot).endByte(), token(dot).endByte());
                 return new CompletionContext(CompletionContext.Kind.MEMBER_ACCESS, replacement, receiver);
             }
@@ -59,6 +63,12 @@ final class CompletionContextAnalyzer {
                 return context(CompletionContext.Kind.IDENTIFIER, node.range());
             }
         }
+        if (name < 0) {
+            var gap = stream.cursorGap(previousAtCursor(), offset);
+            if (gap != null) {
+                return context(gap.kind(), zeroRange());
+            }
+        }
         var paren = enclosingParen();
         if (paren >= 0 && entries.get(paren).role() == CompletionTokenStream.Role.CALL) {
             return context(CompletionContext.Kind.CALL_ARGUMENT, zeroRange());
@@ -67,8 +77,8 @@ final class CompletionContextAnalyzer {
     }
 
     private boolean isInTriviaOrString() {
-        for (var range : stream.incompleteStrings()) {
-            if (range.startByte() < offset && offset <= range.endByte()) {
+        for (var token : stream.incompleteStrings()) {
+            if (token.startByte() < offset && offset <= token.endByte()) {
                 return true;
             }
         }
@@ -119,6 +129,7 @@ final class CompletionContextAnalyzer {
         }
         var previous = previousAtCursor();
         if (previous >= 0 && entries.get(previous).typePosition()
+                && !stream.hasHardStopBetween(token(previous).endByte(), offset)
                 && switch (token(previous).type()) {
             case COLON, AS, IS, NOT, EXTENDS, FORWARD_ARROW, PERIOD, BRACKET_OPEN, COMMA -> true;
             default -> false;
@@ -153,15 +164,26 @@ final class CompletionContextAnalyzer {
             return null;
         }
         var end = token(dot - 1).endByte();
-        var start = primaryStart(dot - 1);
+        if (stream.hasHardStopBetween(end, token(dot).startByte())) {
+            return null;
+        }
+        var hardStop = stream.lastHardStopAtOrBefore(end);
+        var boundary = hardStop >= 0 ? stream.hardStopByte(hardStop) : -1;
+        var startToken = token(primaryStart(dot - 1, hardStop));
+        var start = startToken.startByte();
+        var nodePath = startToken.type() == GdTokenType.DOLLAR || startToken.type() == GdTokenType.PERCENT;
         for (var node : path.reversed()) {
             if (node instanceof AttributeExpression chain) {
+                var chainStart = chain.range().startByte();
+                // A recovered AST can cross the stop or lose a prefix (such as `%`).
+                if (chainStart < boundary || nodePath && chainStart > start) {
+                    continue;
+                }
                 for (var step : chain.steps()) {
                     if (step.range().startByte() == token(dot).endByte()
                             || (dot + 1 < entries.size()
                             && step.range().startByte() == token(dot + 1).startByte())) {
-                        start = chain.range().startByte();
-                        return index.rangeOf(start, end);
+                        return index.rangeOf(chainStart, end);
                     }
                 }
             }
@@ -169,11 +191,9 @@ final class CompletionContextAnalyzer {
         return index.rangeOf(start, end);
     }
 
-    private int primaryStart(int position) {
-        var start = token(position).startByte();
+    private int primaryStart(int position, int hardStop) {
         while (position >= 0) {
             var token = token(position);
-            start = token.startByte();
             if (token.type() == GdTokenType.PARENTHESIS_CLOSE
                     || token.type() == GdTokenType.BRACKET_CLOSE
                     || token.type() == GdTokenType.BRACE_CLOSE) {
@@ -181,43 +201,51 @@ final class CompletionContextAnalyzer {
                 if (open < 0) {
                     break;
                 }
-                start = token(open).startByte();
-                var role = entries.get(open).role();
                 position = open;
-                if ((role == CompletionTokenStream.Role.CALL || role == CompletionTokenStream.Role.SUBSCRIPT)
-                        && position > 0 && stream.isPrimaryEnd(position - 1)) {
-                    position--;
-                    continue;
-                }
             } else if (!stream.isPrimaryEnd(position)) {
                 break;
             }
+            // Exact pairs are atomic; lookbehind outside the pair uses the opener's boundary.
+            // The walk only moves left, so each boundary is passed at most once.
+            while (hardStop >= 0 && stream.hardStopByte(hardStop) > token(position).startByte()) {
+                hardStop--;
+            }
+            var boundary = hardStop >= 0 ? stream.hardStopByte(hardStop) : -1;
+            var role = entries.get(position).role();
+            if ((role == CompletionTokenStream.Role.CALL || role == CompletionTokenStream.Role.SUBSCRIPT)
+                    && canStepLeft(position, boundary) && stream.isPrimaryEnd(position - 1)) {
+                position--;
+                continue;
+            }
             if (isPathSegment(token)) {
-                position = nodePathStart(position);
-                start = token(position).startByte();
+                position = nodePathStart(position, boundary);
             }
             if (position >= 2 && token(position - 1).type() == GdTokenType.PERIOD
-                    && stream.isPrimaryEnd(position - 2)) {
+                    && token(position - 2).endByte() > boundary && stream.isPrimaryEnd(position - 2)) {
                 position -= 2;
                 continue;
             }
             break;
         }
-        return start;
+        return position;
     }
 
-    private int nodePathStart(int position) {
+    private boolean canStepLeft(int position, int boundary) {
+        return position > 0 && token(position - 1).endByte() > boundary;
+    }
+
+    private int nodePathStart(int position, int boundary) {
         var left = position;
         var standalone = position;
-        while (left > 0) {
+        while (canStepLeft(left, boundary)) {
             if (token(left - 1).type() == GdTokenType.PERCENT) {
                 left--;
-                var prefix = isExpressionPrefix(left);
+                var prefix = isExpressionPrefix(left, boundary);
                 if (prefix) {
                     standalone = left;
                 }
                 // Within a dollar path '%' may start each slash-delimited segment.
-                if (left == 0 || token(left - 1).type() != GdTokenType.SLASH
+                if (!canStepLeft(left, boundary) || token(left - 1).type() != GdTokenType.SLASH
                         && token(left - 1).type() != GdTokenType.DOLLAR) {
                     return prefix ? left : standalone;
                 }
@@ -229,10 +257,13 @@ final class CompletionContextAnalyzer {
                 break;
             }
             left--;
-            if (left > 0 && token(left - 1).type() == GdTokenType.DOLLAR) {
+            if (!canStepLeft(left, boundary)) {
+                break;
+            }
+            if (token(left - 1).type() == GdTokenType.DOLLAR) {
                 return left - 1;
             }
-            if (left == 0 || !isPathSegment(token(left - 1))) {
+            if (!isPathSegment(token(left - 1))) {
                 break;
             }
             left--;
@@ -246,12 +277,12 @@ final class CompletionContextAnalyzer {
                 || token.type() == GdTokenType.LITERAL && token.literalKind() == GdLiteralKind.STRING;
     }
 
-    private boolean isExpressionPrefix(int position) {
+    private boolean isExpressionPrefix(int position, int boundary) {
         // A keyword after '/' or '%' is a path operand only if a real path prefix owns it.
         // Each unresolved '%' reverses that question; walking left avoids recursive scans.
         var invert = false;
         outer:
-        while (position > 0) {
+        while (canStepLeft(position, boundary)) {
             var previous = token(position - 1);
             if (CompletionTokenStream.isIdentifier(previous) || previous.type() == GdTokenType.LITERAL
                     || previous.type() == GdTokenType.SELF || previous.type() == GdTokenType.SUPER) {
@@ -261,12 +292,10 @@ final class CompletionContextAnalyzer {
                     || previous.type() == GdTokenType.BRACKET_CLOSE
                     || previous.type() == GdTokenType.BRACE_CLOSE) {
                 var open = stream.partner(position - 1);
-                var nonOperandClose = open >= 0
-                        && (entries.get(open).role() == CompletionTokenStream.Role.SIGNATURE
-                        || entries.get(open).role() == CompletionTokenStream.Role.TYPE);
+                var nonOperandClose = open >= 0 && !stream.isExpressionCloser(open);
                 return invert != nonOperandClose;
             }
-            if (!CompletionTokenStream.isNodeName(previous) || position < 2) {
+            if (!CompletionTokenStream.isNodeName(previous) || !canStepLeft(position - 1, boundary)) {
                 return !invert;
             }
             var before = token(position - 2).type();
@@ -277,10 +306,10 @@ final class CompletionContextAnalyzer {
                 return !invert;
             }
             var left = position - 1;
-            while (left > 0) {
+            while (canStepLeft(left, boundary)) {
                 if (token(left - 1).type() == GdTokenType.PERCENT) {
                     left--;
-                    if (left == 0) {
+                    if (!canStepLeft(left, boundary)) {
                         return invert;
                     }
                     var kind = token(left - 1).type();
@@ -298,10 +327,13 @@ final class CompletionContextAnalyzer {
                     return !invert;
                 }
                 left--;
-                if (left > 0 && token(left - 1).type() == GdTokenType.DOLLAR) {
+                if (!canStepLeft(left, boundary)) {
+                    return !invert;
+                }
+                if (token(left - 1).type() == GdTokenType.DOLLAR) {
                     return invert;
                 }
-                if (left == 0 || !isPathSegment(token(left - 1))) {
+                if (!isPathSegment(token(left - 1))) {
                     return !invert;
                 }
                 left--;
@@ -319,8 +351,7 @@ final class CompletionContextAnalyzer {
                 break;
             }
             if (token.type() == GdTokenType.PARENTHESIS_OPEN) {
-                var close = stream.partner(i);
-                if (close < 0 || offset <= token(close).startByte()) {
+                if (stream.isWithinEffectiveEnd(i, offset)) {
                     result = i;
                 }
             }

@@ -1339,6 +1339,29 @@ class GdScriptParserErrorRecoveryTest {
         assertSame(variable, error.recovery().owner());
     }
 
+    @Test
+    void unclosedArrayLambdaDoesNotMoveTheOuterCallLexicalBoundary() {
+        for (var newline : List.of("\n", "\r\n")) {
+            var source = "var a = target(\n\t[func():\n\t\tvar x = 1\n\t, §".replace("\n", newline);
+            var result = recoverableParse(source);
+            assertEnvelopeRecursive(result.ast(), source);
+            var variable = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+            var call = assertInstanceOf(CallExpression.class, variable.value());
+            assertEquals("target", assertInstanceOf(IdentifierExpression.class, call.callee()).name(), source);
+            var array = assertInstanceOf(ArrayExpression.class, call.arguments().getFirst());
+            assertEquals("§", assertInstanceOf(ErrorExpression.class, array.elements().getLast()).sourceText(), source);
+            var lexicalErrors = errorsOf(result).stream()
+                    .filter(d -> DiagnosticCodes.LEXICAL_ERROR.equals(d.code()))
+                    .filter(d -> "§".equals(utf8Slice(source, d.range())))
+                    .toList();
+            assertEquals(1, lexicalErrors.size(), source);
+            var error = lexicalErrors.getFirst();
+            assertNotNull(error.recovery(), source);
+            assertSame(variable, error.recovery().owner(), source);
+            assertEquals("variable.initializer", error.recovery().facet(), source);
+        }
+    }
+
     /// Every bound recovery link must point at an owner reachable from the final AST
     /// (identity semantics): the end-of-parse sweep unlinks owners of discarded constructs.
     @Test

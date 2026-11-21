@@ -275,19 +275,21 @@ parity 语料分三类管理（非法源不适用 parity，另有独立验收规
 ## 12. 纯 Java 补全上下文合同
 
 - 入口：`GdScriptParserFacade.parseCompletionContext(String source, long byteOffset)`，每次创建独立 parser 与 token 视图，可并发共享 facade，不初始化 tree-sitter/native。
-- DTO：`frontend.gdscript.CompletionContext(kind, replaceableRange, receiverRange)`；kind 为 `MEMBER_ACCESS` / `IDENTIFIER` / `TYPE_POSITION` / `CALL_ARGUMENT` / `UNKNOWN`。仅成员访问携带 receiver；范围使用 UTF-8 字节偏移、0-based 行与字节列，光标 clamp 到物理源范围。
-- 替换范围覆盖光标下完整名字，而非仅已输入前缀；缺名成员的零宽范围锚定点号末端，空实参/类型槽锚定光标。receiver 覆盖点号左侧完整 primary/postfix 片段，包括分组括号、调用、下标与 get-node 路径。
+- DTO：`frontend.gdscript.CompletionContext(kind, replaceableRange, receiverRange)`；kind 为 `MEMBER_ACCESS` / `IDENTIFIER` / `TYPE_POSITION` / `CALL_ARGUMENT` / `PARAMETER_NAME` / `SUITE_START` / `EXPECTED_KEYWORD` / `UNKNOWN`。仅成员访问携带 receiver；范围使用 UTF-8 字节偏移、零基行与字节列，光标限制在物理源范围内。
+- 替换范围覆盖光标下完整名字，而非仅已输入前缀；缺名成员的零宽范围锚定点号末端，空槽锚定光标。receiver 覆盖点号左侧 primary/postfix 片段，包括分组括号、调用、下标与 get-node 路径；AST 存活时用链结构确定起点。
 - 共享边界优先左侧名字：`node|.pa` 为 IDENTIFIER(`node`)，`a.b|.c` 补全 `b`，`Outer|.Inner` 补全类型名 `Outer`。字符串/注释起点之前仍在代码侧，`target(|"s")` 为 CALL_ARGUMENT；进入引号或字符串前缀后为 UNKNOWN，未闭合字符串末端仍 UNKNOWN。
 - get-node 回退支持普通字符串路径段、`/%` 段和独立 `%`；已有完整左操作数后的 `%` 为取模，不吸收到右侧 receiver。健康 AST 与目标链被丢弃两种状态均测试，避免幸存 extent 掩盖回退缺陷。
 - AST 存活时使用其类型/标识符与链 extent；AST 被恢复丢弃时按 token 回退，保留 `super.`、受损成员链、具名 callee、显式类型槽与 EOF 未闭合调用的上下文。点分类型名优先于成员名；标识符实参优先于外围调用实参区；缺名点号及其空首实参位优先于调用实参区。
-- token 视图跳过 ERROR token，但单独保留未闭合字符串区间；字符串和注释内返回 `UNKNOWN`。表达式/签名分组启用 multiline，类型容器括号仅继承；function/lambda 使用禁用帧与有效缩进边界，签名闭合后返回类型不继承签名的启用帧。
+- 托管 token 视图使用真实括号 token，跳过其他 `ERROR`，单独保留未闭合字符串区间。表达式/签名分组启用 multiline，类型容器括号仅继承；function/lambda 使用自己的硬布局与有效缩进边界，签名闭合后返回类型不继承签名的启用帧。
 - `as`/`is` 仅算符角色开启类型槽，`is not` 可跨 `not`；成员名/get-node 路径中的同名关键字不触发类型补全。函数体/字典冒号、推断标记 `:=`/`: =` 不视为显式类型槽；签名参数表不视为调用实参区。
 - `is` 的可选 `not` 只作用于紧随的首个非布局 token；类型替换范围仅包含自身属于类型槽的名字，`for x: Array[int]|in arr:` 不覆盖右侧 `in`。`func` 待开启参数表、返回类型/无体函数、INLINE/INDENTED body 分别维护生命周期；无效头重判当前 token，硬换行终止无体声明，所有函数帧退出恢复外层逻辑缩进。INLINE 显式续行不因物理行变化提前退出。
 - 类型状态区分完整类型与后续表达式：guard 的 `when` 不延续前面的 cast 类型；容器 cast 完成后可补成员或下标表达式，点分类型后的 `[` 亦是表达式下标。字符串 `extends` 的点分内部类仍为 TYPE_POSITION，字符串内部仍 UNKNOWN。
 - INDENTED 函数帧局部维护 match 模式头；模式逗号不退出 lambda，分支 body 尾逗号仍可恢复外层调用。硬换行或类型状态失效时清理连续非 multiline 类型帧，再处理 RETURN_TYPE 与当前 token，不清理签名内合法继承 multiline 的类型容器。
+- 未闭类型在硬换行之后，只对紧邻、比类型声明逻辑行缩进更深且整行可信的类型片段补全。独立声明或语句、祖先分隔符以及不足缩进的光标均不触发；这不延长类型 multiline 或放宽严格解析。
+- 字典值和声明/形参的推断初始值空槽返回 `IDENTIFIER`；合法签名的首个及后续参数名槽返回 `PARAMETER_NAME`，同逻辑行的函数体空槽返回 `SUITE_START`，中缀 `not` 的空槽返回 `EXPECTED_KEYWORD`（预期 `in`）。只在没有名字时检查这些槽，优先于调用实参回退。非法换行签名不提供空参数名分类。
+- 与解析器共享惰性括号扫描器。最近同类祖先优先配对，遇异类替换或祖先截断只记录有效终点，不将错闭合当作 primary。未闭帧在硬结构边界停止，不泄漏布局或实参槽；`[1)\n\ta.\n\tb|` 为 `IDENTIFIER`，`(a.\n\tb|)` 仍为 `MEMBER_ACCESS`。
 - EOF 无最终换行的 `target(`、`target(1,`、`target(1` 均为 `CALL_ARGUMENT`；最后一项是相对旧 CST 分类器 `UNKNOWN` 的有意改进。
-- 旧 `infra.treesitter.GdParserFacade`、`CompletionContext`、`CompletionContextAnalyzer`、`GdParseSnapshot` 已标注弃用并保留迁移指引，运行时行为不变；CST/lowering 与旧补全/parity 测试继续保留，移除另排。
-- 已知恢复限制：错配闭合符作为 ERROR 被跳过时，独立 token 视图可能保留已被 parser 恢复退出的 multiline 帧。例如 `var bad = [1)` 后 `a.` 与下一行 `b` 可能错误拼成成员访问。涉及底层恢复所有权的调整暂缓；详见恢复与补全计划 §12.4。
+- 旧 `infra.treesitter.GdParserFacade`、五值 `CompletionContext`、`CompletionContextAnalyzer` 和 `GdParseSnapshot` 仍可用且行为不变。GDCC 仍使用旧入口；将来接入纯 Java 入口后，若对外保留旧五值合同，新增三类须映射为 `UNKNOWN` 且没有候选。候选生成不属于 gdparser。
 
 ## 13. 参考资料
 

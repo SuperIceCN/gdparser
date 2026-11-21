@@ -4,8 +4,10 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /// Lazy single-pass lexical bracket-balance oracle used when multiline bracketed constructs
 /// encounter cross-line ambiguity.
@@ -54,6 +56,7 @@ final class BracketBalanceOracle {
     private final int[] chars;
     private final int[] byteOffsets;
     private final Map<Integer, OpenerFact> factsByOpenerByte = new HashMap<>();
+    private final Set<Integer> structuralStops = new HashSet<>();
     private int scanCount;
     private int scanLine = 1;
 
@@ -69,6 +72,12 @@ final class BracketBalanceOracle {
     @Nullable OpenerFact factFor(int openerByte) {
         ensureScanned();
         return factsByOpenerByte.get(openerByte);
+    }
+
+    /// Tests the actual token start, even when lexical damage precedes it on the same line.
+    boolean isStructuralStopToken(int byteOffset) {
+        ensureScanned();
+        return structuralStops.contains(byteOffset);
     }
 
     private void ensureScanned() {
@@ -163,8 +172,11 @@ final class BracketBalanceOracle {
 
             // Statement-level @annotation at line start.
             if (ch == '@') {
-                if (atLineHead && !stack.isEmpty()) {
-                    recordStop(stack, byteOffsets[stopAnchor]);
+                if (atLineHead) {
+                    structuralStops.add(byteOffsets[tokenStart]);
+                    if (!stack.isEmpty()) {
+                        recordStop(stack, byteOffsets[stopAnchor]);
+                    }
                 }
                 pos++;
                 while (pos < len && isIdentifierContinue(chars[pos])) {
@@ -203,10 +215,13 @@ final class BracketBalanceOracle {
                 while (pos < len && isIdentifierContinue(chars[pos])) {
                     pos++;
                 }
-                if (atLineHead && !stack.isEmpty()) {
+                if (atLineHead) {
                     var word = new String(chars, tokenStart, pos - tokenStart);
                     if (isStructuralStopKeyword(word, pos)) {
-                        recordStop(stack, byteOffsets[stopAnchor]);
+                        structuralStops.add(byteOffsets[tokenStart]);
+                        if (!stack.isEmpty()) {
+                            recordStop(stack, byteOffsets[stopAnchor]);
+                        }
                     }
                 }
                 continue;
