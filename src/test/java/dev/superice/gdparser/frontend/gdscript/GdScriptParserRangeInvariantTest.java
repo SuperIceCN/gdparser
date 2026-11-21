@@ -91,6 +91,16 @@ class GdScriptParserRangeInvariantTest {
             "var d = {1+:2}\n",
             "var d = {:}\n",
             "var d = {(a): 1}\n",
+            "var d = {\"😀\": 1, :, \"b\": 2}\r\n",
+            "var d = {foo(1+) = 2}\r\n",
+            "var d = {[1+] = 2}\n",
+            "var d = {(1+) = 2}\n",
+            "var d = g([a=1], 2)\n",
+            "var a = foo([1+]).bar\n",
+            "func f():\r\n\tx as Array[int\r\n\tpass\r\n",
+            "func f():\r\n\tx is Array[int)\r\n\tpass\r\n",
+            "func f():\r\n\tfor i: Foo. ??? in xs:\r\n\t\tpass\r\n\tpass\r\n",
+            "func f():\r\n\tfor i: Array[int ??? in xs:\r\n\t\tpass\r\n\tpass\r\n",
             "@export_range(0, 1+, 2)\nvar x = 1\n",
             "@export_enum(\"A\", ,\"B\")\nvar x = 1\n",
             "func f(x: int = 1+): pass\n",
@@ -927,6 +937,26 @@ class GdScriptParserRangeInvariantTest {
             assertEnvelope(result.ast(), () -> "envelope violation in: " + source);
             assertDiagnosticInvariants(source, result, () -> "diagnostic invariant violation in: " + source);
         }
+    }
+
+    @Test
+    void typeOperatorCutsKeepByteRangesAndOwnersOnParserReuse() {
+        var parser = new GdScriptParser();
+        for (var separator : List.of("\n", "\r\n")) {
+            for (var operator : List.of("as", "is", "is not")) {
+                var prefix = String.join(separator, "func f():", "\tvar note = \"😀\"", "\tx " + operator + " ");
+                for (var type : List.of("Outer.Inner", "Array[int]", "Array[Array[int]]", "Array[int)", "Array[]")) {
+                    for (var cut = 0; cut <= type.length(); cut++) {
+                        var source = prefix + type.substring(0, cut);
+                        var result = parser.parse(source);
+                        assertEnvelope(result.ast(), () -> "envelope violation in: " + source);
+                        assertDiagnosticInvariants(source, result, () -> "diagnostic invariant violation in: " + source);
+                    }
+                }
+            }
+        }
+        var healthy = parser.parse("func f(): x is Array[int]\n");
+        assertEquals(List.of(), healthy.diagnostics());
     }
 
     @Test

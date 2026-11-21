@@ -300,6 +300,17 @@ final class RecoveryTransactionTracker {
         return entries.size();
     }
 
+    /// Checks only errors settled on this frame, not lookahead or child-frame diagnostics.
+    boolean hasErrors(@NotNull ProvisionalFrame frame) {
+        requireOwnedFrame(frame);
+        for (var entry : frame.pendingEntries) {
+            if (entry.diagnostic.severity() == AstDiagnosticSeverity.ERROR) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void reset() {
         entries.clear();
         frameStack.clear();

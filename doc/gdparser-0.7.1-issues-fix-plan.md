@@ -171,7 +171,7 @@
 
 | 决策项 | 状态 | 最终裁定与实施边界 |
 |---|---|---|
-| 决策 1（`1B`）：`ParseOutcome` 五态扩展与 D6 容器吸收（`L-07/08`） | **已确认（`1B`）** | 在包私有 `ParseOutcome<T>` 中新增第 5 个 record `EnclosedDamage<T>(T value)`，表达“本层语法结构完整且边界已收口，但子树含损伤”（同时清理零调用死方法 `isOk()`/`valueOrNull()`）。数组（`Parser:9036–9085`）、字典（`:9275–9276`）、已闭合调用/下标/分组在子树受损时返回 `EnclosedDamage` 而非伪装 `Ok`：一方面保留 D6 吸收语义（外层继续 Pratt/后缀折叠，如 `foo([1+]).bar` 正常折叠）；另一方面让表面形态守门（如 `Parser:9188–9202` Lua 键校验对 `{[1+] = 2}`、`{foo(1+) = 2}` 报 `DICTIONARY_INVALID_LUA_KEY`，而本层残缺的 `{(1+) = 2}` 走 `Damaged` 继续避免二次报错）行为一致。同步修正 `doc/pure-java-recovery-and-completion-plan.md` 与 `doc/godot-java-parser-implementation.md` 中已落后于 `9024e36` 的 4 处旧 `ParseOutcome` 描述。 |
+| 决策 1（`1B`）：`ParseOutcome` 五态扩展与 D6 容器吸收（`L-07/08`） | **已确认（`1B`）** | 在包私有 `ParseOutcome<T>` 中新增 `EnclosedDamage<T>(T value)`，表达“本层语法结构完整且边界已收口，但子树含损伤”（并删除无调用的 `isOk()`/`valueOrNull()`）。闭合的数组、字典、调用和下标吸收子损伤而不伪装 `Ok`，让 `foo([1+]).bar` 继续折叠，并让 Lua 键校验对 `{[1+] = 2}`、`{foo(1+) = 2}` 一致报 `DICTIONARY_INVALID_LUA_KEY`。普通分组不建外层节点：真实 `)` 闭合时继承内层结果，`(1+)` 仍为 `Damaged`，因此不二次报错；`([1+])` 继承 `EnclosedDamage`。同步设计与架构文档的五态说明。 |
 | 决策 2（`2B`）：`parseTypeInternal` 统一返回 `ParseOutcome<ParsedType>`（`L-09/20`） | **已确认（`2B`）** | 将 `parseTypeInternal` 改造为返回 `ParseOutcome<ParsedType>`（保留 `ParsedType.isContainer()`，公开 `TypeRef` 与 serde 不变），覆盖全部 6 处 `parseType` 调用点 + 1 处递归调用，彻底消除 7 处 `diagnosticCount() == diagBefore` 计数判断：`Missing` 由调用方补发上下文 `MISSING_TYPE_*`；`Failed`（如 `Array[]`/非法 `void`）禁双报；`Damaged`/`EnclosedDamage`（如 `Foo.` 含点号范围、`Array[int` 缺 `]`、`Array[Array[int]]` 非法嵌套）让 `parseCast`/`parseTypeTest` 准确传播损伤、让 `parseFor` 触发同行 `in` 同步；同时核实并加固 `as`/`is` 无活跃帧时 `MISSING_CLOSER_TYPE_BRACKET` 的安全发射。 |
 | 决策 3（`3A`）：未配对 `Dictionary` 的坏逗号优先级（`L-23`／`R2.2`） | **已确认（`3A`）** | 保持 `shouldContinueDictionaryTypeComma`（`Parser:7181–7192`）“有祖先逗号所有者且 `Dictionary[` 未精确配对时让逗号给外层”的规则不变，不引入脆弱的坏逗号启发式；保护同行真实第二实参 `g(func() -> Dictionary[String, Array[i])` / `other` 与 `C:1214–1222` 的外层 `IDENTIFIER` 解释，同时在 `R2.2` 补齐跨行坏嵌套的非法嵌套/缺闭合 strict 拒绝与 `node.pa` 存活/补全回归测试。 |
 | 决策 4A（`4A`）：语句尾孤立 closer 诊断码（`L-10`／`R3.1`） | **已确认（`4A`）** | 保留 `UNEXPECTED_CLOSER`（`parse.unexpected_closer`，`Codes:267–282,449–457` 已注册所需全部配对），按位置精确绑定归属：同行尾 `pass )`/`return 1 )` 绑原语句 `statement.trailing`，跨行/套件首 `)` 绑存活套件宿主 `suite.body`，类体首 `)` 绑存活类 `class.body`，真正无宿主的顶层 `)` 保持 `null`；祖先拥有的 closer 不进入上述孤立恢复路径。 |
@@ -272,9 +272,11 @@
 
 | 阶段 | 子任务 | 状态 |
 |---|---|---|
-| `R1` 损伤状态保真 | `R1.1`–`R1.3` | 待实施 |
+| `R1` 损伤状态保真 | `R1.1`–`R1.3` | 已完成（双审 APPROVE，505 定向通过） |
 | `R2` 结构边界与熔断配平 | `R2.1`–`R2.3` | 待实施 |
 | `R3` 诊断归属与块边界 | `R3.1`–`R3.5` | 待实施 |
 | `R4` 语法守门与语言对齐 | `R4.1`–`R4.4` | 待实施 |
 | `R5` 行为、坐标与线性门禁 | `R5.1`–`R5.4` | 待实施 |
 | `R6` GDCC 独立联调 | `R6.1`–`R6.3` | 待实施（跨仓，需独立授权） |
+
+`R1` 实施摘要：表达式与类型按五态传播（新增 `EnclosedDamage`），透明分组保留内层状态，Pratt/特化前缀/lambda 头部词法与结构损伤完整保真；`as`/`is` 保留坏类型前缀且为独立类型诊断兜底建立 `type.argument` 归属；`for` 在非 `Ok` 类型后于同行同步 `in`（含显式 `\` 续行）。公开 AST 与 serde 不变；同步更新三份设计文档。定向 5 类 505 项全过（0 失败/错误/跳过），`review-expert-b` 与 `review-expert-c` 双 `APPROVE`。

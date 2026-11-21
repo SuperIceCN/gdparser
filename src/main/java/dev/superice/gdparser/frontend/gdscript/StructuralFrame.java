@@ -52,6 +52,10 @@ final class StructuralFrame {
     @NotNull SeparatorPhase separatorPhase = SeparatorPhase.NONE;
     boolean allowsTypeComma;
     boolean parsingDictionaryKey;
+    /// A separator was missing or inconsistent, or the list skipped an invalid item tail.
+    boolean damagedListSyntax;
+    /// A real separator closed an item with trailing lexical damage.
+    boolean lexicalDamageBeforeListSeparator;
     boolean pendingSync;
     boolean settled;
     byte unclosedParamListCache = -1;

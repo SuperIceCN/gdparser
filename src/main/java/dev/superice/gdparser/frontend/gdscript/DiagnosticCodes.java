@@ -26,6 +26,7 @@ import dev.superice.gdparser.frontend.ast.MatchSection;
 import dev.superice.gdparser.frontend.ast.MatchStatement;
 import dev.superice.gdparser.frontend.ast.Node;
 import dev.superice.gdparser.frontend.ast.Parameter;
+import dev.superice.gdparser.frontend.ast.RecoveredInfixExpression;
 import dev.superice.gdparser.frontend.ast.RecoveryLink;
 import dev.superice.gdparser.frontend.ast.RegionDirectiveStatement;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
@@ -310,7 +311,8 @@ public final class DiagnosticCodes {
                 LambdaExpression.class,
                 ForStatement.class,
                 CastExpression.class,
-                TypeTestExpression.class
+                TypeTestExpression.class,
+                RecoveredInfixExpression.class
         ));
         FACET_ALLOWED_OWNERS = Map.copyOf(facets);
 
@@ -343,8 +345,6 @@ public final class DiagnosticCodes {
                 ASSIGNMENT_DISALLOWED_IN_EXPRESSION,
                 ASSIGNMENT_INVALID_TARGET,
                 CALL_INVALID_CALLEE,
-                MISSING_TYPE_CAST,
-                MISSING_TYPE_TYPE_TEST,
                 DICTIONARY_MIXED_STYLE,
                 DICTIONARY_INVALID_LUA_KEY,
                 NODE_PATH_INVALID
@@ -371,6 +371,9 @@ public final class DiagnosticCodes {
                 MISMATCHED_CLOSER_TYPE_BRACKET,
                 MISSING_TYPE_GENERIC_ARGUMENT
         );
+        var infixTypeFacets = new HashSet<>(EXPRESSION_HOST_FACETS);
+        infixTypeFacets.add("type.argument");
+        registerPairings(pairings, infixTypeFacets, MISSING_TYPE_CAST, MISSING_TYPE_TYPE_TEST);
 
         // Slot-specific codes (also hostable by enclosing property accessor fallback `variable.property`)
         pairings.put(SLOT_VARIABLE_INITIALIZER, Set.of("variable.initializer", "variable.property"));
