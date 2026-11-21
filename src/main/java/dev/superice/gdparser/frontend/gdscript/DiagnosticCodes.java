@@ -3,11 +3,13 @@ package dev.superice.gdparser.frontend.gdscript;
 import dev.superice.gdparser.frontend.ast.AnnotationStatement;
 import dev.superice.gdparser.frontend.ast.AssertStatement;
 import dev.superice.gdparser.frontend.ast.Block;
+import dev.superice.gdparser.frontend.ast.BreakStatement;
 import dev.superice.gdparser.frontend.ast.CastExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.ClassNameStatement;
 import dev.superice.gdparser.frontend.ast.CommentStatement;
 import dev.superice.gdparser.frontend.ast.ConstructorDeclaration;
+import dev.superice.gdparser.frontend.ast.ContinueStatement;
 import dev.superice.gdparser.frontend.ast.DictEntry;
 import dev.superice.gdparser.frontend.ast.DictionaryExpression;
 import dev.superice.gdparser.frontend.ast.ElifClause;
@@ -146,6 +148,13 @@ public final class DiagnosticCodes {
     public static final String SIGNATURE_MANDATORY_AFTER_OPTIONAL = "parse.signature.mandatory_after_optional";
     public static final String SIGNATURE_REST_WITH_DEFAULT = "parse.signature.rest_with_default";
     public static final String SIGNATURE_PARAMETER_AFTER_REST = "parse.signature.parameter_after_rest";
+    public static final String SIGNATURE_DUPLICATE_PARAMETER = "parse.signature.duplicate_parameter";
+    public static final String SIGNATURE_SIGNAL_PARAMETER_DEFAULT = "parse.signature.signal_parameter_default";
+
+    // Dictionary literal and node-path recovery.
+    public static final String DICTIONARY_MIXED_STYLE = "parse.dictionary.mixed_style";
+    public static final String DICTIONARY_INVALID_LUA_KEY = "parse.dictionary.invalid_lua_key";
+    public static final String NODE_PATH_INVALID = "parse.node_path.invalid";
 
     // Property recovery.
     public static final String PROPERTY_DUPLICATE_GETTER = "parse.property.duplicate_getter";
@@ -200,6 +209,7 @@ public final class DiagnosticCodes {
             "match.value",
             "match.pattern",
             "match.guard",
+            "match.section",
             "annotation.arguments",
             "variable.initializer",
             "variable.property",
@@ -207,7 +217,10 @@ public final class DiagnosticCodes {
             "parameter.default",
             "enum.value",
             "match.dictionary_pattern",
-            "dictionary.entry"
+            "dictionary.entry",
+            "function.signature",
+            "signal.parameter",
+            "suite.body"
     );
 
     /// Type-bearing facets that can host type-bracket and generic type argument diagnostics.
@@ -217,8 +230,11 @@ public final class DiagnosticCodes {
             "constant.type",
             "parameter.type",
             "function.return_type",
+            "function.signature",
             "for.iterator",
-            "signal.parameter"
+            "signal.parameter",
+            "match.section",
+            "suite.body"
     );
 
     private static final Map<String, Set<Class<? extends Node>>> FACET_ALLOWED_OWNERS;
@@ -249,9 +265,21 @@ public final class DiagnosticCodes {
 
         // Structural, declaration, signature, and pattern facets
         facets.put("statement.trailing", Set.of(Statement.class));
+        facets.put("statement.control", Set.of(BreakStatement.class, ContinueStatement.class, ReturnStatement.class));
         facets.put("variable.property", Set.of(VariableDeclaration.class));
         facets.put("annotation.target", Set.of(AnnotationStatement.class));
         facets.put("class.extends", Set.of(ClassDeclaration.class, ClassNameStatement.class, ExtendsStatement.class));
+        facets.put("class.body", Set.of(ClassDeclaration.class));
+        facets.put("suite.body", Set.of(
+                IfStatement.class,
+                ElifClause.class,
+                WhileStatement.class,
+                ForStatement.class,
+                FunctionDeclaration.class,
+                ConstructorDeclaration.class,
+                LambdaExpression.class,
+                MatchSection.class
+        ));
         facets.put("parameter.type", Set.of(Parameter.class));
         facets.put("variable.type", Set.of(VariableDeclaration.class));
         facets.put("constant.type", Set.of(VariableDeclaration.class));
@@ -316,7 +344,10 @@ public final class DiagnosticCodes {
                 ASSIGNMENT_INVALID_TARGET,
                 CALL_INVALID_CALLEE,
                 MISSING_TYPE_CAST,
-                MISSING_TYPE_TYPE_TEST
+                MISSING_TYPE_TYPE_TEST,
+                DICTIONARY_MIXED_STYLE,
+                DICTIONARY_INVALID_LUA_KEY,
+                NODE_PATH_INVALID
         );
 
         // Comma and dictionary separators
@@ -344,7 +375,8 @@ public final class DiagnosticCodes {
         // Slot-specific codes (also hostable by enclosing property accessor fallback `variable.property`)
         pairings.put(SLOT_VARIABLE_INITIALIZER, Set.of("variable.initializer", "variable.property"));
         pairings.put(SLOT_CONSTANT_VALUE, Set.of("constant.value", "variable.property"));
-        pairings.put(SLOT_PARAMETER_DEFAULT, Set.of("parameter.default", "variable.property"));
+        pairings.put(SLOT_PARAMETER_DEFAULT, Set.of(
+                "parameter.default", "function.signature", "signal.parameter", "variable.property"));
         pairings.put(SLOT_ENUM_VALUE, Set.of("enum.value", "variable.property"));
         pairings.put(SLOT_RETURN_VALUE, Set.of("return.value", "variable.property"));
         pairings.put(SLOT_IF_CONDITION, Set.of("if.condition", "variable.property"));
@@ -357,12 +389,12 @@ public final class DiagnosticCodes {
         pairings.put(SLOT_MATCH_GUARD, Set.of("match.guard", "variable.property"));
         pairings.put(SLOT_MATCH_PATTERN, Set.of("match.pattern", "match.section", "variable.property"));
         pairings.put(SLOT_DICTIONARY_PATTERN_KEY, Set.of("match.pattern", "match.dictionary_pattern", "dictionary.entry", "variable.property"));
-        pairings.put(SLOT_ANNOTATION_ARGUMENT, Set.of("annotation.arguments", "variable.property"));
+        pairings.put(SLOT_ANNOTATION_ARGUMENT, Set.of("annotation.arguments", "match.section", "variable.property"));
 
         // Construct-specific closers
         registerPairings(pairings, Set.of("assert.arguments", "variable.property"),
                 MISSING_CLOSER_ASSERT, MISMATCHED_CLOSER_ASSERT);
-        registerPairings(pairings, Set.of("annotation.arguments", "variable.property"),
+        registerPairings(pairings, Set.of("annotation.arguments", "match.section", "variable.property"),
                 MISSING_CLOSER_ANNOTATION, MISMATCHED_CLOSER_ANNOTATION);
         registerPairings(pairings, Set.of("function.signature", "signal.parameter", "variable.property"),
                 MISSING_CLOSER_PARAMETER_LIST, MISMATCHED_CLOSER_PARAMETER_LIST);
@@ -376,9 +408,9 @@ public final class DiagnosticCodes {
         // Explicit type slot codes
         pairings.put(MISSING_TYPE_VARIABLE, Set.of("variable.type", "variable.property"));
         pairings.put(MISSING_TYPE_CONSTANT, Set.of("constant.type", "variable.property"));
-        pairings.put(MISSING_TYPE_PARAMETER, Set.of("parameter.type", "variable.property"));
-        pairings.put(MISSING_TYPE_LAMBDA_PARAMETER, Set.of("parameter.type", "variable.property"));
-        pairings.put(MISSING_TYPE_SIGNAL_PARAMETER, Set.of("signal.parameter", "parameter.type"));
+        pairings.put(MISSING_TYPE_PARAMETER, Set.of("parameter.type", "function.signature", "variable.property"));
+        pairings.put(MISSING_TYPE_LAMBDA_PARAMETER, Set.of("parameter.type", "function.signature", "variable.property"));
+        pairings.put(MISSING_TYPE_SIGNAL_PARAMETER, Set.of("signal.parameter", "parameter.type", "variable.property"));
         pairings.put(MISSING_TYPE_RETURN_TYPE, Set.of("function.return_type", "variable.property"));
         pairings.put(MISSING_TYPE_FOR_ITERATOR, Set.of("for.iterator", "variable.property"));
 
@@ -387,14 +419,19 @@ public final class DiagnosticCodes {
         pairings.put(MISSING_SEPARATOR_MATCH_COLON, Set.of("match.section", "variable.property"));
         pairings.put(MISSING_SEPARATOR_SUITE_COLON, Set.of(
                 "if.condition", "elif.condition", "while.condition", "for.iterable",
-                "match.value", "function.signature", "variable.property"
+                "match.value", "function.signature", "class.body", "suite.body", "variable.property"
         ));
         pairings.put(MISSING_SEPARATOR_FOR_IN, Set.of("for.iterator", "for.iterable", "variable.property"));
         pairings.put(FOR_MISSING_ITERATOR, Set.of("for.iterator", "variable.property"));
         pairings.put(FOR_MISSING_IN, Set.of("for.iterator", "for.iterable", "variable.property"));
 
         registerPairings(pairings, Set.of("function.signature", "signal.parameter", "variable.property"),
-                SIGNATURE_MANDATORY_AFTER_OPTIONAL, SIGNATURE_REST_WITH_DEFAULT, SIGNATURE_PARAMETER_AFTER_REST);
+                SIGNATURE_MANDATORY_AFTER_OPTIONAL,
+                SIGNATURE_REST_WITH_DEFAULT,
+                SIGNATURE_PARAMETER_AFTER_REST,
+                SIGNATURE_DUPLICATE_PARAMETER
+        );
+        pairings.put(SIGNATURE_SIGNAL_PARAMETER_DEFAULT, Set.of("signal.parameter", "variable.property"));
         registerPairings(pairings, Set.of("variable.property"),
                 PROPERTY_DUPLICATE_GETTER, PROPERTY_DUPLICATE_SETTER, PROPERTY_INVALID_ACCESSOR);
         registerPairings(pairings, Set.of("match.pattern", "match.section", "match.dictionary_pattern", "dictionary.entry", "variable.property"),
@@ -402,9 +439,12 @@ public final class DiagnosticCodes {
         pairings.put(LAMBDA_BARE_STATEMENT, Set.of("expression", "variable.property"));
         pairings.put(FUNCTION_INVALID_STATIC_INIT, Set.of("function.signature", "function.name"));
         pairings.put(CLASS_DUPLICATE_EXTENDS, Set.of("class.extends"));
+        registerPairings(pairings, Set.of("annotation.target", "match.section", "variable.property"),
+                ANNOTATION_DANGLING, ANNOTATION_INVALID_LEVEL);
         registerPairings(pairings, Set.of("annotation.target", "variable.property"),
-                ANNOTATION_DANGLING, ANNOTATION_INVALID_TARGET, ANNOTATION_INVALID_LEVEL);
-        pairings.put(DECLARATION_MISSING_NAME, Set.of("declaration.name", "function.name", "variable.property"));
+                ANNOTATION_INVALID_TARGET);
+        pairings.put(DECLARATION_MISSING_NAME, Set.of(
+                "declaration.name", "function.name", "enum.body", "function.signature", "signal.parameter", "variable.property"));
 
         // Standalone-allowed codes may also be attributed to any valid construct facet when claimed
         // inside that construct (e.g. a lexical error claimed by an open statement frame).

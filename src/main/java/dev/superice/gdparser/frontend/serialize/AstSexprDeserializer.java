@@ -3,6 +3,7 @@ package dev.superice.gdparser.frontend.serialize;
 import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.Range;
 import dev.superice.gdparser.frontend.ast.SourceFile;
+import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import org.jetbrains.annotations.NotNull;
 
 import java.lang.reflect.RecordComponent;
@@ -171,6 +172,10 @@ public final class AstSexprDeserializer {
     private static Object defaultValueForMissingComponent(RecordComponent component) {
         if (component.getType() == Range.class && component.getName().equals("range")) {
             return ZERO_RANGE;
+        }
+        if (component.getDeclaringRecord() == VariableDeclaration.class
+                && component.getName().equals("recoveryAnnotations")) {
+            return List.of();
         }
         return null;
     }

@@ -1,6 +1,7 @@
 package dev.superice.gdparser.frontend.serialize;
 
 import dev.superice.gdparser.frontend.ast.SourceFile;
+import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import org.jetbrains.annotations.NotNull;
 
 import java.lang.reflect.RecordComponent;
@@ -106,8 +107,12 @@ public final class AstSexprSerializer {
         builder.append('(').append(meta.tag());
 
         for (var component : meta.components()) {
+            var componentValue = readComponentValue(component, value);
+            if (shouldOmitEmptyRecoveryAnnotations(meta.type(), component, componentValue)) {
+                continue;
+            }
             builder.append(" (").append(component.getName()).append(' ');
-            writeValue(readComponentValue(component, value), builder);
+            writeValue(componentValue, builder);
             builder.append(')');
         }
 
@@ -123,9 +128,12 @@ public final class AstSexprSerializer {
             if (!shouldIncludePrettyComponent(component, prettyMode)) {
                 continue;
             }
+            var componentValue = readComponentValue(component, value);
+            if (shouldOmitEmptyRecoveryAnnotations(meta.type(), component, componentValue)) {
+                continue;
+            }
 
             wroteComponent = true;
-            var componentValue = readComponentValue(component, value);
             builder.append('\n');
             appendIndent(builder, indentLevel + 1);
             builder.append('(').append(component.getName());
@@ -157,6 +165,17 @@ public final class AstSexprSerializer {
 
     private static boolean shouldIncludePrettyComponent(RecordComponent component, PrettyMode prettyMode) {
         return prettyMode != PrettyMode.OMIT_RANGE || !"range".equals(component.getName());
+    }
+
+    private static boolean shouldOmitEmptyRecoveryAnnotations(
+            Class<?> recordType,
+            RecordComponent component,
+            Object componentValue
+    ) {
+        return recordType == VariableDeclaration.class
+                && "recoveryAnnotations".equals(component.getName())
+                && componentValue instanceof List<?> list
+                && list.isEmpty();
     }
 
     private static boolean writeScalarValue(Object value, StringBuilder builder) {
@@ -224,6 +243,6 @@ public final class AstSexprSerializer {
     }
 
     private static void appendIndent(StringBuilder builder, int indentLevel) {
-        builder.append(INDENT.repeat(indentLevel));
+        builder.repeat(INDENT, indentLevel);
     }
 }

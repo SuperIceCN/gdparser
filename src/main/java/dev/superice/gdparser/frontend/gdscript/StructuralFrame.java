@@ -51,6 +51,7 @@ final class StructuralFrame {
     final @Nullable String mismatchedCloserCode;
     @NotNull SeparatorPhase separatorPhase = SeparatorPhase.NONE;
     boolean allowsTypeComma;
+    boolean parsingDictionaryKey;
     boolean pendingSync;
     boolean settled;
     byte unclosedParamListCache = -1;

@@ -43,6 +43,8 @@ import dev.superice.gdparser.frontend.ast.PatternBindingExpression;
 import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.PreloadExpression;
 import dev.superice.gdparser.frontend.ast.Range;
+import dev.superice.gdparser.frontend.ast.RecoveredInfixExpression;
+import dev.superice.gdparser.frontend.ast.RecoveryLink;
 import dev.superice.gdparser.frontend.ast.RegionDirectiveStatement;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
 import dev.superice.gdparser.frontend.ast.SelfExpression;
@@ -705,10 +707,39 @@ class GdScriptParserTest {
     }
 
     @Test
-    void staticInitIsAPlainFunctionDeclaration() {
+    void staticInitIsAPlainFunctionDeclarationAndEnforcesSignatureRules() {
         var ast = cleanAst("static func _static_init(): pass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         assertEquals("_static_init", function.name());
+        assertTrue(function.isStatic());
+
+        var typedClean = cleanAst("static func _static_init() -> void:\n\treturn\n");
+        assertEquals("void", requireNotNull(assertInstanceOf(FunctionDeclaration.class, onlyStatement(typedClean))
+                .returnType()).sourceText());
+
+        // Same-named lambda expression is unaffected by `_static_init` rules.
+        var lambdaClean = cleanAst("var f = func _static_init(a): return a\n");
+        var lambdaVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(lambdaClean));
+        assertEquals("_static_init", assertInstanceOf(LambdaExpression.class, lambdaVar.value()).name());
+
+        var nonStatic = parse("func _static_init(): pass\n");
+        var nonStaticFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(nonStatic.ast()));
+        assertEquals(List.of("Static constructor must be declared static."), errorMessages(nonStatic));
+        assertEquals(DiagnosticCodes.FUNCTION_INVALID_STATIC_INIT, nonStatic.diagnostics().getFirst().code());
+        assertEquals(new RecoveryLink(nonStaticFn, "function.signature"), nonStatic.diagnostics().getFirst().recovery());
+
+        var withParams = parse("static func _static_init(a, ...rest): pass\n");
+        var withParamsFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(withParams.ast()));
+        assertEquals(List.of("Static constructor cannot have parameters."), errorMessages(withParams));
+        assertEquals(DiagnosticCodes.FUNCTION_INVALID_STATIC_INIT, withParams.diagnostics().getFirst().code());
+        assertEquals(new RecoveryLink(withParamsFn, "function.signature"), withParams.diagnostics().getFirst().recovery());
+
+        var bothInvalid = parse("func _static_init(a): pass\n");
+        var bothFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(bothInvalid.ast()));
+        assertEquals(2, bothInvalid.diagnostics().size(), () -> bothInvalid.diagnostics().toString());
+        assertTrue(bothInvalid.diagnostics().stream()
+                .allMatch(d -> DiagnosticCodes.FUNCTION_INVALID_STATIC_INIT.equals(d.code())
+                        && new RecoveryLink(bothFn, "function.signature").equals(d.recovery())));
     }
 
     @Test
@@ -892,10 +923,18 @@ class GdScriptParserTest {
 
     @Test
     void multipleSameLineAnnotationsExtendStatementStart() {
-        var ast = cleanAst("@export @rpc var x = 1\n");
+        var ast = cleanAst("@export @onready var x = 1\n");
         assertEquals(3, ast.statements().size());
         var variable = assertInstanceOf(VariableDeclaration.class, ast.statements().get(2));
         assertEquals(0, variable.range().startByte());
+
+        var invalidTarget = parse("@export @rpc var y = 1\n");
+        var rpc = assertInstanceOf(AnnotationStatement.class, invalidTarget.ast().statements().get(1));
+        var targetErrors = invalidTarget.diagnostics().stream()
+                .filter(d -> DiagnosticCodes.ANNOTATION_INVALID_TARGET.equals(d.code()))
+                .toList();
+        assertEquals(1, targetErrors.size(), () -> invalidTarget.diagnostics().toString());
+        assertEquals(new RecoveryLink(rpc, "annotation.target"), targetErrors.getFirst().recovery());
     }
 
     @Test
@@ -1013,15 +1052,154 @@ class GdScriptParserTest {
     }
 
     @Test
-    void unarySignBindsWeakerThanPowerLikeGodot() {
-        // Godot anchors `-2 ** 2` as `-(2 ** 2)` (PREC_SIGN below PREC_POWER); the tree-sitter
-        // path produces `(-2) ** 2` (registered precedence divergence).
-        var ast = cleanAst("const A = -2 ** 2\n");
-        var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
-        var unary = assertInstanceOf(UnaryExpression.class, constant.value());
-        assertEquals("-", unary.operator());
-        var power = assertInstanceOf(BinaryExpression.class, unary.operand());
-        assertEquals("**", power.operator());
+    void tightNumericSignBindsLikeGodotAndSpacedSignUsesPrecSign() {
+        // Godot's tokenizer absorbs an immediately adjacent `+`/`-` into integer/decimal-prefixed
+        // float tokens in prefix position, placing tight signed numbers above `**` and suffix
+        // chains; spaced signs, `.5`, variables, and double signs still parse at `PREC_SIGN`
+        // (below `**`), while binary subtraction (`1-2 ** 2`) stays infix at `ADDITION_SUBTRACTION`.
+        // The AST always retains an explicit `UnaryExpression` with an unsigned numeric literal.
+        for (var tightPower : List.of(
+                new String[]{"const A = -2 ** 2\n", "-", "2"},
+                new String[]{"const A = +2 ** 2\n", "+", "2"},
+                new String[]{"const A = -0x2 ** 2\n", "-", "0x2"},
+                new String[]{"const A = -0b10 ** 2\n", "-", "0b10"},
+                new String[]{"const A = -0.5 ** 2\n", "-", "0.5"}
+        )) {
+            var ast = cleanAst(tightPower[0]);
+            var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+            var power = assertInstanceOf(BinaryExpression.class, constant.value());
+            assertEquals("**", power.operator());
+            var unary = assertInstanceOf(UnaryExpression.class, power.left());
+            assertEquals(tightPower[1], unary.operator());
+            var lit = assertInstanceOf(LiteralExpression.class, unary.operand());
+            assertEquals(tightPower[2], lit.sourceText());
+        }
+
+        // Spaced sign, variable operand, and dot-prefixed float `.5` stay at PREC_SIGN outside `**`.
+        for (var spacedPower : List.of(
+                "const A = - 2 ** 2\n",
+                "const A = -n ** 2\n",
+                "const A = -.5 ** 2\n"
+        )) {
+            var ast = cleanAst(spacedPower);
+            var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+            var unary = assertInstanceOf(UnaryExpression.class, constant.value());
+            assertEquals("-", unary.operator());
+            var power = assertInstanceOf(BinaryExpression.class, unary.operand());
+            assertEquals("**", power.operator());
+        }
+
+        // `-2.5.abs()` folds as `(-2.5).abs()` (tight sign binds above `.` attribute access; the
+        // second `.` also emits Godot's tokenizer error for a second decimal point in a float).
+        var methodRes = parse("const A = -2.5.abs()\n");
+        assertEquals(List.of("Cannot use a decimal point twice in a number."), errorMessages(methodRes));
+        var methodAttr = assertInstanceOf(AttributeExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(methodRes.ast())).value());
+        var methodUnary = assertInstanceOf(UnaryExpression.class, methodAttr.base());
+        assertEquals("-", methodUnary.operator());
+        assertEquals("2.5", assertInstanceOf(LiteralExpression.class, methodUnary.operand()).sourceText());
+        assertEquals("abs", assertInstanceOf(AttributeCallStep.class, methodAttr.steps().getFirst()).name());
+
+        // Clean suffix comparison: tight `-2[0]` -> `(-2)[0]`, spaced `- 2[0]` -> `-(2[0])`.
+        var tightSubAst = cleanAst("const A = -2[0]\n");
+        var tightSub = assertInstanceOf(SubscriptExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(tightSubAst)).value());
+        assertInstanceOf(UnaryExpression.class, tightSub.base());
+
+        var spacedSubAst = cleanAst("const A = - 2[0]\n");
+        var spacedSubUnary = assertInstanceOf(UnaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(spacedSubAst)).value());
+        assertInstanceOf(SubscriptExpression.class, spacedSubUnary.operand());
+
+        // Left-associative `**` with tight vs spaced right operand.
+        var leftAssoc = cleanAst("const A = -2 ** 2 ** 3\n");
+        var leftAssocOuter = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(leftAssoc)).value());
+        assertEquals("**", leftAssocOuter.operator());
+        var leftAssocInner = assertInstanceOf(BinaryExpression.class, leftAssocOuter.left());
+        assertEquals("**", leftAssocInner.operator());
+        assertInstanceOf(UnaryExpression.class, leftAssocInner.left());
+
+        var midTight = cleanAst("const A = 2 ** -2 ** 3\n");
+        var midTightOuter = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(midTight)).value());
+        var midTightInner = assertInstanceOf(BinaryExpression.class, midTightOuter.left());
+        assertInstanceOf(UnaryExpression.class, midTightInner.right());
+
+        var midSpaced = cleanAst("const A = 2 ** - 2 ** 3\n");
+        var midSpacedOuter = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(midSpaced)).value());
+        var midSpacedUnary = assertInstanceOf(UnaryExpression.class, midSpacedOuter.right());
+        assertInstanceOf(BinaryExpression.class, midSpacedUnary.operand());
+
+        // Double unary `--2 ** 2` -> `-((-2) ** 2)`.
+        var doubleUnary = cleanAst("const A = --2 ** 2\n");
+        var outerNeg = assertInstanceOf(UnaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(doubleUnary)).value());
+        var doublePower = assertInstanceOf(BinaryExpression.class, outerNeg.operand());
+        assertEquals("**", doublePower.operator());
+        assertInstanceOf(UnaryExpression.class, doublePower.left());
+
+        // Binary subtraction `1-2 ** 2` -> `1 - (2 ** 2)`.
+        var subPower = cleanAst("const A = 1-2 ** 2\n");
+        var subExpr = assertInstanceOf(BinaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(subPower)).value());
+        assertEquals("-", subExpr.operator());
+        assertInstanceOf(BinaryExpression.class, subExpr.right());
+
+        // Type test `-2 is int` vs `- 2 is int`.
+        var tightIs = cleanAst("const A = -2 is int\n");
+        var tightIsExpr = assertInstanceOf(TypeTestExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(tightIs)).value());
+        assertInstanceOf(UnaryExpression.class, tightIsExpr.value());
+        assertEquals("int", tightIsExpr.targetType().sourceText());
+
+        var spacedIs = cleanAst("const A = - 2 is int\n");
+        var spacedIsUnary = assertInstanceOf(UnaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(spacedIs)).value());
+        assertInstanceOf(TypeTestExpression.class, spacedIsUnary.operand());
+
+        // Infix subtraction in expression contexts and multiline groupings must stay binary `-`.
+        for (var binaryCase : List.of(
+                "var a = 1-2\n",
+                "var a = x-2\n",
+                "var a = a[0]-2\n",
+                "var a = f()-2\n",
+                "var a = (x)-2\n",
+                "var a = (\n\t1\n\t-2\n)\n"
+        )) {
+            var binAst = cleanAst(binaryCase);
+            var binExpr = assertInstanceOf(BinaryExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, onlyStatement(binAst)).value());
+            assertEquals("-", binExpr.operator());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, binExpr.right()).sourceText());
+        }
+
+        // Unsigned numeric token + AST invariant for `Long.MIN_VALUE` magnitude (`-9223372036854775808`).
+        var minSource = "const MIN = -9223372036854775808\n";
+        var tokenizer = GdTokenizer.managed(minSource);
+        GdToken minNumberToken = null;
+        while (true) {
+            var token = tokenizer.scan();
+            if (token.type() == GdTokenType.LITERAL) {
+                minNumberToken = token;
+                break;
+            }
+            if (token.type() == GdTokenType.EOF) {
+                break;
+            }
+        }
+        assertNotNull(minNumberToken);
+        assertEquals(GdLiteralKind.INTEGER, minNumberToken.literalKind());
+        assertEquals("9223372036854775808", minNumberToken.source());
+
+        var minAst = cleanAst(minSource);
+        var minUnary = assertInstanceOf(UnaryExpression.class,
+                assertInstanceOf(VariableDeclaration.class, onlyStatement(minAst)).value());
+        assertEquals("-", minUnary.operator());
+        var minLiteral = assertInstanceOf(LiteralExpression.class, minUnary.operand());
+        assertEquals("integer", minLiteral.kind());
+        assertEquals("9223372036854775808", minLiteral.sourceText());
     }
 
     @Test
@@ -1576,14 +1754,31 @@ class GdScriptParserTest {
 
     @Test
     void castAndTypeTestMissingType() {
-        // A missing type reports and degrades the expression to the left operand.
+        // Missing type emits the context code and preserves a `RecoveredInfixExpression`.
         var castResult = parse("var a = x as\n");
         assertTrue(errorMessages(castResult).contains("Expected type specifier after \"as\"."));
-        assertInstanceOf(IdentifierExpression.class,
+        var castNode = assertInstanceOf(RecoveredInfixExpression.class,
                 assertInstanceOf(VariableDeclaration.class, castResult.ast().statements().getFirst()).value());
+        assertEquals("as", castNode.operator());
+        assertEquals("x", assertInstanceOf(IdentifierExpression.class, castNode.operand()).name());
+        assertEquals(CstIssueKind.MISSING, castNode.problem().kind());
+        assertEquals("cast.type", castNode.problem().nodeType());
 
-        assertTrue(errorMessages(parse("var b = x is\n")).contains("Expected type specifier after \"is\"."));
-        assertTrue(errorMessages(parse("var c = x is not\n")).contains("Expected type specifier after \"is not\"."));
+        var isResult = parse("var b = x is\n");
+        assertTrue(errorMessages(isResult).contains("Expected type specifier after \"is\"."));
+        var isNode = assertInstanceOf(RecoveredInfixExpression.class,
+                assertInstanceOf(VariableDeclaration.class, isResult.ast().statements().getFirst()).value());
+        assertEquals("is", isNode.operator());
+        assertEquals(CstIssueKind.MISSING, isNode.problem().kind());
+        assertEquals("type_test.type", isNode.problem().nodeType());
+
+        var isNotResult = parse("var c = x is not\n");
+        assertTrue(errorMessages(isNotResult).contains("Expected type specifier after \"is not\"."));
+        var isNotNode = assertInstanceOf(RecoveredInfixExpression.class,
+                assertInstanceOf(VariableDeclaration.class, isNotResult.ast().statements().getFirst()).value());
+        assertEquals("is not", isNotNode.operator());
+        assertEquals(CstIssueKind.MISSING, isNotNode.problem().kind());
+        assertEquals("type_test.type", isNotNode.problem().nodeType());
     }
 
     @Test
@@ -1608,11 +1803,22 @@ class GdScriptParserTest {
 
     @Test
     void ternaryErrors() {
-        assertTrue(errorMessages(parse("var a = 1 if c\n"))
-                .contains("Expected \"else\" after ternary operator condition."));
+        var missingElse = parse("var a = 1 if c\n");
+        assertEquals(List.of("Expected \"else\" after ternary operator condition."), errorMessages(missingElse));
+        var missingElseCond = assertInstanceOf(ConditionalExpression.class,
+                assertInstanceOf(VariableDeclaration.class, missingElse.ast().statements().getFirst()).value());
+        var missingElseBranch = assertInstanceOf(ErrorExpression.class, missingElseCond.right());
+        assertEquals(CstIssueKind.MISSING, missingElseBranch.kind());
+        assertEquals("ternary.else", missingElseBranch.nodeType());
+
         assertTrue(errorMessages(parse("var b = 1 if else 2\n"))
                 .contains("Expected expression as ternary condition after \"if\"."));
         assertTrue(errorMessages(parse("var c = 1 if c else\n")).contains("Expected expression after \"else\"."));
+
+        // Same-line trailing token after missing `else` still reports the missing `else`.
+        var sameLineMissingElse = parse("var d = 1 if c 2\n");
+        assertTrue(errorMessages(sameLineMissingElse)
+                .contains("Expected \"else\" after ternary operator condition."));
     }
 
     @Test
@@ -1648,6 +1854,16 @@ class GdScriptParserTest {
     void questionMarkReportsTernaryHint() {
         assertTrue(errorMessages(parse("var a = x ? y : z\n")).contains(
                 "Unexpected \"?\" in source. If you want a ternary operator, use \"truthy_value if true_condition else falsy_value\"."));
+
+        var bare = parse("var a = x ?\n");
+        assertEquals(List.of("Unexpected \"?\" in source. If you want a ternary operator, use \"truthy_value if true_condition else falsy_value\"."),
+                errorMessages(bare));
+        var recovered = assertInstanceOf(RecoveredInfixExpression.class,
+                assertInstanceOf(VariableDeclaration.class, bare.ast().statements().getFirst()).value());
+        assertEquals("?", recovered.operator());
+        assertEquals("x", assertInstanceOf(IdentifierExpression.class, recovered.operand()).name());
+        assertEquals(CstIssueKind.ERROR, recovered.problem().kind());
+        assertEquals("?", recovered.problem().sourceText());
     }
 
     @Test
@@ -1684,15 +1900,16 @@ class GdScriptParserTest {
     }
 
     @Test
-    void assignmentTargetCheckIsDeferredByDesign() {
-        // The vendor's assignee node-type check is a parse-time semantic check outside the
-        // ported set (left to the analysis layer); the invalid target produces an
-        // AssignmentExpression for the analyzer to reject, with no parser diagnostic.
-        var ast = cleanAst("func f():\n\t1 = 2\n");
-        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
-        var assignment = assertInstanceOf(AssignmentExpression.class,
-                assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst()).expression());
+    void assignmentTargetCheckRejectsInvalidTargetWhileRetainingAst() {
+        var result = parse("func f():\n\t1 = 2\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(result.ast()));
+        var exprStmt = assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst());
+        var assignment = assertInstanceOf(AssignmentExpression.class, exprStmt.expression());
         assertInstanceOf(LiteralExpression.class, assignment.left());
+        assertInstanceOf(LiteralExpression.class, assignment.right());
+        assertEquals(1, result.diagnostics().size(), () -> result.diagnostics().toString());
+        assertEquals(DiagnosticCodes.ASSIGNMENT_INVALID_TARGET, result.diagnostics().getFirst().code());
+        assertEquals(new RecoveryLink(exprStmt, "expression"), result.diagnostics().getFirst().recovery());
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1866,14 +2083,32 @@ class GdScriptParserTest {
     }
 
     @Test
-    void danglingAnnotationInsideAccessorSuiteIsDiscarded() {
-        var ast = cleanAst("var x:\n\tget:\n\t\tpass\n\t\t@export\nvar y = 1\n");
-        // The accessor suite's content is discarded entirely; its dangling annotation must not
-        // leak onto the next outer member.
-        assertEquals(2, ast.statements().size());
-        assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
-        var y = assertInstanceOf(VariableDeclaration.class, ast.statements().get(1));
-        assertEquals("y", y.name());
+    void danglingAnnotationInsideAccessorSuiteIsRetainedAsRecoveryChild() {
+        var invalidLevel = parse("var x:\n\tget:\n\t\tpass\n\t\t@export\nvar y = 1\n");
+        assertEquals(2, invalidLevel.ast().statements().size());
+        var xInvalid = assertInstanceOf(VariableDeclaration.class, invalidLevel.ast().statements().getFirst());
+        assertEquals(1, xInvalid.recoveryAnnotations().size());
+        assertEquals("export", xInvalid.recoveryAnnotations().getFirst().name());
+        var levelErrors = invalidLevel.diagnostics().stream()
+                .filter(d -> DiagnosticCodes.ANNOTATION_INVALID_LEVEL.equals(d.code()))
+                .toList();
+        assertEquals(1, levelErrors.size(), () -> invalidLevel.diagnostics().toString());
+        assertEquals(new RecoveryLink(xInvalid, "variable.property"), levelErrors.getFirst().recovery());
+        var yClean = assertInstanceOf(VariableDeclaration.class, invalidLevel.ast().statements().get(1));
+        assertEquals("y", yClean.name());
+        assertTrue(yClean.recoveryAnnotations().isEmpty());
+
+        var dangling = parse("var x:\n\tget:\n\t\tpass\n\t\t@warning_ignore(\"unused\")\nvar y = 1\n");
+        assertEquals(2, dangling.ast().statements().size());
+        var xDangling = assertInstanceOf(VariableDeclaration.class, dangling.ast().statements().getFirst());
+        assertEquals(1, xDangling.recoveryAnnotations().size());
+        assertEquals("warning_ignore", xDangling.recoveryAnnotations().getFirst().name());
+        var danglingErrors = dangling.diagnostics().stream()
+                .filter(d -> DiagnosticCodes.ANNOTATION_DANGLING.equals(d.code()))
+                .toList();
+        assertEquals(1, danglingErrors.size(), () -> dangling.diagnostics().toString());
+        assertEquals(new RecoveryLink(xDangling, "variable.property"), danglingErrors.getFirst().recovery());
+        assertEquals("y", assertInstanceOf(VariableDeclaration.class, dangling.ast().statements().get(1)).name());
     }
 
     @Test
@@ -1891,27 +2126,85 @@ class GdScriptParserTest {
     }
 
     @Test
-    void extendsBeforeClassNameDoesNotDuplicateLikeGodot() {
-        // Godot only checks the duplicate on the standalone `extends` line; a same-line extends
-        // inside `class_name` is parsed unconditionally (anchored vendor behavior, do not
-        // "fix" this into an error).
-        var result = parse("extends A\nclass_name C extends B\n");
-        assertFalse(errorMessages(result).contains("\"extends\" can only be used once."),
-                () -> errorMessages(result).toString());
-        assertEquals("B", assertInstanceOf(ClassNameStatement.class, result.ast().statements().get(1))
-                .extendsTarget());
+    void singleExtendsSlotUsesFirstWinsAcrossDirectionsAndNestedClasses() {
+        // Root `extends` before `class_name ... extends ...`: keep first `ExtendsStatement("A")`
+        // and leave `ClassNameStatement`'s `extendsTarget` null while reporting duplicate extends.
+        var rootFirst = parse("extends A\nclass_name C extends B\n");
+        var rootFirstDup = rootFirst.diagnostics().stream()
+                .filter(d -> DiagnosticCodes.CLASS_DUPLICATE_EXTENDS.equals(d.code()))
+                .toList();
+        assertEquals(1, rootFirstDup.size(), () -> rootFirst.diagnostics().toString());
+        assertEquals(2, rootFirst.ast().statements().size());
+        assertEquals("A", assertInstanceOf(ExtendsStatement.class, rootFirst.ast().statements().getFirst()).target());
+        var rootFirstClassName = assertInstanceOf(ClassNameStatement.class, rootFirst.ast().statements().get(1));
+        assertEquals("C", rootFirstClassName.name());
+        assertNull(rootFirstClassName.extendsTarget());
+        assertEquals(new RecoveryLink(rootFirstClassName, "class.extends"), rootFirstDup.getFirst().recovery());
+
+        // Reverse order: keep `ClassNameStatement("C", "A")` and emit no second valid `ExtendsStatement`.
+        var classNameFirst = parse("class_name C extends A\nextends B\nvar ok = 1\n");
+        var classNameFirstDup = classNameFirst.diagnostics().stream()
+                .filter(d -> DiagnosticCodes.CLASS_DUPLICATE_EXTENDS.equals(d.code()))
+                .toList();
+        assertEquals(1, classNameFirstDup.size(), () -> classNameFirst.diagnostics().toString());
+        assertEquals(2, classNameFirst.ast().statements().size(), () -> classNameFirst.ast().statements().toString());
+        var firstClassName = assertInstanceOf(ClassNameStatement.class, classNameFirst.ast().statements().getFirst());
+        assertEquals("A", firstClassName.extendsTarget());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, classNameFirst.ast().statements().get(1)).name());
+        assertEquals(new RecoveryLink(firstClassName, "class.extends"), classNameFirstDup.getFirst().recovery());
+
+        // Bad first target still claims the `extends` slot so a second `extends B` is rejected.
+        var badFirstRoot = parse("extends\nextends B\n");
+        assertTrue(badFirstRoot.diagnostics().stream()
+                        .anyMatch(d -> DiagnosticCodes.CLASS_DUPLICATE_EXTENDS.equals(d.code())),
+                () -> badFirstRoot.diagnostics().toString());
+        assertEquals(1, badFirstRoot.ast().statements().size());
+        assertNull(assertInstanceOf(ExtendsStatement.class, badFirstRoot.ast().statements().getFirst()).target());
+
+        var nestedBadFirst = parse("class Inner extends :\n\textends B\n\tpass\n");
+        var nestedInner = assertInstanceOf(ClassDeclaration.class, onlyStatement(nestedBadFirst.ast()));
+        assertNull(nestedInner.extendsTarget());
+        assertTrue(nestedBadFirst.diagnostics().stream()
+                        .anyMatch(d -> DiagnosticCodes.CLASS_DUPLICATE_EXTENDS.equals(d.code())),
+                () -> nestedBadFirst.diagnostics().toString());
+
+        var nestedGoodFirst = parse("class Inner extends A:\n\textends B\n\tpass\n");
+        var nestedGoodInner = assertInstanceOf(ClassDeclaration.class, onlyStatement(nestedGoodFirst.ast()));
+        assertEquals("A", nestedGoodInner.extendsTarget());
+        assertTrue(nestedGoodFirst.diagnostics().stream()
+                        .anyMatch(d -> DiagnosticCodes.CLASS_DUPLICATE_EXTENDS.equals(d.code())),
+                () -> nestedGoodFirst.diagnostics().toString());
+
+        // Independent scopes (`root` vs each nested class) each get their own `extends` slot.
+        var independent = cleanAst("""
+                extends RootBase
+                class Inner extends InnerBase:
+                \tpass
+                class Inner2:
+                \textends Inner2Base
+                \tpass
+                """);
+        assertEquals(3, independent.statements().size());
+        assertEquals("RootBase", assertInstanceOf(ExtendsStatement.class, independent.statements().getFirst()).target());
+        assertEquals("InnerBase", assertInstanceOf(ClassDeclaration.class, independent.statements().get(1)).extendsTarget());
+        assertEquals("Inner2Base", assertInstanceOf(ClassDeclaration.class, independent.statements().get(2)).extendsTarget());
     }
 
     @Test
     void trailingAnnotationStaysInItsOwnScope() {
-        var ast = cleanAst("func f():\n\tpass\n\t@x\nvar outside = 1\n");
-        // The annotation dangles at the end of f's suite; it must stay in that scope instead of
-        // escaping onto the next outer member.
-        var function = assertInstanceOf(FunctionDeclaration.class, ast.statements().getFirst());
+        var result = parse("func f():\n\tpass\n\t@x\nvar outside = 1\n");
+        // The annotation dangles at the end of f's suite; it stays in that scope with
+        // ANNOTATION_DANGLING instead of escaping onto the next outer member.
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
         assertEquals(2, function.body().statements().size());
-        assertInstanceOf(AnnotationStatement.class, function.body().statements().get(1));
-        assertEquals(2, ast.statements().size());
-        assertInstanceOf(VariableDeclaration.class, ast.statements().get(1));
+        var annotation = assertInstanceOf(AnnotationStatement.class, function.body().statements().get(1));
+        assertEquals(2, result.ast().statements().size());
+        assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1));
+        var dangling = result.diagnostics().stream()
+                .filter(d -> DiagnosticCodes.ANNOTATION_DANGLING.equals(d.code()))
+                .toList();
+        assertEquals(1, dangling.size(), () -> result.diagnostics().toString());
+        assertEquals(new RecoveryLink(annotation, "annotation.target"), dangling.getFirst().recovery());
     }
 
     @Test
@@ -2042,15 +2335,38 @@ class GdScriptParserTest {
     }
 
     @Test
-    void callWrapsNonPropertyChainEnd() {
-        // A call that does not follow `.name` wraps the expression built so far instead of
-        // folding into the attribute chain.
-        var ast = cleanAst("const A = a.b(1)(2)\n");
-        var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
+    void callWrapsNonPropertyChainEndAndRejectsInvalidDirectCallee() {
+        // A call that does not follow `.name` wraps the expression built so far and emits
+        // `CALL_INVALID_CALLEE` while retaining the AST shape.
+        var result = parse("const A = a.b(1)(2)\n");
+        var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(result.ast()));
         var outerCall = assertInstanceOf(dev.superice.gdparser.frontend.ast.CallExpression.class, constant.value());
         var chain = assertInstanceOf(AttributeExpression.class, outerCall.callee());
         assertEquals(1, chain.steps().size());
         assertInstanceOf(AttributeCallStep.class, chain.steps().getFirst());
+        assertEquals(1, result.diagnostics().size(), () -> result.diagnostics().toString());
+        assertEquals(DiagnosticCodes.CALL_INVALID_CALLEE, result.diagnostics().getFirst().code());
+        assertEquals(new RecoveryLink(constant, "constant.value"), result.diagnostics().getFirst().recovery());
+
+        // Valid direct calls (`(f)(1)`, `obj.method()`, `f(1).call(2)`) remain clean.
+        cleanAst("const A = (f)(1)\nconst B = obj.method()\nconst C = f(1).call(2)\n");
+    }
+
+    @Test
+    void spacedInferredTypeMarkersPreserveSourceTextAndRange() {
+        var varAst = cleanAst("var y : = 2\nvar z :\t= 3\n");
+        var y = assertInstanceOf(VariableDeclaration.class, varAst.statements().getFirst());
+        assertEquals(": =", requireNotNull(y.type()).sourceText());
+        assertEquals(new Range(6, 9, new Point(0, 6), new Point(0, 9)), y.type().range());
+        var z = assertInstanceOf(VariableDeclaration.class, varAst.statements().get(1));
+        assertEquals(":\t=", requireNotNull(z.type()).sourceText());
+        assertEquals(new Range(18, 21, new Point(1, 6), new Point(1, 9)), z.type().range());
+
+        var constAndParam = cleanAst("const C : = 2\nfunc f(p : = 4): pass\n");
+        var c = assertInstanceOf(VariableDeclaration.class, constAndParam.statements().getFirst());
+        assertEquals(": =", requireNotNull(c.type()).sourceText());
+        var f = assertInstanceOf(FunctionDeclaration.class, constAndParam.statements().get(1));
+        assertEquals(": =", requireNotNull(f.parameters().getFirst().type()).sourceText());
     }
 
     @Test
@@ -2447,17 +2763,71 @@ class GdScriptParserTest {
 
     @Test
     void matchRestPatternMisuseErrors() {
-        var branchLevel = parse("func f(v):\n\tmatch v:\n\t\t..:\n\t\t\tpass\n");
+        var branchSource = "func f(v):\n\tmatch v:\n\t\t..:\n\t\t\tpass\n";
+        var branchLevel = parse(branchSource);
         assertTrue(errorMessages(branchLevel).contains(
                 "Rest pattern can only be used inside array and dictionary patterns."));
+        var branchDiag = branchLevel.diagnostics().stream()
+                .filter(d -> DiagnosticCodes.MATCH_REST_MISPLACED.equals(d.code()))
+                .findFirst()
+                .orElseThrow();
+        var branchStart = branchSource.indexOf("..");
+        assertEquals(branchStart, branchDiag.range().startByte());
+        assertEquals(branchStart + 2, branchDiag.range().endByte());
+        var branchSection = assertInstanceOf(MatchStatement.class,
+                assertInstanceOf(FunctionDeclaration.class, branchLevel.ast().statements().getFirst())
+                        .body().statements().getFirst())
+                .sections().getFirst();
+        var branchError = assertInstanceOf(ErrorExpression.class, branchSection.patterns().getFirst());
+        assertEquals(CstIssueKind.ERROR, branchError.kind());
+        assertEquals("..", branchError.sourceText());
+
         var arrayTrailing = parse("func f(v):\n\tmatch v:\n\t\t[1, .., 2]:\n\t\t\tpass\n");
         assertTrue(errorMessages(arrayTrailing).contains(
                 "The \"..\" pattern must be the last element in the pattern array."));
+        assertTrue(arrayTrailing.diagnostics().stream()
+                .anyMatch(d -> DiagnosticCodes.MATCH_REST_NOT_LAST.equals(d.code())));
+        var arrayPattern = assertInstanceOf(ArrayExpression.class,
+                assertInstanceOf(MatchStatement.class,
+                        assertInstanceOf(FunctionDeclaration.class, arrayTrailing.ast().statements().getFirst())
+                                .body().statements().getFirst())
+                        .sections().getFirst().patterns().getFirst());
+        assertEquals(2, arrayPattern.elements().size());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, arrayPattern.elements().get(1)).sourceText());
+
         var dictTrailing = parse("func f(v):\n\tmatch v:\n\t\t{.., \"k\": 1}:\n\t\t\tpass\n");
         assertTrue(errorMessages(dictTrailing).contains(
                 "The \"..\" pattern must be the last element in the pattern dictionary."));
-        var restValue = parse("func f(v):\n\tmatch v:\n\t\t{\"k\": ..}:\n\t\t\tpass\n");
+        assertTrue(dictTrailing.diagnostics().stream()
+                .anyMatch(d -> DiagnosticCodes.MATCH_REST_NOT_LAST.equals(d.code())));
+        var dictTrailingExpr = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(MatchStatement.class,
+                        assertInstanceOf(FunctionDeclaration.class, dictTrailing.ast().statements().getFirst())
+                                .body().statements().getFirst())
+                        .sections().getFirst().patterns().getFirst());
+        assertEquals(1, dictTrailingExpr.entries().size());
+        assertEquals("\"k\"", assertInstanceOf(LiteralExpression.class, dictTrailingExpr.entries().getFirst().key()).sourceText());
+
+        var restValueSource = "func f(v):\n\tmatch v:\n\t\t{\"k\": ..}:\n\t\t\tpass\n";
+        var restValue = parse(restValueSource);
         assertTrue(errorMessages(restValue).contains("The \"..\" pattern cannot be used as a value."));
+        var restValueDiag = restValue.diagnostics().stream()
+                .filter(d -> DiagnosticCodes.MATCH_REST_MISPLACED.equals(d.code()))
+                .findFirst()
+                .orElseThrow();
+        var restValStart = restValueSource.indexOf("..");
+        assertEquals(restValStart, restValueDiag.range().startByte());
+        assertEquals(restValStart + 2, restValueDiag.range().endByte());
+        var restValueDict = assertInstanceOf(DictionaryExpression.class,
+                assertInstanceOf(MatchStatement.class,
+                        assertInstanceOf(FunctionDeclaration.class, restValue.ast().statements().getFirst())
+                                .body().statements().getFirst())
+                        .sections().getFirst().patterns().getFirst());
+        assertFalse(restValueDict.openEnded());
+        assertEquals(1, restValueDict.entries().size());
+        var restValueErr = assertInstanceOf(ErrorExpression.class, restValueDict.entries().getFirst().value());
+        assertEquals(CstIssueKind.ERROR, restValueErr.kind());
+        assertEquals("..", restValueErr.sourceText());
     }
 
     @Test
@@ -2553,28 +2923,35 @@ class GdScriptParserTest {
     }
 
     @Test
-    void lambdaAtStatementLevelBecomesAnonymousFunction() {
-        // Reference-path contract: a statement-position `func` maps to a FunctionDeclaration
-        // (named or `<anonymous>`), not a lambda in an expression statement.
-        var ast = cleanAst("func f():\n\tfunc(): pass\n\tpass\n");
-        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
-        var anonymous = assertInstanceOf(FunctionDeclaration.class, function.body().statements().getFirst());
-        assertEquals("<anonymous>", anonymous.name());
+    void lambdaAtStatementLevelBecomesExpressionStatementWithDiagnostic() {
+        var result = parse("func f():\n\tfunc(): pass\n\tpass\n");
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(result.ast()));
+        var exprStmt = assertInstanceOf(ExpressionStatement.class, function.body().statements().getFirst());
+        var anonymous = assertInstanceOf(LambdaExpression.class, exprStmt.expression());
+        assertNull(anonymous.name());
         assertNull(anonymous.returnType());
         assertEquals(new Range(11, 23, new Point(1, 1), new Point(1, 13)), anonymous.range());
+        assertEquals(anonymous.range(), exprStmt.range());
+        assertEquals(1, result.diagnostics().size(), () -> result.diagnostics().toString());
+        assertEquals(DiagnosticCodes.LAMBDA_BARE_STATEMENT, result.diagnostics().getFirst().code());
+        assertEquals(new RecoveryLink(exprStmt, "expression"), result.diagnostics().getFirst().recovery());
         // The lambda-end state must be consumed so the sibling statement still parses.
         assertInstanceOf(PassStatement.class, function.body().statements().get(1));
 
-        var named = cleanAst("func f():\n\tfunc named(): pass\n");
-        var namedFn = assertInstanceOf(FunctionDeclaration.class,
-                assertInstanceOf(FunctionDeclaration.class, onlyStatement(named)).body().statements().getFirst());
-        assertEquals("named", namedFn.name());
+        var named = parse("func f():\n\tfunc named(): pass\n");
+        var namedStmt = assertInstanceOf(ExpressionStatement.class,
+                assertInstanceOf(FunctionDeclaration.class, onlyStatement(named.ast())).body().statements().getFirst());
+        var namedLambda = assertInstanceOf(LambdaExpression.class, namedStmt.expression());
+        assertEquals("named", namedLambda.name());
+        assertEquals(DiagnosticCodes.LAMBDA_BARE_STATEMENT, named.diagnostics().getFirst().code());
 
-        var typed = cleanAst("func f():\n\tfunc() -> int: return 1\n");
-        var typedFn = assertInstanceOf(FunctionDeclaration.class,
-                assertInstanceOf(FunctionDeclaration.class, onlyStatement(typed)).body().statements().getFirst());
-        assertEquals("<anonymous>", typedFn.name());
-        assertEquals("int", requireNotNull(typedFn.returnType()).sourceText());
+        var typed = parse("func f():\n\tfunc() -> int: return 1\n");
+        var typedStmt = assertInstanceOf(ExpressionStatement.class,
+                assertInstanceOf(FunctionDeclaration.class, onlyStatement(typed.ast())).body().statements().getFirst());
+        var typedLambda = assertInstanceOf(LambdaExpression.class, typedStmt.expression());
+        assertNull(typedLambda.name());
+        assertEquals("int", requireNotNull(typedLambda.returnType()).sourceText());
+        assertEquals(DiagnosticCodes.LAMBDA_BARE_STATEMENT, typed.diagnostics().getFirst().code());
     }
 
     @Test
@@ -2886,11 +3263,37 @@ class GdScriptParserTest {
     }
 
     @Test
-    void forLoopTypeParseFailureUsesPlainInMessage() {
-        // Vendor `parse_type` returns null on failure, which selects the untyped message (a
-        // review-suggested alternate message was verified against the vendor and rejected).
-        var result = parse("func f():\n\tfor i: ??? in xs:\n\t\tpass\n");
-        assertTrue(errorMessages(result).contains("Expected \"in\" or \":\" after \"for\" variable name."));
+    void forLoopTypeParseFailureSyncsToSameLineInAndOnlySuggestsInWhenMissing() {
+        // When `:` was written and type parsing failed, bounded same-line sync finds `in` and
+        // preserves both the iterable expression and the loop suite without a false missing-`in`.
+        var withIn = parse("func f():\n\tfor i: ??? in xs:\n\t\tpass\n");
+        var withInErrors = withIn.diagnostics().stream()
+                .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
+                .toList();
+        assertEquals(1, withInErrors.size(), () -> withInErrors.toString());
+        assertEquals(DiagnosticCodes.MISSING_TYPE_FOR_ITERATOR, withInErrors.getFirst().code());
+        var withInFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(withIn.ast()));
+        var withInFor = assertInstanceOf(ForStatement.class, withInFn.body().statements().getFirst());
+        assertEquals("i", withInFor.iterator());
+        assertNull(withInFor.iteratorType());
+        assertEquals("xs", assertInstanceOf(IdentifierExpression.class, withInFor.iterable()).name());
+        assertInstanceOf(PassStatement.class, withInFor.body().statements().getFirst());
+        assertEquals(new RecoveryLink(withInFor, "for.iterator"), withInErrors.getFirst().recovery());
+
+        // When `:` was written and `in` is actually missing, only `"in"` is suggested (never `":"`),
+        // and outer statements on subsequent lines remain untouched.
+        var withoutIn = parse("func f():\n\tfor i: ???\nvar outside = 1\n");
+        var withoutInMessages = errorMessages(withoutIn);
+        assertTrue(withoutInMessages.contains("Expected \"in\" after \"for\" variable type specifier."),
+                withoutInMessages::toString);
+        assertFalse(withoutInMessages.contains("Expected \"in\" or \":\" after \"for\" variable name."),
+                withoutInMessages::toString);
+        assertEquals(2, withoutIn.ast().statements().size(), () -> withoutIn.ast().statements().toString());
+        assertEquals("outside", assertInstanceOf(VariableDeclaration.class, withoutIn.ast().statements().get(1)).name());
+
+        // Without `:`, missing `in` keeps the `"in" or ":"` hint.
+        var plainMissingIn = parse("func f():\n\tfor i x:\n\t\tpass\n");
+        assertTrue(errorMessages(plainMissingIn).contains("Expected \"in\" or \":\" after \"for\" variable name."));
     }
 
     @Test
@@ -3075,5 +3478,224 @@ class GdScriptParserTest {
         var lambda = assertInstanceOf(LambdaExpression.class,
                 assertInstanceOf(VariableDeclaration.class, noColon.ast().statements().getFirst()).value());
         assertEquals(1, lambda.body().statements().size());
+    }
+
+    @Test
+    void groupedAttributePropertyCalleesAreAcceptedAndInvalidOrDamagedCalleesStayAccurate() {
+        var valid = cleanAst("""
+                func f():
+                \t(obj.method)(1)
+                \t((obj.method))(1)
+                \t(a.b().c)(1)
+                """);
+        var validBody = assertInstanceOf(FunctionDeclaration.class, onlyStatement(valid)).body().statements();
+        assertEquals(3, validBody.size());
+        var directAttrCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(ExpressionStatement.class, validBody.get(0)).expression());
+        var directCallee = assertInstanceOf(AttributeExpression.class, directAttrCall.callee());
+        assertInstanceOf(AttributePropertyStep.class, directCallee.steps().getLast());
+
+        var damagedCallee = parse("func f():\n\t(self.)(1)\n");
+        var damagedCodes = damagedCallee.diagnostics().stream()
+                .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
+                .map(AstDiagnostic::code)
+                .toList();
+        assertEquals(List.of(DiagnosticCodes.ATTRIBUTE_MISSING_NAME), damagedCodes);
+        var damagedCall = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(ExpressionStatement.class,
+                        assertInstanceOf(FunctionDeclaration.class, onlyStatement(damagedCallee.ast()))
+                                .body().statements().getFirst()).expression());
+        var missingCallee = assertInstanceOf(AttributeExpression.class, damagedCall.callee());
+        assertInstanceOf(MissingAttributeStep.class, missingCallee.steps().getLast());
+
+        var rejected = parse("""
+                func f():
+                \t(f(1))(2)
+                \t(a.b(1))(2)
+                \t(table[i])(2)
+                \t(a.b[i])(2)
+                \t(1)(2)
+                """);
+        var rejectedCodes = rejected.diagnostics().stream()
+                .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
+                .map(AstDiagnostic::code)
+                .toList();
+        assertEquals(List.of(
+                DiagnosticCodes.CALL_INVALID_CALLEE,
+                DiagnosticCodes.CALL_INVALID_CALLEE,
+                DiagnosticCodes.CALL_INVALID_CALLEE,
+                DiagnosticCodes.CALL_INVALID_CALLEE,
+                DiagnosticCodes.CALL_INVALID_CALLEE
+        ), rejectedCodes);
+    }
+
+    @Test
+    void staticUnloadAcceptsScriptHeaderAndRejectsNonHeaderPositions() {
+        cleanAst("@static_unload\n");
+        cleanAst("@static_unload\nextends Node\n");
+        cleanAst("@static_unload\nvar z = 3\n");
+
+        var afterExtends = parse("extends Node\n@static_unload\nclass Inner: pass\n");
+        assertEquals(
+                List.of(DiagnosticCodes.ANNOTATION_INVALID_LEVEL),
+                afterExtends.diagnostics().stream()
+                        .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
+                        .map(AstDiagnostic::code)
+                        .toList()
+        );
+
+        var afterMemberWithArg = parse("var x\n@static_unload(123)\nclass Inner: pass\n");
+        assertEquals(
+                List.of(DiagnosticCodes.ANNOTATION_INVALID_LEVEL),
+                afterMemberWithArg.diagnostics().stream()
+                        .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR)
+                        .map(AstDiagnostic::code)
+                        .toList()
+        );
+    }
+
+    @Test
+    void annotationStringsPairByDecodedValueWhilePreservingRawLexemes() {
+        var escapedPair = cleanAst("""
+                @warning_ignore_start("unused_\\u0076ariable")
+                var x = 1
+                @warning_ignore_restore("unused_variable")
+                """);
+        var startAnn = assertInstanceOf(AnnotationStatement.class, escapedPair.statements().getFirst());
+        var literal = assertInstanceOf(LiteralExpression.class, startAnn.arguments().getFirst());
+        assertEquals("\"unused_\\u0076ariable\"", literal.sourceText());
+
+        cleanAst("""
+                @warning_ignore_start(r"unused_variable")
+                var x = 1
+                @warning_ignore_restore("unused_variable")
+                """);
+
+        var rawBackslashMismatch = parse("""
+                @warning_ignore_start(r"unused_\\u0076ariable")
+                var x = 1
+                @warning_ignore_restore("unused_variable")
+                """);
+        assertTrue(errorMessages(rawBackslashMismatch).stream()
+                .anyMatch(msg -> msg.contains("is not being ignored")));
+
+        var duplicateDecodedStart = parse("""
+                @warning_ignore_start("unused_\\u0076ariable")
+                @warning_ignore_start("unused_variable")
+                """);
+        assertTrue(errorMessages(duplicateDecodedStart).stream()
+                .anyMatch(msg -> msg.contains("already being ignored")));
+
+        var emptyEscapedIcon = parse("@icon(\"\\\n\")\n");
+        assertTrue(errorMessages(emptyEscapedIcon).stream()
+                .anyMatch(msg -> msg.contains("must contain the path to the icon")));
+    }
+
+    @Test
+    void multilineTernaryWithInlineLambdaConditionParsesCleanlyAcrossLfAndCrlf() {
+        for (var newline : List.of("\n", "\r\n")) {
+            // 1. Anonymous inline lambda as multiline ternary condition.
+            var anonAst = cleanAst("var x = (1\nif func(): pass\nelse 2)\n".replace("\n", newline));
+            var anonVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(anonAst));
+            var anonCond = assertInstanceOf(ConditionalExpression.class, anonVar.value());
+            var anonLambda = assertInstanceOf(LambdaExpression.class, anonCond.condition());
+            assertNull(anonLambda.name());
+            assertInstanceOf(PassStatement.class, anonLambda.body().statements().getFirst());
+            assertEquals("1", assertInstanceOf(LiteralExpression.class, anonCond.left()).sourceText());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, anonCond.right()).sourceText());
+
+            // 2. Named inline lambda with typed parameter and return type.
+            var namedAst = cleanAst(
+                    "var x = (1\nif func named(a: int) -> int: return a\nelse 2)\n".replace("\n", newline));
+            var namedVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(namedAst));
+            var namedCond = assertInstanceOf(ConditionalExpression.class, namedVar.value());
+            var namedLambda = assertInstanceOf(LambdaExpression.class, namedCond.condition());
+            assertEquals("named", namedLambda.name());
+            assertInstanceOf(ReturnStatement.class, namedLambda.body().statements().getFirst());
+
+            // 3. Inline `for` and indented `if` inside the lambda parse cleanly without outer colon interference.
+            var forAst = cleanAst("var x = (1\nif func(): for i in a: pass\nelse 2)\n".replace("\n", newline));
+            var forVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(forAst));
+            var forCond = assertInstanceOf(ConditionalExpression.class, forVar.value());
+            var forLambda = assertInstanceOf(LambdaExpression.class, forCond.condition());
+            assertInstanceOf(ForStatement.class, forLambda.body().statements().getFirst());
+
+            var indentedIfAst = cleanAst("var x = (1\nif func():\n\tif ready: pass\nelse 2)\n".replace("\n", newline));
+            var indentedIfVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(indentedIfAst));
+            var indentedIfCond = assertInstanceOf(ConditionalExpression.class, indentedIfVar.value());
+            var indentedIfLambda = assertInstanceOf(LambdaExpression.class, indentedIfCond.condition());
+            assertInstanceOf(IfStatement.class, indentedIfLambda.body().statements().getFirst());
+
+            var indentedBlockLambdaAst = cleanAst(
+                    "var x = (1\nif func():\n\treturn true\nelse 2)\n".replace("\n", newline));
+            var indentedBlockVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(indentedBlockLambdaAst));
+            var indentedBlockCond = assertInstanceOf(ConditionalExpression.class, indentedBlockVar.value());
+            var indentedBlockLambda = assertInstanceOf(LambdaExpression.class, indentedBlockCond.condition());
+            assertInstanceOf(ReturnStatement.class, indentedBlockLambda.body().statements().getFirst());
+
+            // 3b. Inline `if` without an `else:` before `\nelse 2` still routes into `parseTernaryOperator`
+            // (ConditionalExpression with LambdaExpression([IfStatement])), never splitting as an `if` head;
+            // the trailing `\nelse` binds to the inner `parseIf()` per Godot's `parse_if()` grammar.
+            var singleLineIf = parse("var x = (1 if func(): if ready: pass else 2)\n".replace("\n", newline));
+            var multiLineIf = parse("var x = (1\nif func(): if ready: pass\nelse 2)\n".replace("\n", newline));
+            assertEquals(
+                    List.of(
+                            "Expected end of statement after \"pass\", found \"else\" instead.",
+                            "Expected \"else\" after ternary operator condition."),
+                    errorMessages(singleLineIf));
+            assertEquals(
+                    List.of(
+                            "Expected \":\" after \"else\".",
+                            "Expected \"else\" after ternary operator condition."),
+                    errorMessages(multiLineIf));
+            for (var res : List.of(singleLineIf, multiLineIf)) {
+                var varDecl = assertInstanceOf(VariableDeclaration.class, onlyStatement(res.ast()));
+                var cond = assertInstanceOf(ConditionalExpression.class, varDecl.value());
+                var lambda = assertInstanceOf(LambdaExpression.class, cond.condition());
+                assertInstanceOf(IfStatement.class, lambda.body().statements().getFirst());
+            }
+
+            // 4. Compound condition ending with an inline lambda.
+            var compoundAst = cleanAst("var x = (1\nif a and func(): pass\nelse 2)\n".replace("\n", newline));
+            var compoundVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(compoundAst));
+            var compoundCond = assertInstanceOf(ConditionalExpression.class, compoundVar.value());
+            var compoundAnd = assertInstanceOf(BinaryExpression.class, compoundCond.condition());
+            assertInstanceOf(LambdaExpression.class, compoundAnd.right());
+
+            // 5. Binary `%` and `/` (incl. contextual `match`/`when` identifiers) before a block lambda
+            //    do not mask lambda recognition as node paths.
+            for (var exprPrefix : List.of("\"%s\" % ", "a / ", "($parent/a) % ", "($a) % ", "match%", "when%")) {
+                var opLambdaAst = cleanAst(("func f():\n\tvar x = [1\n\tif " + exprPrefix
+                        + "func():\n\t\tpass\n\telse 3, 4]\n").replace("\n", newline));
+                var opFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(opLambdaAst));
+                assertEquals(1, opFn.body().statements().size());
+                var opVar = assertInstanceOf(VariableDeclaration.class, opFn.body().statements().getFirst());
+                var opArr = assertInstanceOf(ArrayExpression.class, opVar.value());
+                assertEquals(2, opArr.elements().size());
+                var opCond = assertInstanceOf(ConditionalExpression.class, opArr.elements().getFirst());
+                var opBin = assertInstanceOf(BinaryExpression.class, opCond.condition());
+                assertInstanceOf(LambdaExpression.class, opBin.right());
+            }
+
+            // 5b. Spaced node path `$parent / else:` and ternary `$a else 2` parse cleanly.
+            var spacedNodePathAst = cleanAst("func f():\n\tif $parent / else:\n\t\tpass\n".replace("\n", newline));
+            var spacedNodePathFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(spacedNodePathAst));
+            var spacedNodePathIf = assertInstanceOf(IfStatement.class, spacedNodePathFn.body().statements().getFirst());
+            assertInstanceOf(GetNodeExpression.class, spacedNodePathIf.condition());
+
+            var nodePathTernaryAst = cleanAst("var x = (1\nif $a else 2)\n".replace("\n", newline));
+            var nodePathTernaryVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(nodePathTernaryAst));
+            var nodePathTernaryCond = assertInstanceOf(ConditionalExpression.class, nodePathTernaryVar.value());
+            assertInstanceOf(GetNodeExpression.class, nodePathTernaryCond.condition());
+
+            // 6. Real hex/binary literals after a lambda colon remain inline lambdas.
+            for (var radixLiteral : List.of("0x1", "0b1")) {
+                var radixAst = cleanAst(("var x = (1\nif func(): " + radixLiteral + "\nelse 2)\n")
+                        .replace("\n", newline));
+                var radixVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(radixAst));
+                var radixCond = assertInstanceOf(ConditionalExpression.class, radixVar.value());
+                assertInstanceOf(LambdaExpression.class, radixCond.condition());
+            }
+        }
     }
 }

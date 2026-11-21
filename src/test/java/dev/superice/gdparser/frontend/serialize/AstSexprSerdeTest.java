@@ -1,5 +1,6 @@
 package dev.superice.gdparser.frontend.serialize;
 
+import dev.superice.gdparser.frontend.ast.AnnotationStatement;
 import dev.superice.gdparser.frontend.ast.ArrayExpression;
 import dev.superice.gdparser.frontend.ast.AssignmentExpression;
 import dev.superice.gdparser.frontend.ast.AttributeCallStep;
@@ -40,6 +41,7 @@ import dev.superice.gdparser.frontend.ast.UnknownAttributeStep;
 import dev.superice.gdparser.frontend.ast.UnknownExpression;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import dev.superice.gdparser.frontend.cst.CstIssueKind;
+import dev.superice.gdparser.frontend.gdscript.GdScriptParser;
 import dev.superice.gdparser.frontend.lowering.CstToAstMapper;
 import dev.superice.gdparser.infra.treesitter.GdParserFacade;
 import org.junit.jupiter.api.BeforeAll;
@@ -57,6 +59,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -343,6 +346,39 @@ class AstSexprSerdeTest {
                 () -> deserializer.deserialize(unknownField));
         assertTrue(unknownEx.getMessage().contains("Unknown field 'extra'"),
                 () -> "Unexpected error message: " + unknownEx.getMessage());
+    }
+
+    @Test
+    void shouldOmitEmptyRecoveryAnnotationsAndRoundTripNonEmptyRecoveryAnnotations() {
+        var tiny = span(0, 1);
+        var cleanVar = new VariableDeclaration(
+                DeclarationKind.VAR, "clean", null, null, false, "variable_statement", tiny);
+        var cleanAst = new SourceFile(List.of(cleanVar), tiny);
+        var cleanCompact = serializer.serialize(cleanAst);
+        var cleanPretty = serializer.serializePretty(cleanAst);
+        assertFalse(cleanCompact.contains("recoveryAnnotations"), () -> cleanCompact);
+        assertFalse(cleanPretty.contains("recoveryAnnotations"), () -> cleanPretty);
+        assertEquals(cleanAst, deserializer.deserialize(cleanCompact));
+        assertEquals(cleanAst, deserializer.deserialize(cleanPretty));
+
+        var parsed = new GdScriptParser().parse("""
+                var prop:
+                \tget:
+                \t\t@warning_ignore("unused_variable")
+                \tset(v):
+                \t\t@export
+                """);
+        var propVar = assertInstanceOf(VariableDeclaration.class, parsed.ast().statements().getFirst());
+        assertEquals(2, propVar.recoveryAnnotations().size());
+        assertEquals(List.<Object>copyOf(propVar.recoveryAnnotations()), propVar.getChildren());
+
+        var compact = serializer.serialize(parsed.ast());
+        var pretty = serializer.serializePretty(parsed.ast());
+        assertTrue(compact.contains("(recoveryAnnotations "), () -> compact);
+        assertTrue(pretty.contains("(recoveryAnnotations\n"), () -> pretty);
+        assertEquals(parsed.ast(), deserializer.deserialize(compact));
+        assertEquals(parsed.ast(), deserializer.deserialize(pretty));
+        assertEquals(compact, serializer.serialize(deserializer.deserialize(pretty)));
     }
 
     @TestFactory

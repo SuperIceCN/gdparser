@@ -9,16 +9,7 @@ import dev.superice.gdparser.frontend.ast.SourceFile;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.IdentityHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 
 /// Tracks provisional recovery frames, diagnostic entries, lookahead lexical-error staging, and
 /// end-of-parse owner attribution with amortized O(frames + diagnostics) fallback resolution.
@@ -77,24 +68,147 @@ final class RecoveryTransactionTracker {
 
     private static final class DiagnosticEntry {
         private final @NotNull AstDiagnostic diagnostic;
+        private final int logicalStartLine;
         private @Nullable ProvisionalFrame targetFrame;
 
-        private DiagnosticEntry(@NotNull AstDiagnostic diagnostic, @Nullable ProvisionalFrame targetFrame) {
+        private DiagnosticEntry(
+                @NotNull AstDiagnostic diagnostic,
+                @Nullable ProvisionalFrame targetFrame,
+                int logicalStartLine
+        ) {
             this.diagnostic = diagnostic;
             this.targetFrame = targetFrame;
+            this.logicalStartLine = logicalStartLine;
         }
     }
 
     static final class LexicalBatch {
         private final List<DiagnosticEntry> entries = new ArrayList<>();
+        private final boolean followedContinuation;
         private boolean settled;
+        private int minStartByte = Integer.MAX_VALUE;
+        private int maxEndByte = -1;
+        private int firstStartLine = Integer.MAX_VALUE;
+        private int lastEndLine = -1;
+        private int @Nullable [] physicalOrderIndices;
+        private int @Nullable [] physicalOrderStartBytes;
+        private int @Nullable [] physicalOrderEndBytes;
 
-        private LexicalBatch() {
+        private LexicalBatch(boolean followedContinuation) {
+            this.followedContinuation = followedContinuation;
+        }
+
+        boolean followedContinuation() {
+            return followedContinuation;
         }
 
         boolean isSettled() {
             return settled;
         }
+
+        boolean isEmpty() {
+            return entries.isEmpty();
+        }
+
+        int minStartByte() {
+            return minStartByte;
+        }
+
+        int maxEndByte() {
+            return maxEndByte;
+        }
+
+        int firstStartLine() {
+            return firstStartLine;
+        }
+
+        int lastEndLine() {
+            return lastEndLine;
+        }
+
+        int entryCount() {
+            return entries.size();
+        }
+
+        int entryStartByte(int index) {
+            return entries.get(index).diagnostic.range().startByte();
+        }
+
+        int entryEndByte(int index) {
+            return entries.get(index).diagnostic.range().endByte();
+        }
+
+        int entryLogicalStartLine(int index) {
+            return entries.get(index).logicalStartLine;
+        }
+
+        int[] physicalOrderIndices() {
+            ensurePhysicalOrderCache();
+            return Objects.requireNonNull(physicalOrderIndices);
+        }
+
+        int[] physicalOrderStartBytes() {
+            ensurePhysicalOrderCache();
+            return Objects.requireNonNull(physicalOrderStartBytes);
+        }
+
+        int[] physicalOrderEndBytes() {
+            ensurePhysicalOrderCache();
+            return Objects.requireNonNull(physicalOrderEndBytes);
+        }
+
+        private void invalidatePhysicalOrderCache() {
+            physicalOrderIndices = null;
+            physicalOrderStartBytes = null;
+            physicalOrderEndBytes = null;
+        }
+
+        private void ensurePhysicalOrderCache() {
+            if (physicalOrderIndices != null) {
+                return;
+            }
+            var n = entries.size();
+            var indices = new int[n];
+            var starts = new int[n];
+            var ends = new int[n];
+            var alreadySorted = true;
+            var prevStart = Integer.MIN_VALUE;
+            for (var i = 0; i < n; i++) {
+                var range = entries.get(i).diagnostic.range();
+                var start = range.startByte();
+                if (start < prevStart) {
+                    alreadySorted = false;
+                }
+                prevStart = start;
+                indices[i] = i;
+                starts[i] = start;
+                ends[i] = range.endByte();
+            }
+            if (!alreadySorted) {
+                var rawStarts = starts;
+                var boxed = new Integer[n];
+                for (var i = 0; i < n; i++) {
+                    boxed[i] = i;
+                }
+                Arrays.sort(boxed, Comparator.comparingInt((Integer a) -> rawStarts[a]).thenComparingInt(a -> a));
+                var sortedStarts = new int[n];
+                var sortedEnds = new int[n];
+                for (var i = 0; i < n; i++) {
+                    var idx = boxed[i];
+                    indices[i] = idx;
+                    sortedStarts[i] = rawStarts[idx];
+                    sortedEnds[i] = ends[idx];
+                }
+                starts = sortedStarts;
+                ends = sortedEnds;
+            }
+            physicalOrderIndices = indices;
+            physicalOrderStartBytes = starts;
+            physicalOrderEndBytes = ends;
+        }
+    }
+
+    record LexicalSpan(int startByte, int endByte) {
     }
 
     private record ResolvedTarget(@Nullable Node owner, @Nullable String facet) {
@@ -249,7 +363,7 @@ final class RecoveryTransactionTracker {
                 code,
                 null
         );
-        var entry = new DiagnosticEntry(diagnostic, resolvedTarget);
+        var entry = new DiagnosticEntry(diagnostic, resolvedTarget, range.startPoint().row() + 1);
         entries.add(entry);
         if (resolvedTarget != null) {
             resolvedTarget.pendingEntries.add(entry);
@@ -271,7 +385,7 @@ final class RecoveryTransactionTracker {
                 code,
                 null
         );
-        entries.add(new DiagnosticEntry(diagnostic, null));
+        entries.add(new DiagnosticEntry(diagnostic, null, range.startPoint().row() + 1));
     }
 
     void emitWarning(@NotNull String message, @NotNull String nodeType, @NotNull Range range) {
@@ -279,13 +393,17 @@ final class RecoveryTransactionTracker {
         Objects.requireNonNull(nodeType, "nodeType must not be null");
         Objects.requireNonNull(range, "range must not be null");
         var diagnostic = new AstDiagnostic(AstDiagnosticSeverity.WARNING, message, nodeType, range);
-        entries.add(new DiagnosticEntry(diagnostic, null));
+        entries.add(new DiagnosticEntry(diagnostic, null, range.startPoint().row() + 1));
     }
 
     /// Opens a batch handle for lookahead lexical errors that can later be claimed or flushed in O(1)
     /// amortized time without scanning a shared staging list.
     @NotNull LexicalBatch openLexicalBatch() {
-        var batch = new LexicalBatch();
+        return openLexicalBatch(false);
+    }
+
+    @NotNull LexicalBatch openLexicalBatch(boolean followedContinuation) {
+        var batch = new LexicalBatch(followedContinuation);
         ownedBatches.add(batch);
         openBatches.add(batch);
         return batch;
@@ -307,7 +425,7 @@ final class RecoveryTransactionTracker {
                 code,
                 null
         );
-        entries.add(new DiagnosticEntry(diagnostic, null));
+        entries.add(new DiagnosticEntry(diagnostic, null, range.startPoint().row() + 1));
     }
 
     /// Stages a lexical error into an open `LexicalBatch` while preserving exact global emission order.
@@ -317,12 +435,25 @@ final class RecoveryTransactionTracker {
             @NotNull Range range,
             @NotNull String code
     ) {
+        stageLexicalError(batch, message, range, code, range.startPoint().row() + 1);
+    }
+
+    void stageLexicalError(
+            @NotNull LexicalBatch batch,
+            @NotNull String message,
+            @NotNull Range range,
+            @NotNull String code,
+            int logicalStartLine
+    ) {
         requireOwnedBatch(batch);
         Objects.requireNonNull(message, "message must not be null");
         Objects.requireNonNull(range, "range must not be null");
         DiagnosticCodes.requireRegistered(code);
         if (!DiagnosticCodes.allowsNullRecovery(code)) {
             throw new IllegalArgumentException("Staged lexical error code must allow standalone recovery: " + code);
+        }
+        if (logicalStartLine < 1) {
+            throw new IllegalArgumentException("logicalStartLine must be >= 1, got: " + logicalStartLine);
         }
         if (batch.settled) {
             throw new IllegalStateException("Cannot stage lexical error into a settled LexicalBatch.");
@@ -335,9 +466,14 @@ final class RecoveryTransactionTracker {
                 code,
                 null
         );
-        var entry = new DiagnosticEntry(diagnostic, null);
+        var entry = new DiagnosticEntry(diagnostic, null, logicalStartLine);
         entries.add(entry);
         batch.entries.add(entry);
+        batch.invalidatePhysicalOrderCache();
+        batch.minStartByte = Math.min(batch.minStartByte, range.startByte());
+        batch.maxEndByte = Math.max(batch.maxEndByte, range.endByte());
+        batch.firstStartLine = Math.min(batch.firstStartLine, range.startPoint().row() + 1);
+        batch.lastEndLine = Math.max(batch.lastEndLine, range.endPoint().row() + 1);
     }
 
     /// Binds every entry in `batch` to `targetFrame` in a single pass; settled batches are ignored.
@@ -352,7 +488,76 @@ final class RecoveryTransactionTracker {
             targetFrame.pendingEntries.add(entry);
         }
         batch.entries.clear();
+        batch.invalidatePhysicalOrderCache();
         batch.settled = true;
+    }
+
+    /// Binds the masked subset of entries in `batch` to `targetFrame` (or releases them standalone
+    /// when `targetFrame == null`) without changing global diagnostic emission order, recomputing
+    /// summary bounds over any remaining unclaimed entries so unsettled tails stay queued.
+    @Nullable LexicalSpan claimLexicalBatchSubset(
+            @NotNull LexicalBatch batch,
+            boolean @NotNull [] claimMask,
+            @Nullable ProvisionalFrame targetFrame
+    ) {
+        requireOwnedBatch(batch);
+        if (targetFrame != null) {
+            requireOwnedFrame(targetFrame);
+        }
+        if (batch.settled || batch.entries.isEmpty()) {
+            return null;
+        }
+        if (claimMask.length != batch.entries.size()) {
+            throw new IllegalArgumentException(
+                    "claimMask length (%d) must match batch entry count (%d)"
+                            .formatted(claimMask.length, batch.entries.size()));
+        }
+        var spanStart = Integer.MAX_VALUE;
+        var spanEnd = Integer.MIN_VALUE;
+        var remaining = new ArrayList<DiagnosticEntry>();
+        var remMinStart = Integer.MAX_VALUE;
+        var remMaxEnd = -1;
+        var remFirstLine = Integer.MAX_VALUE;
+        var remLastLine = -1;
+        var claimedAny = false;
+        for (var i = 0; i < batch.entries.size(); i++) {
+            var entry = batch.entries.get(i);
+            var range = entry.diagnostic.range();
+            if (claimMask[i]) {
+                claimedAny = true;
+                spanStart = Math.min(spanStart, range.startByte());
+                spanEnd = Math.max(spanEnd, range.endByte());
+                if (targetFrame != null) {
+                    entry.targetFrame = targetFrame;
+                    targetFrame.pendingEntries.add(entry);
+                }
+            } else {
+                remaining.add(entry);
+                remMinStart = Math.min(remMinStart, range.startByte());
+                remMaxEnd = Math.max(remMaxEnd, range.endByte());
+                remFirstLine = Math.min(remFirstLine, range.startPoint().row() + 1);
+                remLastLine = Math.max(remLastLine, range.endPoint().row() + 1);
+            }
+        }
+        if (!claimedAny) {
+            return null;
+        }
+        batch.entries.clear();
+        batch.entries.addAll(remaining);
+        batch.invalidatePhysicalOrderCache();
+        if (batch.entries.isEmpty()) {
+            batch.settled = true;
+            batch.minStartByte = Integer.MAX_VALUE;
+            batch.maxEndByte = -1;
+            batch.firstStartLine = Integer.MAX_VALUE;
+            batch.lastEndLine = -1;
+        } else {
+            batch.minStartByte = remMinStart;
+            batch.maxEndByte = remMaxEnd;
+            batch.firstStartLine = remFirstLine;
+            batch.lastEndLine = remLastLine;
+        }
+        return new LexicalSpan(spanStart, spanEnd);
     }
 
     /// Releases every entry in `batch` as a standalone (null recovery) diagnostic in O(1).
@@ -362,6 +567,7 @@ final class RecoveryTransactionTracker {
             return;
         }
         batch.entries.clear();
+        batch.invalidatePhysicalOrderCache();
         batch.settled = true;
     }
 

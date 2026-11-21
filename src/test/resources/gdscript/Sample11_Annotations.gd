@@ -1,5 +1,6 @@
 @tool
 @icon("res://icon.svg")
+@static_unload
 class_name AnnotationExamples
 extends Node
 
@@ -117,8 +118,7 @@ func rpc_combined() -> void:
 func rpc_with_channel() -> void:
 	pass
 
-# Static annotation
-@static_unload
+# Static class
 class StaticClass:
 	static var counter: int = 0
 

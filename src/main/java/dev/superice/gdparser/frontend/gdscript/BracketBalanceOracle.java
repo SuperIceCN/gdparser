@@ -83,6 +83,7 @@ final class BracketBalanceOracle {
         var braceIndices = new ArrayList<Integer>();
 
         var firstTokenOnLine = true;
+        var lineHeadAnchor = -1;
         var lineContinuation = false;
         var len = chars.length;
         var pos = 0;
@@ -91,7 +92,19 @@ final class BracketBalanceOracle {
         while (pos < len) {
             var ch = chars[pos];
 
-            if (ch == ' ' || ch == '\t' || ch == '\r') {
+            if (ch == ' ' || ch == '\t') {
+                pos++;
+                continue;
+            }
+            if (ch == '\r') {
+                if (pos + 1 < len && chars[pos + 1] == '\n') {
+                    pos++;
+                    continue;
+                }
+                if (firstTokenOnLine && lineHeadAnchor < 0) {
+                    lineHeadAnchor = pos;
+                }
+                lineContinuation = false;
                 pos++;
                 continue;
             }
@@ -100,6 +113,7 @@ final class BracketBalanceOracle {
                 scanLine++;
                 if (!lineContinuation) {
                     firstTokenOnLine = true;
+                    lineHeadAnchor = -1;
                 }
                 continue;
             }
@@ -110,22 +124,34 @@ final class BracketBalanceOracle {
                 continue;
             }
             if (ch == '\\') {
-                pos++;
-                if (pos < len && chars[pos] == '\r') {
-                    pos++;
-                }
-                if (pos < len && chars[pos] == '\n') {
-                    pos++;
+                if (pos + 1 < len && chars[pos + 1] == '\n') {
+                    lineHeadAnchor = -1;
+                    pos += 2;
                     scanLine++;
                     lineContinuation = true;
+                    continue;
                 }
+                if (pos + 2 < len && chars[pos + 1] == '\r' && chars[pos + 2] == '\n') {
+                    lineHeadAnchor = -1;
+                    pos += 3;
+                    scanLine++;
+                    lineContinuation = true;
+                    continue;
+                }
+                if (firstTokenOnLine && lineHeadAnchor < 0) {
+                    lineHeadAnchor = pos;
+                }
+                lineContinuation = false;
+                pos++;
                 continue;
             }
 
             lineContinuation = false;
             var tokenStart = pos;
             var atLineHead = firstTokenOnLine;
+            var stopAnchor = lineHeadAnchor >= 0 ? lineHeadAnchor : tokenStart;
             firstTokenOnLine = false;
+            lineHeadAnchor = -1;
 
             // String literals (regular, triple-quoted, raw, StringName, NodePath).
             if (ch == '"' || ch == '\''
@@ -138,7 +164,7 @@ final class BracketBalanceOracle {
             // Statement-level @annotation at line start.
             if (ch == '@') {
                 if (atLineHead && !stack.isEmpty()) {
-                    recordStop(stack, byteOffsets[tokenStart]);
+                    recordStop(stack, byteOffsets[stopAnchor]);
                 }
                 pos++;
                 while (pos < len && isIdentifierContinue(chars[pos])) {
@@ -180,14 +206,23 @@ final class BracketBalanceOracle {
                 if (atLineHead && !stack.isEmpty()) {
                     var word = new String(chars, tokenStart, pos - tokenStart);
                     if (isStructuralStopKeyword(word, pos)) {
-                        recordStop(stack, byteOffsets[tokenStart]);
+                        recordStop(stack, byteOffsets[stopAnchor]);
                     }
                 }
                 continue;
             }
 
-            // Numbers and all remaining punctuation advance one code point at a time; none can
-            // introduce brackets, comments, strings, or line-head keywords.
+            // Numbers and valid punctuation advance one code point at a time and mark the line as
+            // having seen a real token; unrecognized lexical-error characters keep `firstTokenOnLine`
+            // intact so a following declaration keyword still acts as an unclosed-multiline stop.
+            if (isValidNonIdentifierTokenChar(ch)) {
+                pos++;
+                continue;
+            }
+            if (atLineHead) {
+                firstTokenOnLine = true;
+                lineHeadAnchor = stopAnchor;
+            }
             pos++;
         }
 
@@ -435,6 +470,17 @@ final class BracketBalanceOracle {
             pos++;
         }
         return pos;
+    }
+
+    private static boolean isValidNonIdentifierTokenChar(int c) {
+        if (c >= '0' && c <= '9') {
+            return true;
+        }
+        return switch (c) {
+            case '+', '-', '*', '/', '%', '&', '|', '^', '~', '!', '=', '<', '>', '.', ',', ':', ';',
+                 '$', '?', '`' -> true;
+            default -> false;
+        };
     }
 
     private static boolean isIdentifierStart(int c) {

@@ -116,7 +116,8 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("@export\nvar x = 1\n");
         assertCleanParity("@tool\nclass_name Foo\n");
         assertCleanParity("@rpc(\"any_peer\", \"call_local\")\nfunc f(): pass\n");
-        assertCleanParity("@rpc(\n\t\"any_peer\",\n)\nvar x = 1\n");
+        assertCleanParity("@rpc(\n\t\"any_peer\",\n)\nfunc g(): pass\n");
+        assertCleanParity("@export_enum(\n\t\"a\",\n)\nvar x = 1\n");
     }
 
     @Test
@@ -145,11 +146,23 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("const A = PI\n");
         assertCleanParity("const A = a.b(1).c[2]\n");
         assertCleanParity("const A = f(1).x\n");
-        assertCleanParity("const A = f(1)(2)\n");
         assertCleanParity("const A = a[0][1]\n");
-        assertCleanParity("const A = a.b(1)(2)\n");
         assertCleanParity("const A = a.b.c.d.e.f.g.h\n");
         assertCleanParity("const A = a.b(\n\t1\n).c\n");
+    }
+
+    @Test
+    void invalidDirectCallMatchesAstShapeAndReportsError() {
+        for (var source : List.of("const A = f(1)(2)\n", "const A = a.b(1)(2)\n")) {
+            assertParity(source);
+            var actual = parseViaGdScript(source);
+            org.junit.jupiter.api.Assertions.assertEquals(1, actual.diagnostics().size(),
+                    () -> actual.diagnostics().toString());
+            org.junit.jupiter.api.Assertions.assertEquals(
+                    DiagnosticCodes.CALL_INVALID_CALLEE,
+                    actual.diagnostics().getFirst().code()
+            );
+        }
     }
 
     @Test
@@ -307,10 +320,35 @@ class GdParserParityTest extends GdParserParityTestSupport {
         assertCleanParity("var f = func(a):\n\tvar t = a\n\treturn t\n");
         assertCleanParity("var x = g(func(a): return a, 2)\n");
         assertCleanParity("var x = g(func():\n\treturn 1\n, 2)\n");
-        assertCleanParity("func f():\n\tfunc(): pass\n\tpass\n");
-        assertCleanParity("func f():\n\tfunc named(): pass\n");
-        assertCleanParity("func f():\n\tfunc() -> int: return 1\n");
         assertCleanParity("var f = func(): return\n");
+    }
+
+    @Test
+    void bareSuiteLambdaDivergesFromTreeSitterToExpressionStatement() {
+        for (var source : List.of(
+                "func f():\n\tfunc(): pass\n\tpass\n",
+                "func f():\n\tfunc named(): pass\n",
+                "func f():\n\tfunc() -> int: return 1\n"
+        )) {
+            var legacy = parseViaTreeSitter(source);
+            var actual = parseViaGdScript(source);
+            var legacyFn = (dev.superice.gdparser.frontend.ast.FunctionDeclaration) legacy.ast().statements().getFirst();
+            var actualFn = (dev.superice.gdparser.frontend.ast.FunctionDeclaration) actual.ast().statements().getFirst();
+            org.junit.jupiter.api.Assertions.assertInstanceOf(
+                    dev.superice.gdparser.frontend.ast.FunctionDeclaration.class,
+                    legacyFn.body().statements().getFirst()
+            );
+            var stmt = org.junit.jupiter.api.Assertions.assertInstanceOf(
+                    dev.superice.gdparser.frontend.ast.ExpressionStatement.class,
+                    actualFn.body().statements().getFirst()
+            );
+            org.junit.jupiter.api.Assertions.assertInstanceOf(
+                    dev.superice.gdparser.frontend.ast.LambdaExpression.class,
+                    stmt.expression()
+            );
+            org.junit.jupiter.api.Assertions.assertTrue(actual.diagnostics().stream()
+                    .anyMatch(d -> "parse.lambda.bare_statement".equals(d.code())));
+        }
     }
 
     /// Comment/region attribution: trailing, whole-line, dedent boundaries, annotation

@@ -129,6 +129,11 @@ public final class GdTokenizer {
     private boolean clearSuppressedOnNextScan;
     private int lastReturnedTokenStart;
     private boolean lastTokenFollowedContinuation;
+    private boolean lastErrorFollowedContinuation;
+    private int hardNewlineCount;
+    private int logicalLineStartLine = 1;
+    private int lastTokenLogicalStartLine = 1;
+    private int lastErrorLogicalStartLine = 1;
 
     // Indentation levels and expression-block snapshots (used for inline/indented lambda bodies).
     private int pendingIndents;
@@ -142,8 +147,11 @@ public final class GdTokenizer {
     private final List<Integer> openBracketIndices = new ArrayList<>();
     private final List<Integer> openBraceIndices = new ArrayList<>();
 
+    private record QueuedError(GdToken token, boolean followedContinuation, int logicalStartLine) {
+    }
+
     // Diagnostic queue and side-channel trivia/continuation records collected during scanning.
-    private final List<GdToken> errorStack = new ArrayList<>();
+    private final List<QueuedError> errorStack = new ArrayList<>();
     private final List<GdComment> comments = new ArrayList<>();
     private final List<Integer> continuationLines = new ArrayList<>();
 
@@ -197,6 +205,11 @@ public final class GdTokenizer {
         startColumn = 1;
         lineContinuation = false;
         lastTokenFollowedContinuation = false;
+        lastErrorFollowedContinuation = false;
+        hardNewlineCount = 0;
+        logicalLineStartLine = 1;
+        lastTokenLogicalStartLine = 1;
+        lastErrorLogicalStartLine = 1;
         lineHasContent = false;
         eofSettled = false;
         explicitMultilineMode = initialMultilineMode;
@@ -315,6 +328,22 @@ public final class GdTokenizer {
 
     boolean isLineContinuation() {
         return lastTokenFollowedContinuation;
+    }
+
+    boolean isErrorLineContinuation() {
+        return lastErrorFollowedContinuation;
+    }
+
+    int hardNewlineCount() {
+        return hardNewlineCount;
+    }
+
+    int tokenLogicalStartLine() {
+        return lastTokenLogicalStartLine;
+    }
+
+    int errorLogicalStartLine() {
+        return lastErrorLogicalStartLine;
     }
 
     boolean hasBalancedLayoutState() {
@@ -516,6 +545,12 @@ public final class GdTokenizer {
             clearSuppressedOnNextScan = true;
             lastReturnedTokenStart = tokenStartIndex;
             lastTokenFollowedContinuation = followedContinuation;
+            lastTokenLogicalStartLine = logicalLineStartLine;
+            lastErrorFollowedContinuation = false;
+            lastErrorLogicalStartLine = logicalLineStartLine;
+        } else {
+            lastErrorFollowedContinuation = followedContinuation;
+            lastErrorLogicalStartLine = logicalLineStartLine;
         }
         return token;
     }
@@ -591,12 +626,24 @@ public final class GdTokenizer {
                 // Line continuation with backslash.
                 if (peek() == '\r') {
                     if (peek(1) != '\n') {
-                        return emitContent(makeError("Unexpected carriage return character."));
+                        var followedContinuation = lineContinuation;
+                        lineContinuation = false;
+                        return returnScannedToken(
+                                emitContent(makeError("Unexpected carriage return character.")),
+                                tokenStart,
+                                followedContinuation
+                        );
                     }
                     advance();
                 }
                 if (peek() != '\n') {
-                    return emitContent(makeError("Expected new line after \"\\\"."));
+                    var followedContinuation = lineContinuation;
+                    lineContinuation = false;
+                    return returnScannedToken(
+                            emitContent(makeError("Expected new line after \"\\\".")),
+                            tokenStart,
+                            followedContinuation
+                    );
                 }
                 advance();
                 newline(false);
@@ -854,6 +901,7 @@ public final class GdTokenizer {
             var indentCount = 0;
             var lineIndentChar = 0;
             var mixed = false;
+            var pushedStrayCr = false;
             while (!isAtEnd()) {
                 var space = peek();
                 if (space == '\t') {
@@ -863,6 +911,7 @@ public final class GdTokenizer {
                 } else if (space == '\r' && peek(1) != '\n') {
                     advance();
                     pushError(makeCursorError("Stray carriage return character in source code."));
+                    pushedStrayCr = true;
                     continue;
                 } else {
                     break;
@@ -875,6 +924,20 @@ public final class GdTokenizer {
             }
 
             if (isAtEnd()) {
+                if (pushedStrayCr && lineContinuation) {
+                    lineHasContent = true;
+                    lineContinuation = false;
+                }
+                return;
+            }
+
+            if (pushedStrayCr
+                    && lineContinuation
+                    && (peek() == '\n' || peek() == '#' || (peek() == '\r' && peek(1) == '\n'))) {
+                // A continued line containing a stray CR error is not blank/comment-only: stop so
+                // the queued error drains and the trailing line break closes the continuation.
+                lineHasContent = true;
+                lineContinuation = false;
                 return;
             }
 
@@ -884,7 +947,7 @@ public final class GdTokenizer {
             if (peek() == '\n') {
                 // Empty line, keep going.
                 advance();
-                newline(false);
+                newline(false, !lineContinuation);
                 continue;
             }
             if (peek() == '#') {
@@ -901,7 +964,7 @@ public final class GdTokenizer {
                     return;
                 }
                 advance(); // Consume '\n'.
-                newline(false);
+                newline(false, !lineContinuation);
                 continue;
             }
 
@@ -955,7 +1018,7 @@ public final class GdTokenizer {
                     advance();
                     // Don't create newline tokens for empty lines (is_bol is always false
                     // here; the parameter is kept to mirror Godot's call shape).
-                    newline(true);
+                    newline(true, !lineContinuation);
                     checkIndent();
                 }
                 case '#' -> {
@@ -972,7 +1035,7 @@ public final class GdTokenizer {
                         return;
                     }
                     advance(); // Consume '\n'.
-                    newline(true);
+                    newline(true, !lineContinuation);
                     checkIndent();
                 }
                 default -> {
@@ -982,14 +1045,22 @@ public final class GdTokenizer {
         }
     }
 
+    private void newline(boolean makeToken) {
+        newline(makeToken, false);
+    }
+
     /// Consumes a physical newline and advances the physical line cursor. When `makeToken`
     /// is set and no newline is pending (and this is not a line continuation), schedules a
     /// `NEWLINE` token covering the consumed `\n` and resets `lineHasContent`.
-    private void newline(boolean makeToken) {
+    private void newline(boolean makeToken, boolean hardBreak) {
         var prevLine = line;
         var prevColumn = column;
         line++;
         column = 1;
+        if (hardBreak) {
+            hardNewlineCount++;
+            logicalLineStartLine = line;
+        }
         if (makeToken && !pendingNewline && !lineContinuation) {
             int startByte;
             int endByte;
@@ -1601,11 +1672,14 @@ public final class GdTokenizer {
 
     /// Port of `pop_error()`: the error stack is LIFO, like Godot's `List` back-pop.
     private GdToken popError() {
-        return errorStack.removeLast();
+        var queued = errorStack.removeLast();
+        lastErrorFollowedContinuation = queued.followedContinuation();
+        lastErrorLogicalStartLine = queued.logicalStartLine();
+        return queued.token();
     }
 
     private void pushError(GdToken error) {
-        errorStack.add(error);
+        errorStack.add(new QueuedError(error, lineContinuation, logicalLineStartLine));
     }
 
     // --- Character classification (port of core/string/char_utils.h) ---------------------
@@ -1634,20 +1708,51 @@ public final class GdTokenizer {
         };
     }
 
+    /// Returns the end byte offset of an error-only `0x`/`0X`/`0b`/`0B` prefix (including
+    /// any trailing `_` separators) when `number()` emits only a lexical error (`needDigits`
+    /// remains true), or `-1` when `pos` does not start an error-only radix prefix (including
+    /// valid literals such as `0x1`, `0x_1`, `0b0`, `0b_1`, `0`, or `0.5`).
+    static int errorOnlyRadixLiteralEnd(byte @NotNull [] bytes, int pos) {
+        if (pos + 1 >= bytes.length || bytes[pos] != '0') {
+            return -1;
+        }
+        var prefix = bytes[pos + 1] & 0xFF;
+        int base;
+        if (prefix == 'x' || prefix == 'X') {
+            base = 16;
+        } else if (prefix == 'b' || prefix == 'B') {
+            base = 2;
+        } else {
+            return -1;
+        }
+        var scan = pos + 2;
+        while (scan < bytes.length) {
+            var c = bytes[scan] & 0xFF;
+            if (digitCheck(base, c)) {
+                return -1;
+            }
+            if (!isUnderscore(c)) {
+                break;
+            }
+            scan++;
+        }
+        return scan;
+    }
+
     /// Approximation of Godot's `is_unicode_identifier_start` (XID_Start table that
     /// explicitly includes `_`): JDK `Character.isUnicodeIdentifierStart` (ID_Start) plus
     /// `_`. The ID_Start/XID_Start difference only affects a handful of exotic code points.
     /// The out-of-bounds sentinel 0 is excluded explicitly: unlike Godot's table, the JDK
     /// treats NUL and other identifier-ignorable controls as identifier characters, which
     /// would otherwise loop forever at EOF.
-    private static boolean isUnicodeIdentifierStart(int c) {
+    static boolean isUnicodeIdentifierStart(int c) {
         return c != 0 && (c == '_' || Character.isUnicodeIdentifierStart(c));
     }
 
     /// Approximation of Godot's `is_unicode_identifier_continue` (XID_Continue table that
     /// explicitly includes `_`): JDK `Character.isUnicodeIdentifierPart` plus `_`.
     /// The out-of-bounds sentinel 0 is excluded for the same reason as above.
-    private static boolean isUnicodeIdentifierContinue(int c) {
+    static boolean isUnicodeIdentifierContinue(int c) {
         return c != 0 && (c == '_' || Character.isUnicodeIdentifierPart(c));
     }
 
