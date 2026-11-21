@@ -30,8 +30,8 @@
 | `L-04` `return` 坏值槽 | `FC-3` + `FC-2/6` | 已修复 | 有裸返回与坏值对照；补 `return )` 和 marker 精确范围 | `RG-6` |
 | `L-05` 属性访问器排空 | `FC-5` + `FC-2/6` | 部分修复 | 有重复/未知项；缺混风格重复项单主诊断 | `RG-4` |
 | `L-06` `match` 绑定及 rest | `FC-3` + `FC-2/6` | 已修复 | 有顶层和容器模式；补范围、配对及无级联矩阵 | `RG-6` |
-| `L-07` 空键空值字典项 | `FC-3` + `FC-4/6` | 部分修复 | 双 marker、相邻项已覆盖；组合覆盖待补，是否改父级行为待确认 | `RG-1` |
-| `L-08` 内嵌非法赋值 | `FC-3` + `FC-2/6` | 部分修复 | 直接值槽与左右子树已覆盖；容器组合待补，是否改父级行为待确认 | `RG-1` |
+| `L-07` 空键空值字典项 | `FC-3` + `FC-4/6` | 部分修复 | 双 marker、相邻项已覆盖；组合覆盖与 `EnclosedDamage`（`1B`）待实施 | `RG-1` |
+| `L-08` 内嵌非法赋值 | `FC-3` + `FC-2/6` | 部分修复 | 直接值槽与左右子树已覆盖；容器组合、`EnclosedDamage`（`1B`）及 Lua 键对照待实施 | `RG-1` |
 | `L-09` 恢复中缀及坏类型 | `FC-3` + `FC-4/6` | 部分修复 | 缺类型、`?`、缺 `else` 已有；缺非空坏类型传播 | `RG-1` |
 | `L-10` 语句尾垃圾归属 | `FC-6` + `FC-2` | 部分修复 | 普通尾垃圾已绑语句；孤立 closer 仅检查 code | `RG-3` |
 | `L-11` key-only 字典模式 | `FC-3` + `FC-6` | 已修复 | 纯 Java、旧 mapper、参考、serde 已有；strict 过滤用合成 WARNING | `RG-6` |
@@ -75,18 +75,18 @@
 
 | 项目与精确输入 | 基线行为及根因 | 目标与未覆盖的断言 |
 |---|---|---|
-| `L-07`：`var d = {:}\n`、`var d = {"a": 1, :, "b": 2}\n` | `Parser:9242–9261` 已保留冒号见证的条目和 `dictionary.key`、`dictionary.value` 两个 `MISSING`。`Parser:9275–9276` 将字典作为吸收宿主返回 `Ok`，内部损伤节点、marker 和诊断仍保留。 | `E:1237–1271` 已覆盖结构。补两个精确零宽位置、各诊断的 code/owner/facet 和前后兄弟；`{}`、`{"a":1,}` 不增伪条目。只有 §3 确认了调用方可见的缺口才实施 `R1.1`；否则归 `R5` 补行为覆盖。 |
-| `L-08`：`g([a=1], 2)`、`{1: a=1}`（放入变量初始化或实参） | `Parser:9657–9685` 已返回 `Damaged(AssignmentExpression)`，保留左右并发带归属的 `ASSIGNMENT_DISALLOWED_IN_EXPRESSION`。数组 `Parser:9036–9085` 和字典 `Parser:9275–9276` 吸收后返回 `Ok`，不抹掉坏子树或诊断。`E.assignmentInsideCallArgument:408–437`、`E.nestedAssignmentDegradationKeepsSingleDiagnostic:1909–1950` 保证直接值槽保留节点和 `ERROR`；因此 `parseStrict` 按 `GdScriptParserFacade.java:34–47` 拒绝。 | 对容器组合补公开入口断言：完整赋值、外层实参 `2`、可达的原发诊断和 strict 拒绝；对照合法赋值、健康容器和 `foo([1+])` 的吸收。是否改变某父级消费行为由 §3 决定，不把私有 `ParseOutcome` 差异单独当作缺陷。 |
-| `L-09`：`x as Node.`、`x as Array[Array[int]]`、`x is Array[int`（表达式位置） | `parseTypeInternalImpl(boolean)` 返回 `ParsedType` 而非直接 `TypeRef`。`Parser:7243–7245` 对嵌套容器报错后继续，`:7259–7264` 忽略 `consumeCloser` 结果，`:7267–7273` 消费 `.` 后缺内层名仍可给 `Node` 的 `TypeRef`，范围不含 `.`。`:7157–7160` 解包成普通 `TypeRef`。`parseCast`、`parseTypeTest` 分别在 `:9597`、`:9626` 以非空结果直接建 `Ok`，已有类型诊断不等于有损伤状态。 | 三例都保留左操作数、坏类型实际消费范围（含点号或已读泛型）和原发诊断，不当健康类型参与后续判断。保留 `x as int`、`x is Array[int]` 的零诊断及健康 AST；保留 `x as`、`x is not`、`Array[]` 的单主诊断、恢复 marker 和 serde（`E:1953–2029,2172`）。 |
-| `L-20`：`func f():\n\tfor i: Foo. ??? in xs:\n\t\tpass\n`；将类型替换为 `Array[int` 再跑 | `Parser:5652–5702` 已记录 `sawColon`，但只对 `iteratorType == null` 做有界同行同步。场景 `Foo. ???`、`Array[int ???` 可带非空坏类型绕过同步，当前 token 不是 `in` 时走 `FOR_MISSING_IN`（`parse.for.missing_in`），丢迭代源和循环体。`P:3266–3281` 仅证明空结果路径。 | 两个组合都保住 `xs`、体内 `pass`、外层兄弟和 `for.iterator` 上的原发类型诊断，不报假缺 `in`。真的缺 `in` 时有冒号只提示 `in`，无冒号仍可提示 `in` 或 `:`；不得越过实际块冒号、同行末尾或祖先边界。 |
+| `L-07`：`var d = {:}\n`、`var d = {"a": 1, :, "b": 2}\n` | `Parser:9242–9261` 已保留冒号见证的条目和 `dictionary.key`、`dictionary.value` 两个 `MISSING`。`Parser:9275–9276` 将字典作为吸收宿主返回 `Ok`，掩盖了“本层闭合完整但子树含损伤”的状态。 | `E:1237–1271` 已覆盖结构。按 §3 决策 `1B` 在 `R1.1` 为 `ParseOutcome` 新增第 5 态 `EnclosedDamage`（本层结构完整但含子损伤），字典与数组在内部含损时返回 `EnclosedDamage` 而非伪装 `Ok`；补两个精确零宽位置、各诊断 code/owner/facet 和前后兄弟；`{}`、`{"a":1,}` 不增伪条目。 |
+| `L-08`：`g([a=1], 2)`、`{1: a=1}`（放入变量初始化或实参） | `Parser:9657–9685` 已返回 `Damaged(AssignmentExpression)`，保留左右并发带归属的 `ASSIGNMENT_DISALLOWED_IN_EXPRESSION`。数组 `Parser:9036–9085` 和字典 `Parser:9275–9276` 吸收后返回 `Ok`；同时 `Parser:9188–9202` 的 Lua 键校验对 `{foo(1+) = 2}`（`Damaged`）漏报 `DICTIONARY_INVALID_LUA_KEY`，对 `{[1+] = 2}`（`Ok`）则正常报错。`E.assignmentInsideCallArgument:408–437`、`E.nestedAssignmentDegradationKeepsSingleDiagnostic:1909–1950` 保证直接值槽保留节点和 `ERROR`。 | 按 §3 决策 `1B` 在 `R1.1` 引入 `EnclosedDamage`：数组、字典、已闭合调用/下标在子树受损时返回 `EnclosedDamage`，既保持 D6 吸收与外层续折（如 `foo([1+]).bar`），又让表面形态守门（如 Lua 键 `{[1+] = 2}`、`{foo(1+) = 2}`）识别完整非合法键，同时对本层残缺的 `{(1+) = 2}`（`Damaged`）继续避免二次报错；补公开入口 AST、外层实参 `2`、可达诊断与 strict 拒绝。 |
+| `L-09`：`x as Node.`、`x as Array[Array[int]]`、`x is Array[int`（表达式位置） | `parseTypeInternalImpl(boolean)` 返回 `ParsedType` 而非直接 `TypeRef`。`Parser:7243–7245` 对嵌套容器报错后继续，`:7259–7264` 忽略 `consumeCloser` 结果，`:7267–7273` 消费 `.` 后缺内层名仍可给 `Node` 的 `TypeRef`，范围不含 `.`。`:7157–7160` 解包成普通 `TypeRef`，且 7 处调用点均靠 `diagnosticCount() == diagBefore` 区分未写与已报错失败。`parseCast`、`parseTypeTest` 分别在 `:9597`、`:9626` 以非空结果直接建 `Ok`。 | 按 §3 决策 `2B` 在 `R1.2` 将 `parseTypeInternal` 统一返回 `ParseOutcome<ParsedType>`，消除 7 处 `diagBefore` 计数判断；三例保留左操作数、坏类型实际消费范围（含 `.` 或已读泛型）和原发诊断，不再伪装 `Ok`（并核实 `as`/`is` 无活跃帧时的 `MISSING_CLOSER_TYPE_BRACKET` 发射安全）。保留 `x as int`、`x is Array[int]` 零诊断健康 AST；保留 `x as`、`x is not`、`Array[]` 单主诊断、恢复 marker 和 serde（`E:1953–2029,2172`）。 |
+| `L-20`：`func f():\n\tfor i: Foo. ??? in xs:\n\t\tpass\n`；将类型替换为 `Array[int` 再跑 | `Parser:5652–5702` 已记录 `sawColon`，但只对 `iteratorType == null` 做有界同行同步。场景 `Foo. ???`、`Array[int ???` 可带非空坏类型绕过同步，当前 token 不是 `in` 时走 `FOR_MISSING_IN`（`parse.for.missing_in`），丢迭代源和循环体。`P:3266–3281` 仅证明空结果路径。 | 借助 `R1.2` 的 `ParseOutcome<ParsedType>`（`Missing`/`Failed`/`Damaged`/`EnclosedDamage` 均触发同行有界同步），两个组合保住 `xs`、体内 `pass`、外层兄弟和 `for.iterator` 原发类型诊断，不报假缺 `in`。真的缺 `in` 时有冒号只提示 `in`，无冒号仍可提示 `in` 或 `:`；不得越过实际块冒号、同行末尾或祖先边界。 |
 
 ### 2.2 `RG-2`：局部同步、泛型逗号与深度熔断错闭合
 
 - **`L-18`／原 5b。** `func f():\n\tfoo(1+, func(): = [1)\n\tpass\nvar after = 1\n`。`synchronize()` 在 `Parser:3284–3301` 要求括号局部计数全归零才询问祖先逗号/closer；`:3318–3334` 对各类括号独立加减，遇 `)` 不撤销同步时留下的 `[`。这个组合会让 `)` 被同步消费，外层误报 `parse.missing_closer.call`，并丢 `pass` 和 `after`。预期把 `)` 交给外层 `foo`，保住调用、两个作用域中的后继节点，只保留有因果关系的坏实参/坏体诊断。`E:1488–1490,1823–1827,2751` 的正常 lambda、已有损伤及替换 closer 是回归对照，不等于测过局部遗留 opener。
 - **`L-23`。** `var x = g(func() -> Dictionary[String, Array[\n,\n\tnode.\n\tpa\n)\n` 当前把首个逗号交给 `g`，随后把未闭 `Array[` 解析为外层 `SubscriptExpression`，形成三个实参和次生下标错。在有祖先逗号所有者时，`shouldContinueDictionaryTypeComma` 只接受 `BracketBalanceOracle` 已精确配对、且 closer 位于逗号之后的 `Dictionary`（`Parser:7181–7192`）。若走类型元素路径，嵌套容器本来就会报错（`:7243–7245`）；达参数上限或该容器不允许逗号时，`:7249–7252` 已退回 `NONE` 并跳出，不会到 `:7256` 再判断逗号。不能只放宽该辅助方法，也不能把坏嵌套改成合法类型。
   - 补全分类已锁定：`C:477` 的 `var x = g(func() -> Dictionary[String, Array[\n,\n\tnode.\n\tpa|\n)` 由 `C.matchPatternsAndDamagedTypesDoNotLeakFrames:461–464` 在 facade 和空 AST 两入口期望 `MEMBER_ACCESS`，替换 `pa`，receiver 为 `node`。换行后的外层逗号已让未闭的 `Role.TYPE` 退出，`node.pa` 不是跨行类型续写；`TYPE_POSITION` 必须满足 `receiverRange == null`（`CompletionContext.java:17–47`）。
-  - 是否避免三实参和派生下标错，以及是否改变未配对字典的坏逗号优先级，先按 §3 裁定。若裁定跨行坏片段应留在类型恢复中，验证 `g` 的两个实参是带坏类型的无体 lambda 和 `node.pa`，并保持既有补全分类与 receiver。
-  - 每个调整用例都配 `var x = g(func() -> Dictionary[String, Array[i])` 和把 `Array[i]` 换成裸标识符 `other` 的同行对照。恢复 AST 必须保留两种真实第二实参；在 `Ar|ray[i]` 和 `oth|er` 处，两入口应给外层 `IDENTIFIER`，不能给 `TYPE_POSITION`。`C.trustedTypesDistinguishOpenCaretSlotsAndCommaOwners:1197–1200` 的数据（`C:1214–1222`）已有未闭字典 `oth|er` 对照；跨行坏例和两种未闭字典对照都必须 `parseStrict` 拒绝。合法 `Dictionary[String, int]` 的内部逗号另作零诊断对照。
+  - 按 §3 决策 `3A`（保持未配对 `Dictionary` 让逗号给外层的既定规则，不修改 `shouldContinueDictionaryTypeComma` 的坏逗号优先级）：对跨行坏嵌套只锁非法嵌套/缺闭合严格报错、无体 lambda 与 `node.pa` 存活且补全保持 `MEMBER_ACCESS`，不因该残缺样本改动外层逗号归属策略。
+  - 配对对照 `var x = g(func() -> Dictionary[String, Array[i])` 和把 `Array[i]` 换成裸标识符 `other` 的同行用例：恢复 AST 必须保留两种真实第二实参；在 `Ar|ray[i]` 和 `oth|er` 处，两入口给外层 `IDENTIFIER`，不给 `TYPE_POSITION`。`C.trustedTypesDistinguishOpenCaretSlotsAndCommaOwners:1197–1200` 的数据（`C:1214–1222`）已有未闭字典 `oth|er` 对照；跨行坏例和两种未闭字典对照都必须 `parseStrict` 拒绝。合法 `Dictionary[String, int]` 的内部逗号另作零诊断对照。
 - **`L-26`。** 在 `match` 分支头拼 `"[".repeat(260) + "1}" + "]".repeat(259) + ":"`，带有体、后续 `_:`、函数内 `local_after` 和顶层 `after`；再用 `([1})` 变体并接 260 个 `]` 验证祖先 closer 优先。深度预算为 256（`Parser:254,3352–3375`）。`unwindPoisonedBracketChain` 在 `Parser:2742–2760` 找不到同类未入栈 opener 时清空整条链，剩余真 `]` 越过应有作用域，产生派生 `parse.missing_separator.match_colon`。修复应优先交给真祖先，否则只替换最内一层；不把预算加大来掩盖。`E:742,781,2456,2540` 有常规深度熔断，组合缺错配插入、精确诊断和线性步数。
 
 ### 2.3 `RG-3`：归属链断开、语句尾绕行与位置门禁
@@ -95,7 +95,7 @@
 - **`L-29.1`，丢弃的参数默认值。** `func f(x, x = func(): return (1`。重复参数默认值被丢弃后，内层 lambda 套件的归属授权没有连到仍存活的签名（`Parser:3017–3040,8489–8496,8668–8671`），终结器找不到合法 owner/facet 时保留诊断、清空链接（`Tracker:614–631`）。**`GdScriptParserErrorRecoveryTest.recoveryLinkOfDiscardedOwnerIsSwept`（`E:1368–1383`）用 `assertNull` 锁住这个残余缺陷。** 改为断言仅一个参数保留、分组缺 `)` 的原 code 和 EOF 零宽范围不变，并通过显式授权连到同代存活签名的合法 facet，不允许把已丢弃的 lambda 当 owner。
 - **`L-29.2`，存活类体与套件。** `class Outer:\n\tclass Inner:\n\t\tstatic\n\t\tpass\n`，以及将 `static` 替换成 `% ^ &` 的变体：`Parser:3999–4005,4086–4113,2955–2962` 的 legacy 发射不经过 owner 决策（`Tracker:374–389`），即使 `Inner` 存活也可无链接。`func f():\n\t)\n\tpass\n`（`Parser:5448–5450`）和 `class C:\n\t)\n\tpass\n`（`:4086–4090`）在第一条语句前遇孤立 `)` 时也无链接。前者应绑定 `f` 的 `suite.body`，后者应绑定 `C` 的 `class.body`；嵌套类中的垃圾绑定 `Inner` 而非外层类。`func f():\n\tpass\n\t)\n\tpass\n` 的孤立 closer 即使被上条语句的收尾消费，也只能绑套件而非 `pass`。范围锚实际 token，保留健康后继，区分真正顶层孤立例外；顺带核实 legacy 回退的其他路径是否可达，不做笼统改绑。
   - 另有两条类体路径：`class C:\n\tfunc 1\n\tpass\n` 在建立函数签名 frame 前拒绝无效函数名（`Parser:8334–8337`）；`class C:\n\t"doc" var a = 1\n\tpass\n` 在 `notStandaloneDocstring()` 中报告说明字符串后缺换行（`Parser:3913–3918`）。两例的 `parse.syntax.unexpected_token` 在基线均无链接；应连到同次解析仍存活的 `C`，facet 为 `class.body`，且后续 `pass` 仍留在 `C` 中。
-- **`L-29.3`，套件熔断。** 构造有宿主的函数或 lambda，用连续 105 次真实语句失败触发预算，再接同级或外层健康后继。`Parser:4463–4470,4483–4490` 强制 standalone；实际常量为 `STATEMENT_TOO_MANY_ERRORS`（`parse.statement.too_many_errors`）。`Codes:458` 为空 facet 集，故先确认 §3 的配对方案，再断言单个熔断诊断、存活结构和归属；不要通过解绑整批诊断来绕过门禁。
+- **`L-29.3`，套件熔断。** 构造有宿主的函数或 lambda，用连续 105 次真实语句失败触发预算，再接同级或外层健康后继。`Parser:4463–4470,4483–4490` 强制 standalone；实际常量为 `STATEMENT_TOO_MANY_ERRORS`（`parse.statement.too_many_errors`）。按 §3 决策 `4B-A`，在 `Codes:458` 开放 `Set.of("suite.body")`，有存活套件宿主时归属该宿主，无宿主时保持 `null`，断言单个熔断诊断、存活结构和归属；不要通过解绑整批诊断来绕过门禁。
 - **`L-29.4`，门禁位置。** `V:1132–1141` 校验已连 owner 的身份和配对，但空链接只按 `allowsNullRecovery(code)` 放行。增加同 code 的顶层孤立正例、存活套件/类内负例、确属独立词法错误对照，以及多次独立解析的同代身份检查。具体允许位置来自基线语法和发射上下文，不能只凭范围落入某 AST 包络猜 owner。
 
 ### 2.4 `RG-4`：块头与容器边界启发式、混风格重复诊断
@@ -165,20 +165,20 @@
 | `L-28` | 接入纯 Java `CompletionContext`，覆盖八枚举与新旧客户端映射。`PARAMETER_NAME` 默认不推荐旧变量，`SUITE_START` 接语句关键字，`EXPECTED_KEYWORD` 在本槽只建议 `in`；旧公开映射必要时降为 `UNKNOWN`。验证同代 receiver、CRLF/UTF-8 替换范围和健康体。 |
 | `L-30a/b/c` | 根据 parser code 合并派生左值/直接调用错误，同时保留真实语义限制；推断标记接受 `:=`、`: =`、`:\t=`；过渡期拒绝旧声明式及新表达式式的裸 lambda，不误拒绝合法 `.call()`、赋值或实参。 |
 
-## 3. 涉及契约或架构的待确认事项
+## 3. 契约与架构决策记录
 
-这些不是实施授权。先确认影响面，再在对应阶段写下裁定及正反例，不在本轮文档内预先改变 ABI、AST、诊断或另一个仓库的行为。
+以下各项均已完成用户裁定或明确边界，作为 `R1`–`R6` 的实施依据；未获单独授权前仍不越界修改公开 AST/API 或下游 GDCC 仓库。
 
-| 保留点 | 需确认的选择与限制 |
-|---|---|
-| D6：组合损伤与吸收（`L-07/08`） | `9024e36` 数组（`Parser:9036–9085`）和字典（`:9275–9276`）返回宿主 `Ok`，内部 `Damaged` 的节点或 marker 与原诊断仍保存；非法值位置赋值已建完整 `AssignmentExpression`、返回 `Damaged`（`:9681–9685`）且诊断使 strict 拒绝，见 §2.1。只在明确具体消费方、可公开观察的父级错误、基线失败测试及 `foo([1+])` 的基线吸收对照之后，才确认是否缩小吸收范围；仅私有结果不同不足以改 D6。若不需要改调用方行为，保持 D6，两组用例转 `R5`。 |
-| 类型结果（`L-09/20`，关联 `L-23`） | 比较 `ParseOutcome<TypeRef>`（若采用须额外保留 `isContainer`，或以 `ParsedType` 为实际内部结果）与扩展现有 `ParsedType` 的损伤状态。明确未写、已报错且无结果、已报错但有残片、正常四态由谁消费；本轮不随意改公开 `TypeRef`、serde 或把诊断计数当损伤协议。 |
-| 未配对 `Dictionary` 的坏逗号优先级（`L-23`／`R2.2`） | 有祖先调用时，未配对 `Dictionary` 默认让逗号（`Parser:7181–7192`）；若进入类型参数路径，嵌套类型在 `:7243–7245` 被拒绝，且已达参数上限（或该容器不允许逗号）时 `:7249–7252` 将分隔状态清为 `NONE` 并在 `:7256` 前退出。先确认跨行坏例 `Dictionary[String, Array[\n,\n\tnode.\n\tpa\n)` 是否只消除次生下标/三实参，还是可窄化调整坏逗号优先级。不得吞掉 `g(func() -> Dictionary[String, Array[i])` 的真实外层 `Array[i]` 或裸标识符实参；`C:1214–1222` 明确保留未闭字典中的外层实参解释。两组坏例都维持 strict 拒绝，非法嵌套决不能成为有效字典类型参数。 |
-| 语句尾孤立 closer（`L-10/29`） | 同行尾部绑定 `statement.trailing`：可保留 `UNEXPECTED_CLOSER`（所需配对已存在），或按兼容性决定改用 `STATEMENT_TRAILING`（`parse.statement.trailing`）；不扩大此选择至容器内孤立 closer。须锁定裸 `return )` 值槽、`suite.body`/`class.body`、祖先所有权与真正顶层孤立例外。 |
-| 套件熔断及位置门禁（`L-29`） | 确认 `STATEMENT_TOO_MANY_ERRORS` 是否开放存活容器 facet、哪些宿主可用、跨废弃子帧怎么授权；不授予 `SourceFile` 或通用兜底所有者。对类体垃圾与被丢默认值，同样先确认语义上最近且被授权的存活宿主，不盲目从树包络回推。 |
-| strict WARNING 夹具（`L-11`） | 当前纯 Java 没有调用 `Tracker:391–395` 的生产 WARNING 路径，旧 mapper 的 warning 不代表纯 Java 能发。默认保留合成结果的 `F.requireStrictSkipsWarningsAndThrowsFirstError:67–78` 和 `F.requireStrictDoesNotThrowOnWarningsOnly:81–88` 两个过滤测试。若强制真 WARNING，先确认可靠来源与范围，不为测试发明解析规则或借用已经合法的 key-only。 |
-| 配对、跨行与诊断主次（`L-05/16/24`） | 双诊断同源时为混风格重复项指定主诊断；`{"a"\n\t"b":1}` 的两个问题不是本例同源，暂以 `E:2948–2952` 的独立漏逗号对照为准。`->` 修复只区分签名续词和可信套件，不扩大一般多行语法。 |
-| 旧路径与跨仓（`RG-7`） | 不将纯 Java 新枚举塞进旧五枚举，也不为 fallback 重写 Pratt。GDCC 联调须等版本和授权；不把它挡在本仓库补强阶段的本地验收路径上。 |
+| 决策项 | 状态 | 最终裁定与实施边界 |
+|---|---|---|
+| 决策 1（`1B`）：`ParseOutcome` 五态扩展与 D6 容器吸收（`L-07/08`） | **已确认（`1B`）** | 在包私有 `ParseOutcome<T>` 中新增第 5 个 record `EnclosedDamage<T>(T value)`，表达“本层语法结构完整且边界已收口，但子树含损伤”（同时清理零调用死方法 `isOk()`/`valueOrNull()`）。数组（`Parser:9036–9085`）、字典（`:9275–9276`）、已闭合调用/下标/分组在子树受损时返回 `EnclosedDamage` 而非伪装 `Ok`：一方面保留 D6 吸收语义（外层继续 Pratt/后缀折叠，如 `foo([1+]).bar` 正常折叠）；另一方面让表面形态守门（如 `Parser:9188–9202` Lua 键校验对 `{[1+] = 2}`、`{foo(1+) = 2}` 报 `DICTIONARY_INVALID_LUA_KEY`，而本层残缺的 `{(1+) = 2}` 走 `Damaged` 继续避免二次报错）行为一致。同步修正 `doc/pure-java-recovery-and-completion-plan.md` 与 `doc/godot-java-parser-implementation.md` 中已落后于 `9024e36` 的 4 处旧 `ParseOutcome` 描述。 |
+| 决策 2（`2B`）：`parseTypeInternal` 统一返回 `ParseOutcome<ParsedType>`（`L-09/20`） | **已确认（`2B`）** | 将 `parseTypeInternal` 改造为返回 `ParseOutcome<ParsedType>`（保留 `ParsedType.isContainer()`，公开 `TypeRef` 与 serde 不变），覆盖全部 6 处 `parseType` 调用点 + 1 处递归调用，彻底消除 7 处 `diagnosticCount() == diagBefore` 计数判断：`Missing` 由调用方补发上下文 `MISSING_TYPE_*`；`Failed`（如 `Array[]`/非法 `void`）禁双报；`Damaged`/`EnclosedDamage`（如 `Foo.` 含点号范围、`Array[int` 缺 `]`、`Array[Array[int]]` 非法嵌套）让 `parseCast`/`parseTypeTest` 准确传播损伤、让 `parseFor` 触发同行 `in` 同步；同时核实并加固 `as`/`is` 无活跃帧时 `MISSING_CLOSER_TYPE_BRACKET` 的安全发射。 |
+| 决策 3（`3A`）：未配对 `Dictionary` 的坏逗号优先级（`L-23`／`R2.2`） | **已确认（`3A`）** | 保持 `shouldContinueDictionaryTypeComma`（`Parser:7181–7192`）“有祖先逗号所有者且 `Dictionary[` 未精确配对时让逗号给外层”的规则不变，不引入脆弱的坏逗号启发式；保护同行真实第二实参 `g(func() -> Dictionary[String, Array[i])` / `other` 与 `C:1214–1222` 的外层 `IDENTIFIER` 解释，同时在 `R2.2` 补齐跨行坏嵌套的非法嵌套/缺闭合 strict 拒绝与 `node.pa` 存活/补全回归测试。 |
+| 决策 4A（`4A`）：语句尾孤立 closer 诊断码（`L-10`／`R3.1`） | **已确认（`4A`）** | 保留 `UNEXPECTED_CLOSER`（`parse.unexpected_closer`，`Codes:267–282,449–457` 已注册所需全部配对），按位置精确绑定归属：同行尾 `pass )`/`return 1 )` 绑原语句 `statement.trailing`，跨行/套件首 `)` 绑存活套件宿主 `suite.body`，类体首 `)` 绑存活类 `class.body`，真正无宿主的顶层 `)` 保持 `null`；祖先拥有的 closer 不进入上述孤立恢复路径。 |
+| 决策 4B（`4B-A`）：套件熔断归属（`L-29`／`R3.2`） | **已确认（`4B-A`）** | 在 `DiagnosticCodes.java:458` 为 `STATEMENT_TOO_MANY_ERRORS`（`parse.statement.too_many_errors`）开放 `Set.of("suite.body")`。当熔断发生在存活函数/构造器/lambda/控制块等套件宿主内时归属该宿主，无宿主时保持 `null`，不授予 `SourceFile` 或兜底所有者，使 `R3` 起的位置感知 `I5` 门禁实现零例外。 |
+| strict WARNING 夹具（`L-11`） | 保持现状 | 当前纯 Java 无调用 `Tracker:391–395` 的生产 WARNING 路径；保留合成结果的 `F.requireStrictSkipsWarningsAndThrowsFirstError:67–78` 和 `F.requireStrictDoesNotThrowOnWarningsOnly:81–88`，不为测试发明解析规则。 |
+| 配对、跨行与诊断主次（`L-05/16/24`） | 已定基线 | `L-05` 混风格重复项保留首项、排空后项且每坏项发单一主诊断；`L-16` 以键末消费 token 物理行判同行值且保持 `key.range()` 解包合同；`L-24` 只交接受损签名后的可信 `->` 且负对照 `func f(a):\n\t-> int: pass\n` 不误判为返回类型。 |
+| 旧路径与跨仓（`RG-7`） | 保持边界 | 不将纯 Java 八枚举塞进旧五枚举，也不为独立无 AST 补全回退重写 Pratt `as` 解析器；GDCC 联调（`R6`）待独立授权后跨仓执行。 |
 
 ## 4. 分阶段修复措施
 
@@ -190,38 +190,38 @@
 4. **`I5` 分阶段验收。** `R1`、`R2` 零新增违规；所有新增或改变的诊断均须有稳定码及符合位置和宿主身份的归属。只暂留 `R3.2` 位置门禁清单中已记录且本阶段未改变的基线违规：同行尾、跨 `NEWLINE`、套件或类体首项前的孤立 closer；类体 `static`、`% ^ &`、`func 1`、`"doc" var a = 1`；重复参数被丢弃的 lambda 默认值；套件熔断。不得扩大豁免或仅按 code 放行。从 `R3` 起这些违规全部归零，执行完整的位置感知 `I5`。合法的独立词法错误和真正无宿主的顶层孤立垃圾不属于违规。
 5. **退出条件。** 每阶段 `git diff --check HEAD` 清洁，专测和范围门禁通过；双独立审阅意见已处理并复核，无未处置阻塞、高或中风险，契约事项有明确决定。无法解决的问题保留为显式阻塞，不签为已完成。文档整编本身不触发实现构建。
 
-### 4.2 `R1`：损伤状态保真（`RG-1`）
+### 4.2 `R1`：损伤状态保真（`RG-1`，按决策 `1B + 2B`）
 
-**目标与前置：** 保存损伤的可观察语义，不破坏已登记的吸收和 AST 合同。先确认 §3 的容器与类型结果策略；不依赖 `R2` 修复即可复现。
+**目标与前置：** 扩展 `ParseOutcome<T>` 五态（新增 `EnclosedDamage`）并将类型解析统一纳入 `ParseOutcome<ParsedType>`，消除伪装 `Ok` 与 7 处 `diagBefore` 诊断计数判断，同时保留 D6 吸收续折与公开 AST 合同。不依赖 `R2` 即可独立实施。
 
 | 子任务 | 改动锚点与约束 | 行为必测 |
 |---|---|---|
-| `R1.1` 容器组合传播（有条件） | `Parser:9036–9085,9097–9276,9657–9685`。先通过 §3 的 D6 前置确认：点名具体消费方，用其对外可见的父级行为在 `9024e36` 上复现失败。若没有需要修复的调用方行为，D6 不改，`L-07/08` 组合转 `R5`。 | 失败用例必须和基线通过的 `foo([1+])` 吸收控制配对，不单测私有 `ParseOutcome`。`L-07/08` 断言结构、诊断与 strict；保留健康同级实参、尾逗号、空容器和合法赋值。 |
-| `R1.2` 类型四态贯通 | `Parser:7157–7179,7194–7274,9579–9649`。记录部分已消费范围和 closer 结果；不把未写、坏点链、坏类型元素混成缺类型，也不双报。 | 三个 `L-09` 例、`x as`/`x is not`、`Array[]`/`void`、健康 cast/type test；补 marker/类型残片 serde 和 UTF-8 精确范围。 |
-| `R1.3` `for` 保住迭代源 | `Parser:5652–5702`。同行同步依赖明确的坏类型状态，复用现有停止条件。 | 两个非空坏类型；真正缺 `in` 的有/无冒号、健康类型、祖先 closer 或逗号前停住。 |
+| `R1.1` `ParseOutcome` 五态扩展与容器/Lua 键对齐（`1B`） | `ParseOutcome.java:16–69`、`Parser:8882–9976`（重点 `:9036–9085,9097–9276,9657–9685`）。新增 `EnclosedDamage<T>(T value)`，清理死方法 `isOk()`/`valueOrNull()`。明确五态合并：本层完整但子项为 `Damaged`/`EnclosedDamage`/`Missing`/`Failed` 吸收时返回 `EnclosedDamage`；本层残缺返回 `Damaged`。`parsePrecedence`/`parseSuffixChain`/`absorbSlot`/`parseStatement` 对 `Ok`/`EnclosedDamage`/`Damaged` 维持一致续折与槽位吸收；`Parser:9188–9202` Lua 键校验对 `Ok` 与 `EnclosedDamage` 均执行键形态检查（`{[1+] = 2}`、`{foo(1+) = 2}` 报 `DICTIONARY_INVALID_LUA_KEY`），仅 `Damaged`（如 `{(1+) = 2}`）豁免。同步更新 `doc/pure-java-recovery-and-completion-plan.md` 与 `doc/godot-java-parser-implementation.md` 的 4 处旧 `ParseOutcome` 描述。 | `L-07/08`（`{:}`、`{"a":1,:, "b":2}`、`g([a=1], 2)`、`{1: a=1}`）断言结构、零宽 marker、精确诊断/归属与 strict 拒绝；Lua 键三对照 `{[1+] = 2}`、`{foo(1+) = 2}`（均报 `DICTIONARY_INVALID_LUA_KEY`）与 `{(1+) = 2}`（不二次报）；`foo([1+]).bar` 吸收续折正对照；健康同级实参、尾逗号、空容器和合法赋值。 |
+| `R1.2` 类型解析五态化与 `ParseOutcome<ParsedType>`（`2B`） | `Parser:7157–7179,7194–7274,7372,7877,8548,9579–9649`。`parseTypeInternal` 改为返回 `ParseOutcome<ParsedType>`，6 处 `parseType` 调用点 + 1 处递归统一按 `Ok`/`EnclosedDamage`/`Damaged`/`Missing`/`Failed` 分派，删除 7 处 `diagnosticCount() == diagBefore` hack；修复 `Foo.` 使 `typeEnd` 包含已消费 `.` 并返回 `Damaged`；`Array[int` 缺 `]` 返回 `Damaged`，`Array[Array[int]]` 非法嵌套返回 `EnclosedDamage`/`Damaged`；核实并加固 `as`/`is` 无活跃帧时 `MISSING_CLOSER_TYPE_BRACKET` 的归属发射，禁止抛出 `IllegalStateException`。公开 `TypeRef` 与 serde 保持不变。 | 三个 `L-09` 例（含 `Foo.` 含点号字节范围与 `var`/`param`/`return` 处点号范围）、`x as`/`x is not`、`Array[]`/`void`、健康 cast/type test、`as`/`is` 顶层独立表达式缺 `]` 防崩用例；补 marker/类型残片 serde 和 UTF-8 精确范围。 |
+| `R1.3` `for` 保住迭代源 | `Parser:5652–5702`。改用 `parseTypeInternal(false)` 返回的 `ParseOutcome<ParsedType>`：`Missing` 补发 `MISSING_TYPE_FOR_ITERATOR`，凡非 `Ok`（`Missing`/`Failed`/`Damaged`/`EnclosedDamage`）均复用现有边界守卫执行同行 `in` 同步。 | 两个非空坏类型（`Foo. ??? in xs:`、`Array[int ??? in xs:`）保住 `xs`/`pass`/外层兄弟且无假 `FOR_MISSING_IN`；真正缺 `in` 的有/无冒号、健康类型、祖先 closer 或逗号前停住。 |
 
-**出口：** `GdScriptParserTest`、`GdScriptParserErrorRecoveryTest`、`GdScriptParserRangeInvariantTest`、`GdScriptParserFacadeTest`、`AstSexprSerdeTest`；两个 `for` 样本均保 `xs`/`pass` 且无 `FOR_MISSING_IN`。零新增 `I5` 违规，改变或新增的诊断全部检查准确归属；只暂留 §4.1 所列、未触及的基线例。
+**出口：** `GdScriptParserTest`、`GdScriptParserErrorRecoveryTest`、`GdScriptParserRangeInvariantTest`、`GdScriptParserFacadeTest`、`AstSexprSerdeTest`；两个 `for` 样本均保 `xs`/`pass` 且无 `FOR_MISSING_IN`，`{foo(1+) = 2}` 与 `{[1+] = 2}` 行为一致且 `{(1+) = 2}` 无二次错，`foo([1+]).bar` 不回归；零新增 `I5` 违规，改变或新增的诊断全部检查准确归属，只暂留 §4.1 所列未触及的基线例。
 
-### 4.3 `R2`：结构边界与熔断配平（`RG-2`）
+### 4.3 `R2`：结构边界与熔断配平（`RG-2`，按决策 `3A`）
 
-**目标与前置：** 局部错误不夺祖先 token。`R2.1`、`R2.3` 可独立复现；`R2.2` 须先确认 §3 未配对字典的坏逗号合同，并在 `R1.2` 类型结果合同明确后集成。
+**目标与前置：** 局部错误不夺祖先 token。`R2.1`、`R2.3` 可独立复现；`R2.2` 按决策 `3A` 保持未配对 `Dictionary` 让逗号给外层的规则，在 `R1.2` 类型结果合同落地后补齐正反回归验证。
 
 | 子任务 | 改动锚点与约束 | 行为必测 |
 |---|---|---|
 | `R2.1` 同步中的局部括号 | `Parser:3243–3346,1051–1059`。局部 opener 使用与祖先边界兼容的匹配/替换规则；不反复遍历无界祖先，不把匹配的外层 closer 当同步垃圾。 | `L-18`/原 5b 的 `= [1)`、局部精确匹配与单替换、祖先逗号、`assert(1+, func(): pass)`、健康 lambda。 |
-| `R2.2` 泛型内部和外部逗号（待裁定） | `Parser:1014–1021,7181–7192,7223–7259,8681–8685`。只按 §3 批准的规则修跨行三实参/派生下标错，或窄化坏逗号归属；不绕过嵌套类型禁令或全局放开 `TYPE_BRACKET` 多行。 | 每个跨行改善样本配同一行的 `g(func() -> Dictionary[String, Array[i])` 及裸标识符外层实参：锁 AST 实参归属、两入口的 `MEMBER_ACCESS`/外层实参分类和范围，所有未闭/非法嵌套例 strict 仍拒绝；已配对的合法字典类型另测零诊断。 |
+| `R2.2` 泛型内外逗号回归锁定（`3A`） | `Parser:7181–7192,7223–7259`（不改动未配对 `Dictionary` 让逗号给外层的规则，不绕过嵌套类型禁令或全局放开 `TYPE_BRACKET` 多行）。 | 跨行坏嵌套 `g(func() -> Dictionary[String, Array[\n,\n\tnode.\n\tpa\n)` 锁非法嵌套/缺闭合 strict 拒绝、无体 lambda 与 `node.pa` 存活及双入口 `MEMBER_ACCESS`；同行正对照 `g(func() -> Dictionary[String, Array[i])` 与 `other` 锁真实第二实参、双入口外层 `IDENTIFIER` 及 strict 拒绝；已配对 `Dictionary[String, int]` 测零诊断。 |
 | `R2.3` 未入栈错闭合 | `Parser:2701–2853,3352–3375`。未入栈链按种类索引或等价有界配平；优先匹配真祖先，否则单层替换，不能清整条链或抬高预算。 | 两个 `L-26` 样本、全配对版本、EOF 截断、260 层内外兄弟，以及递增错配风暴的实际计数。 |
 
 **出口：** `GdScriptParserErrorRecoveryTest`、`GdScriptParserRangeInvariantTest`、`GdCompletionContextTest`；原 5b 的 `pass`、`after` 皆存活，`R2.3` 不新增假缺冒号，遵守三栈、单扫描及线性门禁。零新增 `I5` 违规，改变或新增的诊断全部检查准确归属；只暂留 §4.1 所列、未触及的基线例。
 
-### 4.4 `R3`：诊断归属与块边界（`RG-3`、`RG-4`）
+### 4.4 `R3`：诊断归属与块边界（`RG-3`、`RG-4`，按决策 `4A + 4B-A`）
 
-**目标与前置：** 错误绑定到存活构造、不连健康外层；限制同一坏项的重复诊断。先确认 §3 的 code/facet 与主诊断策略；与 `R2` 的祖先 closer 行为联验，与 `R1` 共测类型/签名组合。
+**目标与前置：** 错误绑定到存活构造、不连健康外层；限制同一坏项的重复诊断。按决策 `4A`（保留 `UNEXPECTED_CLOSER` 按位置绑定）与 `4B-A`（`STATEMENT_TOO_MANY_ERRORS` 开放 `suite.body`）落地；与 `R2` 的祖先 closer 行为联验，与 `R1` 共测类型/签名组合。
 
 | 子任务 | 改动锚点与约束 | 行为必测 |
 |---|---|---|
-| `R3.1` 同行语句尾 closer | `Parser:3524–3675,1160–1167`，已注册配对见 `Codes:267–282,449–457`。保留 `NEWLINE` 边界的信息，先判祖先归属再区分同行尾部与下一行；不能把收尾读取的每个 closer 都绑给语句。 | 套件内同一行 `pass )`、`return 1 )` 只绑原语句 `statement.trailing`；`func f():\n\tpass\n\t)\n\tpass\n` 只能绑套件 `suite.body`。普通尾垃圾不回归，祖先 closer 不被当作垃圾；断言范围、稳定码、owner/facet 和后继。 |
-| `R3.2` 独立 closer、丢弃树与熔断归属 | `Parser:2955–2962,3017–3040,3913–3918,3999–4113,4463–4490,5448–5450,8334–8337,8489–8496,8668–8671`，`Tracker:614–631`、`Codes:267–282,449–458`、`V:1132–1141`。沿合法授权回退，位置检查不代替注册闭集。 | 首项前 `func f():\n\t)\n\tpass\n` 绑 `suite.body`，`class C:\n\t)\n\tpass\n` 绑 `class.body`；跨 `NEWLINE` 的套件 closer 仍绑 `suite.body`，与 `R3.1` 同行尾一起纳入位置门禁。祖先 closer 不走这三类恢复，真正无宿主的顶层 `)\n` 保持 null。`class C:\n\tfunc 1\n\tpass\n`、`class C:\n\t"doc" var a = 1\n\tpass\n` 均断言 `parse.syntax.unexpected_token` 的 owner 与存活 `C` 是同一对象、facet 为 `class.body`、后续 `pass` 保留。修默认值旧锁、类体 `static`/`% ^ &` 和熔断；独立词法正例仍通过。 |
+| `R3.1` 同行语句尾 closer（`4A`） | `Parser:3524–3675,1160–1167`，已注册配对见 `Codes:267–282,449–457`。保留 `UNEXPECTED_CLOSER` 诊断码与 `NEWLINE` 边界信息，先判祖先归属再区分同行尾部与下一行；不能把收尾读取的每个 closer 都绑给语句。 | 套件内同一行 `pass )`、`return 1 )` 均发 `UNEXPECTED_CLOSER` 并绑原语句 `statement.trailing`；`func f():\n\tpass\n\t)\n\tpass\n` 只能绑套件 `suite.body`。普通尾垃圾不回归，祖先 closer 不被当作垃圾；断言范围、稳定码、owner/facet 和后继。 |
+| `R3.2` 独立 closer、丢弃树与熔断归属（`4A + 4B-A`） | `Parser:2955–2962,3017–3040,3913–3918,3999–4113,4463–4490,5448–5450,8334–8337,8489–8496,8668–8671`，`Tracker:614–631`、`Codes:267–282,449–458`、`V:1132–1141`。在 `Codes:458` 将 `STATEMENT_TOO_MANY_ERRORS` 改为 `Set.of("suite.body")`，在 `parseSuiteImpl` 有存活套件宿主时归属该宿主（无宿主保持 `null`）；沿合法授权回退，位置检查不代替注册闭集。 | 首项前 `func f():\n\t)\n\tpass\n` 绑 `suite.body`，`class C:\n\t)\n\tpass\n` 绑 `class.body`；跨 `NEWLINE` 的套件 closer 仍绑 `suite.body`，与 `R3.1` 同行尾一起纳入位置门禁。祖先 closer 不走这三类恢复，真正无宿主的顶层 `)\n` 保持 null。`class C:\n\tfunc 1\n\tpass\n`、`class C:\n\t"doc" var a = 1\n\tpass\n` 均断言 `parse.syntax.unexpected_token` 的 owner 与存活 `C` 是同一对象、facet 为 `class.body`、后续 `pass` 保留。修默认值旧锁、类体 `static`/`% ^ &` 和熔断（存活函数/lambda 熔断归属宿主 `suite.body`）；独立词法正例仍通过。 |
 | `R3.3` 属性重复主诊断 | `Parser:7572–7619,7784–7787`。保持第一项、排空后项，对每坏项用一个主诊断，不降低对独立错误的报告。 | 两种 getter 混写、setter 对照、单纯风格错、全合法，锁各诊断位置及健康后续成员。 |
 | `R3.4` 字典键结束同行 | `Parser:9134–9135,9216–9238,9250–9255`。用键末消费 token 的物理行决定值候选，不扩张解包后 `key.range()`。 | `var d = {(\n\ta) 2}\n` 只报一次分隔符错；`key.range()` 是 `[12,13)`，`DictEntry.range()` 从字节 9 的 `(` 开始，覆盖 `()` 和 `2`。另测 `{1 2}`、真正跨行下一键、健康括号键和 EOF。 |
 | `R3.5` 签名续词与 suite | 同时改 `shouldYieldColonToEnclosingSuite`（`Parser:7901–7944`）与参数表到返回类型的交接（`:8538–8543`）；处理缺 `)` 退出多行带来的 `NEWLINE`/`INDENT` 回放（`:2916–2921,1425–1458`）。只交接受损签名后的可信 `->`；不能通用跳过布局。 | `L-24` 保留 `int`、真实套件冒号与起点、体内 `pass`、顶层 `after`；负例 `func f(a):\n\t-> int: pass\n` 不得把套件解释为返回类型。保留合法 `pass` 体、合法类型续行及无体声明。 |
@@ -243,12 +243,12 @@
 
 ### 4.6 `R5`：行为测试、坐标与线性门禁（`RG-6`）
 
-**目标与前置：** 覆盖 §2.6 的全部 22 个已修复子项及原 3/5a/5c。若 D6 无需改变调用方行为，将 `L-07/08` 的容器组合和吸收对照并入 `R5.2`。可先独立补现状断言，`L-04` closer 和全局归属/边界的组合在 `R1`–`R4` 定案后集成；未确认的失败先定位，不扩大为新实现任务。
+**目标与前置：** 覆盖 §2.6 的全部 22 个已修复子项及原 3/5a/5c（`L-07/08` 已按决策 `1B` 留在 `R1.1`）。可先独立补现状断言，`L-04` closer 和全局归属/边界的组合在 `R1`–`R4` 定案后集成；未确认的失败先定位，不扩大为新实现任务。
 
 | 子任务 | 锚点与改动边界 | 行为必测 |
 |---|---|---|
 | `R5.1` 词法与解析、坐标 | 从 §2.6 对应行列出的 `T`、`F`、`P`、`E` 测试扩展真实公开/托管入口；坐标用独立字节和 code point 计算。 | 完成 `L-01/02/03/27a/27b` 与原 3/5a 矩阵；LF/CRLF+emoji、EOF、错闭合与健康配对。 |
-| `R5.2` AST、严格入口与诊断 | 从 §2.6 对应行的各行为测试及 §3 合成过滤测试扩展；清理反义命名，serde/walker 测真实返回树。 | 完成 `L-04/06/11/14/15/17/19/21/22/25a/25b/25c/30b/30d` 行为矩阵；D6 不变时加 `L-07/08` 及 `foo([1+])`。查精确 marker、诊断和兄弟；用 `I5` 位置门禁验身份。 |
+| `R5.2` AST、严格入口与诊断 | 从 §2.6 对应行的各行为测试及 §3 合成过滤测试扩展；清理反义命名，serde/walker 测真实返回树。 | 完成 `L-04/06/11/14/15/17/19/21/22/25a/25b/25c/30b/30d` 行为矩阵。查精确 marker、诊断和兄弟；用 `I5` 位置门禁验身份。 |
 | `R5.3` 补全入口和独立回退 | 扩展 §2.6 的 `C` 行为测试和 §2.7 的双入口对照；生产锚点是 `GdScriptParserFacade.java:52–55` 与 `CompletionContextAnalyzer.java:175–191`。不改变旧五分类或重建 Pratt。 | 完成原 5c、`L-28.1/.2/.3` 矩阵；硬换行已有 `]` strict 拒绝、普通和默认值内 `target(\|)` 的两个入口、CRLF+emoji 错闭合分类及健康/恢复数据流。 |
 | `R5.4` 复杂度与边界 | 扩展 §2.6 线性测试及 `V:1132–1141` 的归属断言。沿用内部可观察计数，不用墙钟或 token 数代替步数，避免改变生产行为以配合测试。 | 按 §4.1 做四档递增、三栈收口与重入，覆盖连续错配、深层 `match`、长行、短行、逐截断及诊断回退。 |
 
