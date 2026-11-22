@@ -211,6 +211,29 @@ class GdParityReferenceTest extends GdParserParityTestSupport {
     }
 
     @Test
+    void inferredMarkersKeepTheirExactPhysicalSliceInBothParsers() {
+        for (var marker : List.of(":=", ": =", ":\t=")) {
+            var source = "var local " + marker + " 1\nconst C " + marker
+                    + " 2\nfunc f(p " + marker + " 3): pass\n";
+            for (var result : List.of(parseViaTreeSitter(source), parseViaGdScript(source))) {
+                assertTrue(result.diagnostics().isEmpty(), () -> result.diagnostics().toString());
+                var statements = result.ast().statements();
+                var variable = assertInstanceOf(VariableDeclaration.class, statements.getFirst());
+                var constant = assertInstanceOf(VariableDeclaration.class, statements.get(1));
+                var parameter = assertInstanceOf(FunctionDeclaration.class, statements.getLast())
+                        .parameters().getFirst();
+                var cursor = 0;
+                for (var type : List.of(variable.type(), constant.type(), parameter.type())) {
+                    var start = source.indexOf(marker, cursor);
+                    cursor = start + marker.length();
+                    assertEquals(marker, type.sourceText());
+                    assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, start, cursor), type.range());
+                }
+            }
+        }
+    }
+
+    @Test
     void notInAndIsNotFoldIntoDedicatedShapes() {
         var function = assertInstanceOf(FunctionDeclaration.class,
                 parseViaTreeSitter(CORPUS.get("not_in")).ast().statements().getFirst());

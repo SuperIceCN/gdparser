@@ -15,6 +15,7 @@ import dev.superice.gdparser.frontend.ast.BinaryExpression;
 import dev.superice.gdparser.frontend.ast.BreakStatement;
 import dev.superice.gdparser.frontend.ast.BreakpointStatement;
 import dev.superice.gdparser.frontend.ast.CallExpression;
+import dev.superice.gdparser.frontend.ast.CastExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.ClassNameStatement;
 import dev.superice.gdparser.frontend.ast.CommentStatement;
@@ -26,6 +27,7 @@ import dev.superice.gdparser.frontend.ast.DictEntry;
 import dev.superice.gdparser.frontend.ast.DictionaryExpression;
 import dev.superice.gdparser.frontend.ast.EnumDeclaration;
 import dev.superice.gdparser.frontend.ast.ErrorExpression;
+import dev.superice.gdparser.frontend.ast.Expression;
 import dev.superice.gdparser.frontend.ast.ExpressionStatement;
 import dev.superice.gdparser.frontend.ast.ExtendsStatement;
 import dev.superice.gdparser.frontend.ast.ForStatement;
@@ -50,6 +52,7 @@ import dev.superice.gdparser.frontend.ast.ReturnStatement;
 import dev.superice.gdparser.frontend.ast.SignalStatement;
 import dev.superice.gdparser.frontend.ast.SubscriptExpression;
 import dev.superice.gdparser.frontend.ast.TypeRef;
+import dev.superice.gdparser.frontend.ast.TypeTestExpression;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import dev.superice.gdparser.frontend.ast.WhileStatement;
 import dev.superice.gdparser.frontend.cst.CstIssueKind;
@@ -59,6 +62,8 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -68,12 +73,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Error-recovery corpus: panic-mode recovery (`synchronize()`), expected-token diagnostics,
@@ -639,6 +646,35 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     @Test
+    void deeplyNestedMatchPatternsUnwindInLinearWorkAndPermitParserReuse() {
+        var parser = new GdScriptParser();
+        for (var n : List.of(256, 512, 1024, 2048)) {
+            var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(n) + "1}" + "]".repeat(n - 1)
+                    + ": pass\n\t\t_: pass\n\tpass\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertTrue(errorMessages(result).contains("Maximum nesting depth exceeded."));
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            var steps = parser.poisonedBracketScanSteps() + parser.poisonedBracketStackOps()
+                    + parser.poisonedBracketOpenerLookups();
+            // At most 2N delimiter tokens; each can be visited, looked up, pushed or popped,
+            // or cleared once after the poison boundary. The fixed trailer contributes < 24 tokens.
+            var limit = 8L * n + 96;
+            assertTrue(steps > 0 && steps <= limit, () -> "match recovery steps: " + steps);
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> "depth " + n);
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            assertHealthyReuse(parser);
+        }
+    }
+
+    private static void assertHealthyReuse(GdScriptParser parser) {
+        // parse() verifies its structural, multiline, tokenizer layout, and recovery stacks before returning.
+        var clean = parser.parse("var ok = 1\n");
+        assertTrue(clean.diagnostics().isEmpty());
+        assertEquals(List.of("ok"), topLevelMemberNames(clean));
+        assertTrue(parser.bracketOracleScanCount() <= 1);
+    }
+
+    @Test
     void deeplyNestedClassesReportErrorInsteadOfOverflowing() {
         var source = new StringBuilder("class A:\n");
         for (var i = 1; i <= 600; i++) {
@@ -802,6 +838,670 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     @Test
+    void poisonedMatchPatternSingleReplacementKeepsBothBranchesAndSiblings() {
+        var parser = new GdScriptParser();
+        for (var pattern : List.of("[".repeat(260) + "1}" + "]".repeat(259),
+                "[".repeat(260) + "1" + "]".repeat(260))) {
+            var source = "func f():\n\tmatch x:\n\t\t" + pattern + ":\n\t\t\tpass\n\t\t_: return 7\n"
+                    + "\tvar local_after = 1\nvar after = 2\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+            assertEquals(2, match.sections().size());
+            var first = match.sections().getFirst();
+            assertInstanceOf(PassStatement.class, first.body().statements().getFirst());
+            var returned = assertInstanceOf(ReturnStatement.class, match.sections().getLast().body().statements().getFirst());
+            assertEquals("7", assertInstanceOf(LiteralExpression.class, returned.value()).sourceText());
+            assertEquals("local_after", assertInstanceOf(VariableDeclaration.class,
+                    function.body().statements().getLast()).name());
+            // The function suite already uses one of the 256 nesting levels.
+            var rejected = source.indexOf('[') + 255;
+            assertDamage(result, DiagnosticCodes.NESTING_DEPTH_EXCEEDED, first, "match.pattern",
+                    utf8Range(source, rejected, rejected + 1));
+            assertStrictSyntaxError(source);
+        }
+        assertEquals(List.of(), parser.parse("var healthy = [1, 2]\n").diagnostics());
+    }
+
+    @Test
+    void poisonedLocalClosersPreserveExactCallClosersAndFollowingArguments() {
+        var parser = new GdScriptParser();
+        for (var tail : List.of("([1})" + "]".repeat(260), "1}")) {
+            var source = "var x = h(g(func(): return " + "[".repeat(260) + tail + "), 2)\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+            var variable = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+            var call = assertInstanceOf(CallExpression.class, variable.value());
+            assertEquals(2, call.arguments().size());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().getLast()).sourceText());
+            assertEquals(utf8Range(source, source.indexOf("h("), source.indexOf('\n')), call.range());
+            var inner = assertInstanceOf(CallExpression.class, call.arguments().getFirst());
+            assertEquals(utf8Range(source, source.indexOf("g("), source.indexOf(", 2")), inner.range());
+            var lambda = assertInstanceOf(LambdaExpression.class, inner.arguments().getFirst());
+            var returned = assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+            // The two calls, lambda argument and lambda suite occupy four levels.
+            var rejected = source.indexOf('[') + 252;
+            assertDamage(result, DiagnosticCodes.NESTING_DEPTH_EXCEEDED, returned, "return.value",
+                    utf8Range(source, rejected, rejected + 1));
+            assertStrictSyntaxError(source);
+        }
+        var eof = parser.parse("var x = " + "[".repeat(260) + "1}");
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(eof).stream().map(AstDiagnostic::code).toList());
+        assertEquals(List.of("x"), topLevelMemberNames(eof));
+        assertEquals(List.of(), parser.parse("var healthy = [1, 2]\n").diagnostics());
+    }
+
+    @Test
+    void poisonedNestedGroupingReturnsToLiveArgumentLists() {
+        var grouped = "(" + "[".repeat(260) + "1})";
+        var call = "g(" + grouped + ", 2)";
+        var parser = new GdScriptParser();
+        assertAll(
+                () -> {
+                    var source = "var x = " + call + "\nvar after = 1\n";
+                    var result = parser.parse(source);
+                    assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+                    var variable = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+                    assertLiveCallAfterPoisonedGrouping(source, result, variable.value(), variable,
+                            "variable.initializer", 254);
+                },
+                () -> {
+                    var source = "var x = g(" + grouped + ")\nvar after = 1\n";
+                    var result = parser.parse(source);
+                    assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                            errorsOf(result).stream().map(AstDiagnostic::code).toList());
+                    assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+                    var variable = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+                    var single = assertInstanceOf(CallExpression.class, variable.value());
+                    assertEquals(1, single.arguments().size());
+                    assertEquals(utf8Range(source, source.indexOf("g("), source.indexOf('\n')), single.range());
+                    assertTrue(single.arguments().getFirst().range().endByte() < single.range().endByte());
+                },
+                () -> {
+                    var source = "var x = h(" + call + ", 3)\nvar after = 1\n";
+                    var result = parser.parse(source);
+                    assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+                    var variable = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+                    var outer = assertInstanceOf(CallExpression.class, variable.value());
+                    assertLiveCallAfterPoisonedGrouping(source, result, outer.arguments().getFirst(), variable,
+                            "variable.initializer", 253);
+                    assertEquals(2, outer.arguments().size());
+                    assertEquals("3", assertInstanceOf(LiteralExpression.class, outer.arguments().getLast()).sourceText());
+                },
+                () -> {
+                    var source = "func f():\n\tmatch x:\n\t\t" + call + ": pass\n\t\t_: pass\nvar after = 1\n";
+                    var result = parser.parse(source);
+                    assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+                    var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+                    var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+                    assertEquals(2, match.sections().size());
+                    var first = match.sections().getFirst();
+                    assertLiveCallAfterPoisonedGrouping(source, result, first.patterns().getFirst(), first,
+                            "match.pattern", 252);
+                    assertInstanceOf(PassStatement.class, first.body().statements().getFirst());
+                    assertInstanceOf(PassStatement.class, match.sections().getLast().body().statements().getFirst());
+                });
+        assertEquals(List.of(), parser.parse("var healthy = g(1, 2)\n").diagnostics());
+    }
+
+    private static void assertLiveCallAfterPoisonedGrouping(String source, AstMappingResult result, Expression expression,
+                                                           Node owner, String facet, int enteredArrays) {
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(result).stream().map(AstDiagnostic::code).toList());
+        var call = assertInstanceOf(CallExpression.class, expression);
+        assertEquals("g", assertInstanceOf(IdentifierExpression.class, call.callee()).name());
+        assertEquals(2, call.arguments().size());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().getLast()).sourceText());
+        assertEquals(utf8Range(source, source.indexOf("g("), source.indexOf(", 2)") + ", 2)".length()), call.range());
+        var rejected = source.indexOf('[') + enteredArrays;
+        assertDamage(result, DiagnosticCodes.NESTING_DEPTH_EXCEEDED, owner, facet, utf8Range(source, rejected, rejected + 1));
+        assertStrictSyntaxError(source);
+    }
+
+    @Test
+    void poisonedUnpushedDelimitersRespectTheMatchBranchColon() {
+        var parser = new GdScriptParser();
+        for (var tail : List.of("1", "1]]]]", "(1", "{\"key\": 1}")) {
+            var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + tail
+                    + ": pass\n\t\t_: pass\n\tvar local_after = 1\nvar after = 2\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> tail);
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+            assertEquals(2, match.sections().size());
+            var firstPass = assertInstanceOf(PassStatement.class, match.sections().getFirst().body().statements().getFirst());
+            var passStart = source.indexOf(": pass") + 2;
+            assertEquals(utf8Range(source, passStart, passStart + "pass".length()), firstPass.range());
+            assertInstanceOf(PassStatement.class, match.sections().getLast().body().statements().getFirst());
+            assertEquals("local_after", assertInstanceOf(VariableDeclaration.class,
+                    function.body().statements().getLast()).name());
+        }
+        assertEquals(List.of(), parser.parse("var healthy = [1]\n").diagnostics());
+    }
+
+    @Test
+    void poisonedMatchBranchColonYieldsBeforeCloserPastTopLevelDeclaration() {
+        var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "(1: return 7\n"
+                + "\t\t_: pass\nvar after = 1\n)\n";
+        var result = parse(source);
+        var sibling = assertPoisonedMatchBranchRetainsReturn(result);
+        assertInstanceOf(PassStatement.class, sibling.body().statements().getFirst());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+    }
+
+    @Test
+    void poisonedMatchBranchColonYieldsBeforeCloserInSiblingBranch() {
+        for (var localOpener : List.of("(", "(\n\t\t\t")) {
+            var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + localOpener + "1: return 7\n\t\t_: )\n";
+            var result = parse(source);
+            var sibling = assertPoisonedMatchBranchRetainsReturn(result);
+            assertEquals("_", assertInstanceOf(IdentifierExpression.class, sibling.patterns().getFirst()).name());
+        }
+    }
+
+    @Test
+    void poisonedMatchBranchColonYieldsBeforeCloserPastBracketedSibling() {
+        for (var pattern : List.of("[2]", "{2: 1}", "(2)")) {
+            var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "(1: return 7\n"
+                    + "\t\t" + pattern + ": pass\n\t\t)\nvar after = 1\n";
+            var result = parse(source);
+            var sibling = assertPoisonedMatchBranchRetainsReturn(result);
+            var pass = assertInstanceOf(PassStatement.class, sibling.body().statements().getFirst());
+            var passStart = source.indexOf(": pass") + 2;
+            assertEquals(utf8Range(source, passStart, passStart + "pass".length()), pass.range());
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+            var orphan = findErrorByCode(result, DiagnosticCodes.UNEXPECTED_CLOSER);
+            assertSame(match, requireNotNull(orphan.recovery()).owner());
+            assertEquals("match.section", orphan.recovery().facet());
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+        }
+    }
+
+    @Test
+    void poisonedMatchBranchColonYieldsBeforeCloserPastEnclosingSuiteStatement() {
+        var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "(1: return 7\n"
+                + "\t\t_: pass\n\tpass\n)\n";
+        var result = parse(source);
+        var sibling = assertPoisonedMatchBranchRetainsReturn(result);
+        assertInstanceOf(PassStatement.class, sibling.body().statements().getFirst());
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        assertEquals(2, function.body().statements().size());
+        assertInstanceOf(PassStatement.class, function.body().statements().getLast());
+    }
+
+    private static MatchSection assertPoisonedMatchBranchRetainsReturn(AstMappingResult result) {
+        findErrorByCode(result, DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        assertEquals(2, match.sections().size());
+        var body = match.sections().getFirst().body().statements();
+        assertEquals(1, body.size());
+        var returned = assertInstanceOf(ReturnStatement.class, body.getFirst());
+        assertEquals("7", assertInstanceOf(LiteralExpression.class, returned.value()).sourceText());
+        return match.sections().getLast();
+    }
+
+    @Test
+    void poisonedInnerCallResumesWhileUnpairedOuterCallStillUnwinds() {
+        var parser = new GdScriptParser();
+        for (var trailingGarbage : List.of("", " other")) {
+            var source = "var x = h(g((" + "[".repeat(260) + "1}), 2)" + trailingGarbage + "\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+            var variable = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+            var outer = assertInstanceOf(CallExpression.class, variable.value());
+            assertEquals("h", assertInstanceOf(IdentifierExpression.class, outer.callee()).name());
+            assertEquals(1, outer.arguments().size());
+            assertLiveCallAfterPoisonedGrouping(source, result, outer.arguments().getFirst(), variable,
+                    "variable.initializer", 253);
+        }
+        assertEquals(List.of(), parser.parse("var healthy = h(g(1, 2))\n").diagnostics());
+    }
+
+    @Test
+    void poisonedDictionaryFramesRetainTheRecoveredKeyWithoutReadingAValue() {
+        var parser = new GdScriptParser();
+        var key = "g((" + "[".repeat(260) + "1]), 2)";
+        for (var matchPattern : List.of(false, true)) {
+            var source = matchPattern
+                    ? "func f():\n\tmatch x:\n\t\t{ " + key + ": pass\n\t\t_: pass\nvar after = 1\n"
+                    : "var x = { " + key + "\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of(matchPattern ? "f" : "x", "after"), topLevelMemberNames(result));
+            var first = result.ast().statements().getFirst();
+            Expression dictionary;
+            if (matchPattern) {
+                var function = assertInstanceOf(FunctionDeclaration.class, first);
+                var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+                assertEquals(2, match.sections().size());
+                for (var section : match.sections()) {
+                    assertInstanceOf(PassStatement.class, section.body().statements().getFirst());
+                }
+                dictionary = match.sections().getFirst().patterns().getFirst();
+            } else {
+                dictionary = assertInstanceOf(VariableDeclaration.class, first).value();
+            }
+            var entries = assertInstanceOf(DictionaryExpression.class, dictionary).entries();
+            assertEquals(1, entries.size());
+            var entry = entries.getFirst();
+            var call = assertInstanceOf(CallExpression.class, entry.key());
+            assertEquals("g", assertInstanceOf(IdentifierExpression.class, call.callee()).name());
+            assertEquals(2, call.arguments().size());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().getLast()).sourceText());
+            if (matchPattern) {
+                assertNull(entry.value());
+            } else {
+                var missing = assertInstanceOf(ErrorExpression.class, entry.value());
+                assertEquals(CstIssueKind.MISSING, missing.kind());
+                assertEquals(call.range().endByte(), missing.range().startByte());
+            }
+        }
+        assertEquals(List.of(), parser.parse("var healthy = {\"key\": 1}\n").diagnostics());
+    }
+
+    @Test
+    void poisonedMatchPatternKeepsLocalLambdaColonsAndTheRealBranchBody() {
+        var parser = new GdScriptParser();
+        for (var lambda : List.of("func(): pass", "func(a: int) -> int: pass", "(func(): pass)", "(func(a: int): pass)",
+                "(func(a: int) -> int: pass)", "(func named(a: int) -> Array[int]: pass)",
+                "(func(): for i in a: pass)", "(func(): if x: pass)", "(func(): if x: pass \\\n\t\t)",
+                "(\n\t\t\tfunc(): if x: pass)", "(\n\t\t\tfunc(): if x: pass\n\t\t)")) {
+            for (var depth : List.of(2, 260)) {
+                var closing = depth == 2 ? depth : 5;
+                var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(depth) + lambda + "]".repeat(closing)
+                        + ": return 7\n\t\t_: pass\nvar after = 1\n";
+                var result = parser.parse(source);
+                var expected = depth == 2 ? List.<String>of() : List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED);
+                assertEquals(expected, errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> lambda);
+                assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+                var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+                var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+                assertEquals(2, match.sections().size());
+                var firstBody = match.sections().getFirst().body().statements();
+                assertEquals(1, firstBody.size());
+                var returned = assertInstanceOf(ReturnStatement.class, firstBody.getFirst());
+                assertEquals("7", assertInstanceOf(LiteralExpression.class, returned.value()).sourceText());
+                assertInstanceOf(PassStatement.class, match.sections().getLast().body().statements().getFirst());
+            }
+        }
+    }
+
+    @Test
+    void poisonedMatchPatternKeepsIndentedLambdaBodyInsideLocalGrouping() {
+        var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(260)
+                + "(\n\t\t\tfunc(): if x:\n\t\t\t\tpass\n\t\t\t)]]]]]: return 7\n\t\t_: pass\nvar after = 1\n";
+        var result = parse(source);
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(result).stream().map(AstDiagnostic::code).toList());
+        var sibling = assertPoisonedMatchBranchRetainsReturn(result);
+        assertInstanceOf(PassStatement.class, sibling.body().statements().getFirst());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+    }
+
+    @Test
+    void poisonedExactTargetCloserKeepsPostfixWithUnpairedOuterArray() {
+        var source = "var x = " + "[".repeat(254) + "g([1].value, 2)" + "]".repeat(253) + "\nvar after = 1\n";
+        var result = recoverableParse(source);
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(result).stream().map(AstDiagnostic::code).toList());
+        assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+        var expression = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value();
+        for (var level = 0; level < 254; level++) {
+            var array = assertInstanceOf(ArrayExpression.class, expression);
+            assertEquals(1, array.elements().size());
+            expression = array.elements().getFirst();
+        }
+        var call = assertInstanceOf(CallExpression.class, expression);
+        assertEquals("g", assertInstanceOf(IdentifierExpression.class, call.callee()).name());
+        assertEquals(2, call.arguments().size());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().getLast()).sourceText());
+        var attribute = assertInstanceOf(AttributeExpression.class, call.arguments().getFirst());
+        var property = assertInstanceOf(AttributePropertyStep.class, attribute.steps().getFirst());
+        assertEquals("value", property.name());
+        var array = assertInstanceOf(ArrayExpression.class, attribute.base());
+        var targetStart = source.indexOf("g(") + 2;
+        assertEquals(utf8Range(source, targetStart, targetStart + "[1]".length()), array.range());
+        assertEquals(utf8Range(source, targetStart, targetStart + "[1].value".length()), attribute.range());
+    }
+
+    @Test
+    void poisonedTargetCloseCannotResumeAtLaterGarbage() {
+        var parser = new GdScriptParser();
+        for (var garbage : List.of("4", "= 4")) {
+            var source = "var x = " + "[".repeat(253) + "h([[1] + 2 } " + garbage + ", 9)" + "]".repeat(253)
+                    + "\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+            var expression = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value();
+            for (var level = 0; level < 253; level++) {
+                var array = assertInstanceOf(ArrayExpression.class, expression);
+                assertEquals(1, array.elements().size());
+                expression = array.elements().getFirst();
+            }
+            var call = assertInstanceOf(CallExpression.class, expression);
+            assertEquals("h", assertInstanceOf(IdentifierExpression.class, call.callee()).name());
+            assertEquals(2, call.arguments().size());
+            assertInstanceOf(ArrayExpression.class, call.arguments().getFirst());
+            assertEquals("9", assertInstanceOf(LiteralExpression.class, call.arguments().getLast()).sourceText());
+        }
+        assertEquals(List.of(), parser.parse("var healthy = h([], 9)\n").diagnostics());
+    }
+
+    @Test
+    void poisonedMatchPatternDoesNotTreatNodePathNamesAsLambdaHeaders() {
+        var parser = new GdScriptParser();
+        var tails = List.of("$func()", "$a/func()", "%func()", "$/func()", "$a/%func()", "$\"a\"/func()",
+                "x + %func()", "(x % func(): pass)]]]]]", "(x / func(): pass)]]]]]",
+                "(x.pass % func(): pass)]]]]]", "(x.func % func(): pass)]]]]]",
+                "(self.pass % func(): pass)]]]]]", "([1].pass % func(): pass)]]]]]");
+        for (var tail : tails) {
+            var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + tail
+                    + ": return 7\n\t\t_: pass\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> tail);
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+            assertEquals(2, match.sections().size());
+            var body = match.sections().getFirst().body().statements();
+            assertEquals(1, body.size());
+            var returned = assertInstanceOf(ReturnStatement.class, body.getFirst());
+            assertEquals("7", assertInstanceOf(LiteralExpression.class, returned.value()).sourceText());
+            assertInstanceOf(PassStatement.class, match.sections().getLast().body().statements().getFirst());
+        }
+        assertEquals(List.of(), parser.parse("var healthy = $a/func\n").diagnostics());
+    }
+
+    @Test
+    void poisonedDictionaryPatternCommitsItsRecoveredValueBeforeUnwinding() {
+        var source = "func f():\n\tmatch x:\n\t\t{ \"key\": g((" + "[".repeat(260) + "1]), 2): return 7\n"
+                + "\t\t_: pass\nvar after = 1\n";
+        var result = recoverableParse(source);
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(result).stream().map(AstDiagnostic::code).toList());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+        assertEquals(2, match.sections().size());
+        var section = match.sections().getFirst();
+        var dictionary = assertInstanceOf(DictionaryExpression.class, section.patterns().getFirst());
+        assertEquals(1, dictionary.entries().size());
+        var entry = dictionary.entries().getFirst();
+        assertEquals("\"key\"", assertInstanceOf(LiteralExpression.class, entry.key()).sourceText());
+        var value = assertInstanceOf(CallExpression.class, entry.value());
+        assertEquals("g", assertInstanceOf(IdentifierExpression.class, value.callee()).name());
+        assertEquals(2, value.arguments().size());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, value.arguments().getLast()).sourceText());
+        var branchColon = source.indexOf(": return 7");
+        assertEquals(utf8Range(source, source.indexOf("\"key\""), branchColon), entry.range());
+        assertEquals(utf8Range(source, source.indexOf("g("), branchColon), value.range());
+        var returned = assertInstanceOf(ReturnStatement.class, section.body().statements().getFirst());
+        assertEquals("7", assertInstanceOf(LiteralExpression.class, returned.value()).sourceText());
+        assertInstanceOf(PassStatement.class, match.sections().getLast().body().statements().getFirst());
+    }
+
+    @Test
+    void poisonedPartlyClosedArraysDoNotCascade() {
+        var parser = new GdScriptParser();
+        var sources = List.of(
+                "var x = " + "[".repeat(260) + "1" + "]".repeat(10) + "\nvar after = 1\n",
+                "var x = g(" + "[".repeat(255) + "1}, 2)\nvar after = 1\n");
+        for (var source : sources) {
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+            var initializer = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value();
+            if (source.startsWith("var x = g(")) {
+                var call = assertInstanceOf(CallExpression.class, initializer);
+                assertEquals(utf8Range(source, source.indexOf("g("), source.indexOf('\n')), call.range());
+            } else {
+                assertInstanceOf(ArrayExpression.class, initializer);
+            }
+        }
+        assertEquals(List.of(), parser.parse("var healthy = [1]\n").diagnostics());
+    }
+
+    @Test
+    void poisonedArrayPatternsWithAnUnmatchedFrameKeepTheMatchBranches() {
+        var parser = new GdScriptParser();
+        for (var tail : List.of("", "}" + "]".repeat(248))) {
+            var source = "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "1}" + "]".repeat(10)
+                    + tail + ": pass\n\t\t_: pass\n\tvar local_after = 1\nvar after = 2\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+            assertEquals(2, match.sections().size());
+            for (var section : match.sections()) {
+                assertInstanceOf(PassStatement.class, section.body().statements().getFirst());
+            }
+            assertEquals("local_after", assertInstanceOf(VariableDeclaration.class,
+                    function.body().statements().getLast()).name());
+        }
+        assertEquals(List.of(), parser.parse("var healthy = [1]\n").diagnostics());
+    }
+
+    @Test
+    void poisonedExactTargetCloserLeavesPostfixAndFollowingArgument() {
+        var parser = new GdScriptParser();
+        for (var target : List.of("[1]", "a[(1)]", "([1})")) {
+            var depth = target.startsWith("[") ? 254 : 253;
+            var source = "var x = " + "[".repeat(depth) + "g(" + target + ".value, 2)" + "]".repeat(depth)
+                    + "\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+            var expression = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value();
+            for (var level = 0; level < depth; level++) {
+                var array = assertInstanceOf(ArrayExpression.class, expression);
+                assertEquals(1, array.elements().size());
+                expression = array.elements().getFirst();
+            }
+            var call = assertInstanceOf(CallExpression.class, expression);
+            assertEquals("g", assertInstanceOf(IdentifierExpression.class, call.callee()).name());
+            assertEquals(2, call.arguments().size());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().getLast()).sourceText());
+            var attribute = assertInstanceOf(AttributeExpression.class, call.arguments().getFirst());
+            assertEquals(1, attribute.steps().size());
+            var property = assertInstanceOf(AttributePropertyStep.class, attribute.steps().getFirst());
+            assertEquals("value", property.name());
+            var targetStart = source.indexOf("g(") + 2;
+            var targetEnd = targetStart + target.length();
+            assertEquals(targetEnd + ".value".length(), attribute.range().endByte());
+            if (target.startsWith("(")) {
+                // The array is replaced, but the live grouping still owns its exact `)`.
+                var base = assertInstanceOf(ArrayExpression.class, attribute.base());
+                assertEquals(utf8Range(source, targetStart + 1, targetEnd - 1), base.range());
+            } else if (target.startsWith("[")) {
+                assertInstanceOf(ArrayExpression.class, attribute.base());
+                assertEquals(utf8Range(source, targetStart, targetEnd), attribute.base().range());
+                assertEquals(targetStart, attribute.range().startByte());
+            } else {
+                var subscript = assertInstanceOf(SubscriptExpression.class, attribute.base());
+                assertEquals(utf8Range(source, targetStart, targetEnd), subscript.range());
+                assertEquals(targetStart, attribute.range().startByte());
+                assertEquals("a", assertInstanceOf(IdentifierExpression.class, subscript.base()).name());
+                assertEquals(1, subscript.arguments().size());
+            }
+        }
+        assertEquals(List.of(), parser.parse("var healthy = g(a[0].value, 2)\n").diagnostics());
+    }
+
+    @Test
+    void poisonedAssertConditionKeepsMessageAndFollowingStatements() {
+        var group = "(" + "[".repeat(260) + "1})";
+        var source = "func f():\n\tassert(" + group + ", \"keep\")\n\tpass\nvar after = 1\n";
+        var result = recoverableParse(source);
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(result).stream().map(AstDiagnostic::code).toList());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var body = function.body().statements();
+        assertEquals(2, body.size());
+        var statement = assertInstanceOf(AssertStatement.class, body.getFirst());
+        assertInstanceOf(ArrayExpression.class, statement.condition());
+        assertEquals("\"keep\"", assertInstanceOf(LiteralExpression.class, statement.message()).sourceText());
+        assertInstanceOf(PassStatement.class, body.getLast());
+        var start = source.indexOf("assert");
+        assertEquals(utf8Range(source, start, source.indexOf('\n', start)), statement.range());
+    }
+
+    @Test
+    void poisonedAnnotationArgumentKeepsSecondArgumentAndSibling() {
+        var group = "(" + "[".repeat(260) + "1})";
+        var source = "@custom(" + group + ", 2)\nvar after = 1\n";
+        var result = recoverableParse(source);
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(result).stream().map(AstDiagnostic::code).toList());
+        assertEquals(List.of("AnnotationStatement", "after"), topLevelMemberNames(result));
+        var annotation = assertInstanceOf(AnnotationStatement.class, result.ast().statements().getFirst());
+        assertEquals("custom", annotation.name());
+        assertEquals(2, annotation.arguments().size());
+        assertInstanceOf(ArrayExpression.class, annotation.arguments().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class, annotation.arguments().getLast()).sourceText());
+        assertEquals(utf8Range(source, 0, source.indexOf('\n')), annotation.range());
+    }
+
+    @Test
+    void poisonedEnumInitializerKeepsSecondMemberAndSibling() {
+        var source = "enum E { A = (" + "[".repeat(260) + "1]), B }\nvar after = 1\n";
+        var result = recoverableParse(source);
+        assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                errorsOf(result).stream().map(AstDiagnostic::code).toList());
+        var statements = result.ast().statements();
+        assertEquals(2, statements.size());
+        var declaration = assertInstanceOf(EnumDeclaration.class, statements.getFirst());
+        assertEquals("E", declaration.name());
+        assertEquals(2, declaration.members().size());
+        assertEquals("A", declaration.members().getFirst().name());
+        assertInstanceOf(ArrayExpression.class, declaration.members().getFirst().value());
+        assertEquals("B", declaration.members().getLast().name());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, statements.getLast()).name());
+        assertEquals(utf8Range(source, 0, source.indexOf('\n')), declaration.range());
+    }
+
+    @Test
+    void poisonedPreloadPathKeepsOptionalTrailingCommaAndSibling() {
+        var group = "(" + "[".repeat(260) + "1})";
+        var parser = new GdScriptParser();
+        for (var separator : List.of("", ",")) {
+            var source = "var x = preload(" + group + separator + ")\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+            var initializer = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value();
+            var preload = assertInstanceOf(PreloadExpression.class, initializer);
+            assertInstanceOf(ArrayExpression.class, preload.path());
+            assertEquals(utf8Range(source, source.indexOf("preload"), source.indexOf('\n')), preload.range());
+        }
+        assertEquals(List.of(), parser.parse("var healthy = preload(\"res://a.gd\",)\n").diagnostics());
+    }
+
+    @Test
+    void poisonedMixedCloserStormScansAndBalancesLinearlyOnReuse() {
+        var parser = new GdScriptParser();
+        for (var units : List.of(256, 512, 1024, 2048)) {
+            // Each four-token group resolves a same-kind opener below a different top
+            // opener, while the long '[' prefix remains open. The final '}' replaces one '['.
+            var pattern = "[".repeat(units) + "([1){[1}".repeat(units) + "1}" + "]".repeat(units - 1);
+            var source = "func f():\n\tmatch x:\n\t\t" + pattern + ": pass\n\t\t_: pass\n"
+                    + "\tvar local_after = 1\nvar after = 2\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+            assertEquals(2, match.sections().size());
+            for (var section : match.sections()) {
+                assertInstanceOf(PassStatement.class, section.body().statements().getFirst());
+            }
+            assertEquals("local_after", assertInstanceOf(VariableDeclaration.class,
+                    function.body().statements().getLast()).name());
+
+            var tokenizer = GdTokenizer.managed(source);
+            var tokenCount = 1; // Includes EOF.
+            while (tokenizer.scan().type() != GdTokenType.EOF) {
+                tokenCount++;
+            }
+            var scanSteps = parser.poisonedBracketScanSteps();
+            var stackOps = parser.poisonedBracketStackOps();
+            var openerLookups = parser.poisonedBracketOpenerLookups();
+            var oracleScans = parser.bracketOracleScanCount();
+            IO.println("mixed closers: units=%d bytes=%d tokens=%d scan=%d stack=%d lookups=%d oracle=%d"
+                    .formatted(units, utf8Length(source), tokenCount, scanSteps, stackOps, openerLookups, oracleScans));
+            // One scan per token plus the stopping check, and at most one push and pop per opener.
+            // Lookups count actual kind-counter slots, cached facts and entries checked, not calls.
+            assertTrue(scanSteps >= 8 * units && scanSteps <= tokenCount + 1);
+            assertTrue(stackOps >= 8 * units && stackOps <= 2 * tokenCount);
+            assertTrue(openerLookups >= 3 * units && openerLookups <= 3 * tokenCount);
+            assertTrue(oracleScans <= 1);
+        }
+        assertEquals(List.of(), parser.parse("var healthy = 1\n").diagnostics());
+        assertEquals(0, parser.poisonedBracketScanSteps());
+        assertEquals(0, parser.poisonedBracketStackOps());
+        assertEquals(0, parser.poisonedBracketOpenerLookups());
+        assertEquals(0, parser.bracketOracleScanCount());
+    }
+
+    @Test
+    void poisonedDeepOpenerMissesStayLinearOnReuse() {
+        var parser = new GdScriptParser();
+        for (var units : List.of(256, 512, 1024, 2048)) {
+            // The wrong-kind closers miss at a deep stack and replace one opener each.
+            var source = "var x = " + "[".repeat(2 * units) + "1}".repeat(units) + "]".repeat(units)
+                    + "\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(List.of(DiagnosticCodes.NESTING_DEPTH_EXCEEDED),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(List.of("x", "after"), topLevelMemberNames(result));
+
+            var tokenizer = GdTokenizer.managed(source);
+            var tokenCount = 1;
+            while (tokenizer.scan().type() != GdTokenType.EOF) {
+                tokenCount++;
+            }
+            var scanSteps = parser.poisonedBracketScanSteps();
+            var stackOps = parser.poisonedBracketStackOps();
+            var openerLookups = parser.poisonedBracketOpenerLookups();
+            var oracleScans = parser.bracketOracleScanCount();
+            IO.println("deep misses: units=%d bytes=%d tokens=%d scan=%d stack=%d lookups=%d oracle=%d"
+                    .formatted(units, utf8Length(source), tokenCount, scanSteps, stackOps, openerLookups, oracleScans));
+            // A closer reads at most three slots. An opener contributes at most one cached
+            // fact read and one comparison on removal; opener and closer tokens are distinct.
+            assertTrue(scanSteps >= 3 * units && scanSteps <= tokenCount + 1);
+            assertTrue(stackOps >= 2 * units && stackOps <= 2 * tokenCount);
+            assertTrue(openerLookups >= 3 * units && openerLookups <= 3 * tokenCount);
+            assertTrue(scanSteps + stackOps + openerLookups <= 6 * tokenCount + 1);
+            assertTrue(oracleScans <= 1);
+        }
+        assertEquals(List.of(), parser.parse("var healthy = 1\n").diagnostics());
+        assertEquals(0, parser.poisonedBracketScanSteps());
+        assertEquals(0, parser.poisonedBracketStackOps());
+        assertEquals(0, parser.poisonedBracketOpenerLookups());
+        assertEquals(0, parser.bracketOracleScanCount());
+    }
+
+    @Test
     void garbageDedentThenSameLevelSiblingSurvives() {
         // After the balanced garbage DEDENT is consumed, `previous` is a DEDENT: the poisoned
         // line-start gate must still fire for the following same-level line.
@@ -930,9 +1630,20 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     @Test
-    void errorAfterEmojiLiteralStaysInBounds() {
-        // Surrogate pair: UTF-16 length 14, UTF-8 length 16 — only the byte bound is valid.
-        recoverableParse("var x = \"😀\" +");
+    void errorAfterEmojiLiteralUsesPhysicalUtf8ColumnsAtEof() {
+        var source = "func f():\r\n\tvar x = \"😀中\" +";
+        var result = parse(source);
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        var declaration = assertInstanceOf(VariableDeclaration.class,
+                onlyFunction(result).body().statements().getFirst());
+        var binary = assertInstanceOf(BinaryExpression.class, declaration.value());
+        var literal = assertInstanceOf(LiteralExpression.class, binary.left());
+        var openingQuote = source.indexOf('"');
+        assertEquals(utf8Range(source, openingQuote, source.lastIndexOf('"') + 1), literal.range());
+        assertMissingAt(source, binary.right(), "binary.right", source.length());
+        assertEquals(1, result.diagnostics().size());
+        assertDamage(result, DiagnosticCodes.SLOT_BINARY_RIGHT, declaration, "variable.initializer",
+                utf8Range(source, source.indexOf('+'), source.length()));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -944,8 +1655,8 @@ class GdScriptParserErrorRecoveryTest {
     void surfaceAssignmentTargetAndDirectCallGuards() {
         // Valid surface lvalues and direct calls stay clean.
         for (var validSource : List.of(
-                "func f():\n\tx = 1\n\t(x) = 2\n\tf().x = 3\n\tf()[0] = 4\n\tobj.arr[i] = 5\n",
-                "func f():\n\tfoo()\n\t(foo)()\n\tobj.method()\n\tf(1).call(2)\n"
+                "func f():\n\tx = 1\n\t(x) = 2\n\tf().x = 3\n\tf()[0] = 2\n\tobj.arr[i] = 5\n",
+                "func f():\n\tfoo()\n\t(foo)()\n\t(f)(1)\n\tobj.method()\n\tf(1).call(2)\n"
         )) {
             var clean = new GdScriptParser().parse(validSource);
             assertTrue(errorsOf(clean).isEmpty(), () -> validSource + " -> " + errorsOf(clean));
@@ -996,6 +1707,188 @@ class GdScriptParserErrorRecoveryTest {
                 errorsOf(missingAttrCall).stream().map(AstDiagnostic::code).toList());
     }
 
+    @ParameterizedTest
+    @CsvSource({"(a ?) = 2, ?", "x as = 2, as", "(a ?)(2), ?"})
+    void recoveredInfixTargetKeepsOnlyThePrimaryDiagnostic(String expression, String operator) {
+        for (var newline : List.of("\n", "\r\n")) {
+            var source = ("func f():\n\tvar prefix = \"😀\"\n\t" + expression + "\n\tpass\n")
+                    .replace("\n", newline);
+            var result = recoverableParse(source);
+            var body = onlyFunction(result).body().statements();
+            assertEquals(3, body.size());
+            var statement = assertInstanceOf(ExpressionStatement.class, body.get(1));
+            var operands = switch (statement.expression()) {
+                case AssignmentExpression assign -> List.of(assign.left(), assign.right());
+                case CallExpression call -> List.of(call.callee(), call.arguments().getFirst());
+                default -> throw new AssertionError(statement);
+            };
+            var damaged = assertInstanceOf(RecoveredInfixExpression.class, operands.getFirst());
+            assertEquals(operator, damaged.operator());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, operands.getLast()).sourceText());
+            assertInstanceOf(PassStatement.class, body.getLast());
+            var code = operator.equals("?") ? DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN
+                    : DiagnosticCodes.MISSING_TYPE_CAST;
+            var start = source.indexOf(operator, source.indexOf(expression));
+            assertEquals(List.of(code), errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertDamage(result, code, statement, "expression", utf8Range(source, start, start + operator.length()));
+            assertEnvelopeRecursive(result.ast(), source);
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
+    @Test
+    void publishedAnnotationsStillGetWrongTargetAndDanglingDiagnostics() {
+        for (var newline : List.of("\n", "\r\n")) {
+            var start = "@warning_ignore_start(\"unreachable_code\")";
+            for (var prefix : List.of("var prefix = 1\n", "class C:\n", "func f():\n")) {
+                var indent = prefix.endsWith(":\n") ? "\t" : "";
+                var annotation = "@warning_ignore(\"unused_variable\")";
+                var source = ("# 😀\n" + prefix + indent + annotation + "\n" + indent + start + "\n")
+                        .replace("\n", newline);
+                var result = recoverableParse(source);
+                var root = result.ast().statements();
+                var scope = switch (root.get(1)) {
+                    case ClassDeclaration klass -> klass.body().statements();
+                    case FunctionDeclaration function -> function.body().statements();
+                    default -> root.subList(2, root.size());
+                };
+                assertEquals(2, scope.size());
+                var owner = assertInstanceOf(AnnotationStatement.class, scope.getFirst());
+                assertEquals("warning_ignore", owner.name());
+                assertEquals("warning_ignore_start", assertInstanceOf(AnnotationStatement.class, scope.getLast()).name());
+                assertEquals(1, errorsOf(result).size());
+                var offset = source.indexOf(annotation);
+                assertDamage(result, DiagnosticCodes.ANNOTATION_DANGLING, owner, "annotation.target",
+                        utf8Range(source, offset, offset + annotation.length()));
+                GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+            }
+
+            for (var prefix : List.of("", "var prefix = 1\n", "class C:\n")) {
+                var indent = prefix.endsWith(":\n") ? "\t" : "";
+                var source = ("# 😀\n" + prefix + indent + "@export\n" + indent + start + "\n"
+                        + indent + "func f(): pass\n").replace("\n", newline);
+                var result = recoverableParse(source);
+                var root = result.ast().statements();
+                var scope = root.get(1) instanceof ClassDeclaration klass ? klass.body().statements()
+                        : root.subList(prefix.isEmpty() ? 1 : 2, root.size());
+                assertEquals(3, scope.size());
+                var owner = assertInstanceOf(AnnotationStatement.class, scope.getFirst());
+                assertEquals("export", owner.name());
+                assertEquals("warning_ignore_start", assertInstanceOf(AnnotationStatement.class, scope.get(1)).name());
+                assertInstanceOf(FunctionDeclaration.class, scope.getLast());
+                assertEquals(1, errorsOf(result).size());
+                var offset = source.indexOf("@export");
+                assertDamage(result, DiagnosticCodes.ANNOTATION_INVALID_TARGET, owner, "annotation.target",
+                        utf8Range(source, offset, offset + "@export".length()));
+                GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+            }
+        }
+    }
+
+    @Test
+    void onlyAnOpenScriptPrefixCanBindPendingAnnotationsToTheImplicitRoot() {
+        var warning = "@warning_ignore(\"unused_variable\")";
+        var region = """
+                @warning_ignore_start("unreachable_code")
+                @warning_ignore_restore("unreachable_code")
+                """;
+        for (var newline : List.of("\n", "\r\n")) {
+            var open = (warning + "\n" + region).replace("\n", newline);
+            assertEquals(List.of(), parse(open).diagnostics());
+            assertEquals(3, new GdScriptParserFacade().parseStrict(open).statements().size());
+            for (var fixture : List.of(
+                    Map.entry("@abstract\n@export_category(\"Stats\")\n", "@abstract"),
+                    Map.entry("@abstract\n@export_group(\"Stats\")\n", "@abstract"),
+                    Map.entry("@abstract\n@export_subgroup(\"Stats\")\n", "@abstract"),
+                    Map.entry("@export\n" + region, "@export"),
+                    Map.entry("var prefix = 1\n" + warning + "\n" + region, warning))) {
+                var source = fixture.getKey().replace("\n", newline);
+                var result = recoverableParse(source);
+                var owner = assertInstanceOf(AnnotationStatement.class,
+                        result.ast().statements().get(source.startsWith("var") ? 1 : 0));
+                var start = source.indexOf(fixture.getValue());
+                assertEquals(1, result.diagnostics().size());
+                assertDamage(result, DiagnosticCodes.ANNOTATION_DANGLING, owner, "annotation.target",
+                        utf8Range(source, start, start + fixture.getValue().length()));
+                GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+            }
+        }
+    }
+
+    @Test
+    void trailingCommentDoesNotChangeEligibilityAfterADeclarationAnnotationClosesThePrefix() {
+        var prefix = "@warning_ignore(\"unused_variable\")\n@export\n@custom";
+        for (var tail : List.of("\n", " # c\n")) {
+            var source = prefix + tail;
+            var result = recoverableParse(source);
+            assertEquals(List.of(DiagnosticCodes.ANNOTATION_DANGLING, DiagnosticCodes.ANNOTATION_DANGLING,
+                    DiagnosticCodes.ANNOTATION_DANGLING), result.diagnostics().stream().map(AstDiagnostic::code).toList());
+            for (var i = 0; i < 3; i++) {
+                var annotation = assertInstanceOf(AnnotationStatement.class, result.ast().statements().get(i));
+                var diagnostic = result.diagnostics().get(i);
+                assertSame(annotation, requireNotNull(diagnostic.recovery()).owner());
+                assertEquals("annotation.target", diagnostic.recovery().facet());
+                assertEquals(annotation.range(), diagnostic.range());
+            }
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
+    @Test
+    void invalidStandaloneDirectivesAndWrongLevelAnnotationsKeepTheirOwnDiagnostics() {
+        var ignore = "@warning_ignore(\"unused_variable\")";
+        var restore = "@warning_ignore_restore(\"missing\")";
+        var start = "@warning_ignore_start(\"unreachable_code\")";
+        var group = "@export_group(\"Stats\")";
+        for (var entry : Map.of(
+                restore + "\n\t", DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN,
+                start + " ", DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN,
+                group + "\n\t", DiagnosticCodes.ANNOTATION_INVALID_LEVEL).entrySet()) {
+            var source = "func f():\n\t" + ignore + "\n\t" + entry.getKey() + "var a = 1\n";
+            var result = recoverableParse(source);
+            var scope = onlyFunction(result).body().statements();
+            assertEquals(3, scope.size());
+            assertEquals("warning_ignore", assertInstanceOf(AnnotationStatement.class, scope.getFirst()).name());
+            var owner = assertInstanceOf(AnnotationStatement.class, scope.get(1));
+            assertEquals("a", assertInstanceOf(VariableDeclaration.class, scope.getLast()).name());
+            assertEquals(1, errorsOf(result).size());
+            var directive = entry.getKey().stripTrailing();
+            var offset = source.indexOf(directive);
+            assertDamage(result, entry.getValue(), owner, "annotation.target",
+                    utf8Range(source, offset, offset + directive.length()));
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
+    @Test
+    void annotationsStayIsolatedInPropertySuitesAcrossStandaloneDirectives() {
+        var ignore = "@warning_ignore(\"unused_variable\")";
+        var start = "@warning_ignore_start(\"unreachable_code\")";
+        var header = "var p:\n\tget:\n\t\t" + ignore + "\n\t\t" + start + "\n";
+        var nextMember = "var after = 1\n";
+        var clean = parse(header + "\t\tpass\n" + nextMember);
+        assertEquals(List.of(), errorsOf(clean));
+        var prop = assertInstanceOf(VariableDeclaration.class, clean.ast().statements().getFirst());
+        assertTrue(prop.recoveryAnnotations().isEmpty());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, clean.ast().statements().getLast()).name());
+
+        var bad = header + "\t\t@warning_ignore_restore(\"missing\")\n" + nextMember;
+        var result = recoverableParse(bad);
+        var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+        assertEquals(List.of("warning_ignore", "warning_ignore_restore"),
+                owner.recoveryAnnotations().stream().map(AnnotationStatement::name).toList());
+        var sibling = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast());
+        assertEquals("after", sibling.name());
+        assertTrue(sibling.recoveryAnnotations().isEmpty());
+        assertEquals(2, errorsOf(result).size());
+        assertDamage(result, DiagnosticCodes.ANNOTATION_DANGLING, owner, "variable.property",
+                owner.recoveryAnnotations().getFirst().range());
+        assertDamage(result, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, owner, "variable.property",
+                owner.recoveryAnnotations().getLast().range());
+        assertEnvelopeRecursive(result.ast(), bad);
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(bad, result, () -> bad);
+    }
+
     // -----------------------------------------------------------------------------------------
     // Sealed-outcome recovery (T1/T2): return-value and variable-initializer slots.
     // -----------------------------------------------------------------------------------------
@@ -1004,7 +1897,8 @@ class GdScriptParserErrorRecoveryTest {
     void returnDamagedValueKeepsMarker() {
         // `return 1+`: the value is the damaged binary with a MISSING right slot; exactly one
         // diagnostic (the inner `+` root cause) — the slot host adds no generic message.
-        var result = recoverableParse("func f():\n\treturn 1+\n");
+        var source = "func f():\n\treturn 1+\n";
+        var result = recoverableParse(source);
         assertEquals(List.of("Expected expression after \"+\" operator."), errorMessages(result),
                 () -> errorMessages(result).toString());
         var body = onlyFunction(result).body().statements();
@@ -1014,6 +1908,11 @@ class GdScriptParserErrorRecoveryTest {
         var right = assertInstanceOf(ErrorExpression.class, binary.right());
         assertEquals(CstIssueKind.MISSING, right.kind());
         assertEquals("binary.right", right.nodeType());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        var operator = source.indexOf('+');
+        assertMissingAt(source, right, "binary.right", operator + 1);
+        assertDamage(result, DiagnosticCodes.SLOT_BINARY_RIGHT, returnStatement, "return.value",
+                utf8Range(source, operator, operator + 1));
     }
 
     @Test
@@ -1038,7 +1937,8 @@ class GdScriptParserErrorRecoveryTest {
 
         // `return =3`: `=` opens no expression; the value slot emits SLOT_RETURN_VALUE bound to
         // `return.value` and keeps an ERROR fragment over `=3` without a duplicate tail error.
-        var result = recoverableParse("func f():\n\treturn =3\n");
+        var assignmentSource = "func f():\n\treturn =3\n";
+        var result = recoverableParse(assignmentSource);
         var returnDiag = findErrorByCode(result, DiagnosticCodes.SLOT_RETURN_VALUE);
         assertEquals(1, errorMessages(result).size(), () -> errorMessages(result).toString());
         var returnStmt = assertInstanceOf(ReturnStatement.class,
@@ -1050,9 +1950,14 @@ class GdScriptParserErrorRecoveryTest {
         assertEquals(CstIssueKind.ERROR, fragment.kind());
         assertEquals("ERROR", fragment.nodeType());
         assertEquals("=3", fragment.sourceText());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(assignmentSource, result, () -> assignmentSource);
+        var assignment = assignmentSource.indexOf('=');
+        assertEquals(utf8Range(assignmentSource, assignment, assignment + 2), fragment.range());
+        assertEquals(fragment.range(), returnDiag.range());
 
         // Orphan closer `return )` keeps an ERROR fragment over `)` and binds `return.value`.
-        var orphanCloser = recoverableParse("func f():\n\treturn )\n");
+        var orphanSource = "func f():\n\treturn )\n";
+        var orphanCloser = recoverableParse(orphanSource);
         var orphanDiag = findErrorByCode(orphanCloser, DiagnosticCodes.SLOT_RETURN_VALUE);
         assertEquals(1, errorMessages(orphanCloser).size(), () -> errorMessages(orphanCloser).toString());
         var orphanStmt = assertInstanceOf(ReturnStatement.class,
@@ -1063,6 +1968,10 @@ class GdScriptParserErrorRecoveryTest {
         var orphanFragment = assertInstanceOf(ErrorExpression.class, orphanStmt.value());
         assertEquals(CstIssueKind.ERROR, orphanFragment.kind());
         assertEquals(")", orphanFragment.sourceText());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(orphanSource, orphanCloser, () -> orphanSource);
+        var orphan = orphanSource.lastIndexOf(')');
+        assertEquals(utf8Range(orphanSource, orphan, orphan + 1), orphanFragment.range());
+        assertEquals(orphanFragment.range(), orphanDiag.range());
 
         // Inline lambda `return =3` stops before `,` and preserves the enclosing call's second arg.
         var lambdaBadReturn = recoverableParse("var x = call(func(): return =3, 1)\n");
@@ -1079,12 +1988,31 @@ class GdScriptParserErrorRecoveryTest {
         assertEquals("1", assertInstanceOf(LiteralExpression.class, outerCall.arguments().get(1)).sourceText());
 
         // `return 1 2` keeps `1` as the return value and sends `2` to the statement tail.
-        var trailingReturn = recoverableParse("func f():\n\treturn 1 2\n");
+        var trailingSource = "func f():\n\treturn 1 2\n";
+        var trailingReturn = recoverableParse(trailingSource);
         assertEquals(List.of("Expected end of statement after return statement, found \"Literal\" instead."),
                 errorMessages(trailingReturn), () -> errorMessages(trailingReturn).toString());
         var trailingStmt = assertInstanceOf(ReturnStatement.class,
                 onlyFunction(trailingReturn).body().statements().getFirst());
         assertEquals("1", assertInstanceOf(LiteralExpression.class, trailingStmt.value()).sourceText());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(trailingSource, trailingReturn, () -> trailingSource);
+        var trailing = trailingSource.indexOf('2');
+        assertDamage(trailingReturn, DiagnosticCodes.STATEMENT_TRAILING, trailingStmt, "statement.trailing",
+                utf8Range(trailingSource, trailing, trailing + 1));
+
+        var closerSource = "# 😀\r\nfunc f():\r\n\treturn 1 )\r\n\tpass";
+        var closerResult = recoverableParse(closerSource);
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(closerSource, closerResult, () -> closerSource);
+        var closerBody = assertInstanceOf(FunctionDeclaration.class,
+                closerResult.ast().statements().getLast()).body().statements();
+        assertEquals(2, closerBody.size());
+        var closerReturn = assertInstanceOf(ReturnStatement.class, closerBody.getFirst());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, closerReturn.value()).sourceText());
+        assertInstanceOf(PassStatement.class, closerBody.getLast());
+        assertEquals(1, closerResult.diagnostics().size());
+        var closer = closerSource.lastIndexOf(')');
+        assertDamage(closerResult, DiagnosticCodes.UNEXPECTED_CLOSER, closerReturn, "statement.trailing",
+                utf8Range(closerSource, closer, closer + 1));
     }
 
     @Test
@@ -1362,22 +2290,19 @@ class GdScriptParserErrorRecoveryTest {
         }
     }
 
-    /// Every bound recovery link must point at an owner reachable from the final AST
-    /// (identity semantics): the end-of-parse sweep unlinks owners of discarded constructs.
     @Test
-    void recoveryLinkOfDiscardedOwnerIsSwept() {
-        // The grouping's missing-`)` diagnostic is first bound to the inner return statement;
-        // the enclosing duplicate parameter `x` is then dropped from the signature, making the
-        // return (inside the lambda default) unreachable — the sweep must clear the link while
-        // keeping code, range and message.
+    void closerFromDiscardedDefaultAttributionFallsBackToSurvivingSignature() {
         var source = "func f(x, x = func(): return (1";
         var result = recoverableParse(source);
         var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
         assertEquals(1, function.parameters().size());
+        assertEquals("x", function.parameters().getFirst().name());
+        assertNull(function.parameters().getFirst().defaultValue());
         var closer = errorsOf(result).stream()
                 .filter(d -> "parse.missing_closer.grouping".equals(d.code()))
                 .findFirst().orElseThrow();
-        assertNull(closer.recovery());
+        assertSame(function, requireNotNull(closer.recovery()).owner());
+        assertEquals("function.signature", closer.recovery().facet());
         assertEquals("Expected closing \")\" after grouping expression.", closer.message());
         assertEquals(source.length(), closer.range().startByte());
         assertEquals(source.length(), closer.range().endByte());
@@ -1720,6 +2645,99 @@ class GdScriptParserErrorRecoveryTest {
                 () -> "section " + section.range() + " must cover marker " + marker.range());
     }
 
+    @Test
+    void damagedMatchPatternsKeepExactSlotsAndDoNotAddNoPatternErrors() {
+        var prefix = "func f():\r\n\tmatch v:\r\n\t\t";
+        for (var patternText : List.of("var ", "..", "[1, var , 3]", "{\"a\": var }", "{\"k\": ..}", "{.., \"k\": 1}")) {
+            var source = prefix + patternText + ": pass\r\nvar after = 1";
+            var result = recoverableParse(source);
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var section = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst())
+                    .sections().getFirst();
+            assertEquals(1, result.diagnostics().size());
+            assertEquals(1, section.patterns().size());
+            var pattern = section.patterns().getFirst();
+            var fragment = patternText.contains("var") ? "var" : "..";
+            var start = prefix.length() + patternText.indexOf(fragment);
+            var span = utf8Range(source, start, start + fragment.length());
+            var code = fragment.equals("var") ? DiagnosticCodes.MATCH_BIND_MISSING_NAME
+                    : patternText.startsWith("{..") ? DiagnosticCodes.MATCH_REST_NOT_LAST
+                    : DiagnosticCodes.MATCH_REST_MISPLACED;
+            assertDamage(result, code, section, "match.pattern", span);
+            if (patternText.startsWith("[")) {
+                var array = assertInstanceOf(ArrayExpression.class, pattern);
+                assertEquals(3, array.elements().size());
+                assertPatternLiteral(source, array.elements().getFirst(), "1", prefix.length() + 1);
+                assertPatternLiteral(source, array.elements().getLast(), "3", prefix.length() + patternText.indexOf('3'));
+                pattern = array.elements().get(1);
+            } else if (patternText.startsWith("{")) {
+                var dictionary = assertInstanceOf(DictionaryExpression.class, pattern);
+                assertEquals(1, dictionary.entries().size());
+                var entry = dictionary.entries().getFirst();
+                var key = patternText.contains("\"a\"") ? "\"a\"" : "\"k\"";
+                assertPatternLiteral(source, entry.key(), key, prefix.length() + patternText.indexOf(key));
+                if (patternText.startsWith("{..")) {
+                    assertTrue(dictionary.openEnded());
+                    assertPatternLiteral(source, entry.value(), "1", prefix.length() + patternText.indexOf('1'));
+                } else {
+                    assertFalse(dictionary.openEnded());
+                    pattern = entry.value();
+                }
+            }
+            if (!DiagnosticCodes.MATCH_REST_NOT_LAST.equals(code)) {
+                var error = assertInstanceOf(ErrorExpression.class, pattern);
+                assertEquals(CstIssueKind.ERROR, error.kind());
+                assertEquals(fragment, error.sourceText());
+                assertEquals(span, error.range());
+            }
+            assertInstanceOf(PassStatement.class, section.body().statements().getFirst());
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
+    private static void assertPatternLiteral(String source, Expression node, String text, int start) {
+        var literal = assertInstanceOf(LiteralExpression.class, node);
+        assertEquals(text, literal.sourceText());
+        assertEquals(utf8Range(source, start, start + text.length()), literal.range());
+    }
+
+    @Test
+    void damagedDictionaryPatternsConfineCloserAndBranchBodyToTheirOwnScopes() {
+        var prefix = "func f():\n\tmatch x:\n\t\t";
+        for (var patternText : List.of("{1+, 2: 3}", "{1+ var x: 3, 2: 3}", "{1+ var x: 3")) {
+            var closed = patternText.endsWith("}");
+            var source = prefix + patternText + (closed ? ": pass" : "") + "\nvar after = 1";
+            var result = recoverableParse(source);
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var section = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst())
+                    .sections().getFirst();
+            var dictionary = assertInstanceOf(DictionaryExpression.class, section.patterns().getFirst());
+            var patternEnd = prefix.length() + patternText.length();
+            assertEquals(utf8Range(source, prefix.length(), patternEnd), dictionary.range());
+            var firstKey = assertInstanceOf(BinaryExpression.class, dictionary.entries().getFirst().key());
+            var plus = source.indexOf('+');
+            assertMissingAt(source, firstKey.right(), "binary.right", plus + 1);
+            assertDamage(result, DiagnosticCodes.SLOT_BINARY_RIGHT, section, "match.pattern",
+                    utf8Range(source, plus, plus + 1));
+            if (closed) {
+                assertEquals(1, result.diagnostics().size());
+                assertEquals(2, dictionary.entries().size());
+                var pass = assertInstanceOf(PassStatement.class, section.body().statements().getFirst());
+                assertEquals(utf8Range(source, patternEnd + 2, patternEnd + 6), pass.range());
+            } else {
+                assertEquals(3, result.diagnostics().size());
+                assertDamage(result, DiagnosticCodes.MISSING_CLOSER_MATCH_DICTIONARY_PATTERN, section, "match.pattern",
+                        utf8Range(source, patternEnd, patternEnd));
+                assertDamage(result, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON, section, "match.section",
+                        utf8Range(source, patternEnd - 1, patternEnd));
+                assertTrue(section.body().statements().isEmpty());
+            }
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
     // -----------------------------------------------------------------------------------------
     // T20: protocol-directed cases — stop-fold, absorbing hosts, statement-dispatch gating.
     // -----------------------------------------------------------------------------------------
@@ -1737,7 +2755,7 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     @Test
-    void damagedSubscriptOrGroupingDoesNotFoldFollowingOperators() {
+    void damagedSubscriptAndGroupingKeepNodesAndFoldFollowingOperators() {
         // Settled subscript and grouping boundaries remain damaged but continue folding trailing
         // infix `+ 2`, retaining the full BinaryExpression statement.
         var subscript = recoverableParse("func f():\n\ta[1+]+2\n");
@@ -1788,7 +2806,7 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     @Test
-    void damagedArgumentsStopTheSuffixChain() {
+    void damagedArgumentsAndIndicesKeepNodesAndContinueTheSuffixChain() {
         // After damaged call arguments or subscript indices, the settled suffix chain continues
         // folding subsequent `(2)` / `[2]` suffixes and preserves both argument/index slots; the
         // outer call on `foo(1+)` also reports `CALL_INVALID_CALLEE` on the non-identifier callee.
@@ -1852,7 +2870,104 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     @Test
-    void superCallWithDamagedArgumentStopsFold() {
+    void lambdaSynchronizationPreservesLocalAndAncestorDelimiterOwnership() {
+        var parser = new GdScriptParser();
+        var tails = List.of("[1", "[1]", "[(1]", "[1, 2", "[1, 2], 3", "[(1}, 2], 3");
+        for (var eol : List.of("\n", "\r\n")) {
+            var prefix = eol.equals("\r\n") ? "\"😀\", " : "";
+            for (var tail : tails) {
+                var source = ("func f():\n\tfoo(" + prefix + "1+, func(): = " + tail
+                        + ")\n\tpass\nvar after = 1\n").replace("\n", eol);
+                var result = parser.parse(source);
+                assertEquals(List.of(DiagnosticCodes.SLOT_BINARY_RIGHT, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN),
+                        errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> source);
+                assertEquals(List.of("f", "after"), topLevelMemberNames(result), () -> source);
+                var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+                var statements = function.body().statements();
+                assertEquals(2, statements.size(), () -> source);
+                assertInstanceOf(PassStatement.class, statements.getLast());
+                var statement = assertInstanceOf(ExpressionStatement.class, statements.getFirst());
+                var call = assertInstanceOf(CallExpression.class, statement.expression());
+                var badArg = prefix.isEmpty() ? 0 : 1;
+                assertInstanceOf(BinaryExpression.class, call.arguments().get(badArg));
+                var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().get(badArg + 1));
+                assertEquals(List.of(), lambda.body().statements());
+                var outside = switch (tail) {
+                    case "[1, 2" -> "2";
+                    case "[1, 2], 3", "[(1}, 2], 3" -> "3";
+                    default -> "";
+                };
+                assertEquals(badArg + (outside.isEmpty() ? 2 : 3), call.arguments().size(), () -> source);
+                if (!outside.isEmpty()) {
+                    assertEquals(outside, assertInstanceOf(LiteralExpression.class,
+                            call.arguments().getLast()).sourceText());
+                }
+                var plus = source.indexOf('+');
+                assertDamage(result, DiagnosticCodes.SLOT_BINARY_RIGHT, statement, "expression",
+                        utf8Range(source, plus, plus + 1));
+                var equals = source.indexOf("= [");
+                assertDamage(result, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, statement, "expression",
+                        utf8Range(source, equals, equals + 1));
+                var callStart = source.indexOf("foo(");
+                var closer = source.indexOf(eol, callStart);
+                assertEquals(utf8Range(source, callStart, closer), call.range());
+                assertStrictSyntaxError(source);
+            }
+        }
+        var healthy = "func f():\n\tfoo(1, func(): pass)\n\tpass\nvar after = 1\n";
+        assertEquals(List.of(), parser.parse(healthy).diagnostics());
+        new GdScriptParserFacade().parseStrict(healthy);
+    }
+
+    @Test
+    void synchronizationCommaShieldsRequireReachableExactClosers() {
+        var parser = new GdScriptParser();
+        var strayCrEscape = "\"a\\" + '\r' + "\";b\\" + '\r' + "\"c\"";
+        var rawAfterNumber = "r\"a\\" + '\r' + "\"";
+        var tails = new ArrayList<>(List.of("2\nvar after = 1\n]\n", "2 # ; ]\nvar after = 1\n]\n",
+                    "2; 3], 4)\nvar after = 1\n",
+                    "\\\n\t2], 3)\nvar after = 1\n",
+                    "\\\n\t# ; ]\n\t2], 3)\nvar after = 1\n",
+                    "\";\", 2], 3)\nvar after = 1\n",
+                    strayCrEscape + ", 2], 3)\nvar after = 1\n",
+                    "\"\"\";\n]\"\"\", 2], 3)\nvar after = 1\n"));
+        for (var number : List.of("0x1", "0x1 ", "0B1_0", "10", "10.25", ".25", "1e+2", "1..0x1")) {
+            tails.add(number + rawAfterNumber + ", 3], 4)\nvar after = 1\n");
+        }
+        for (var eol : List.of("\n", "\r\n")) {
+            for (var tail : tails) {
+                var source = ("var x = g(func(): = [1, " + tail).replace("\n", eol);
+                var result = parser.parse(source);
+                var x = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+                var call = assertInstanceOf(CallExpression.class, x.value());
+                assertEquals(2, call.arguments().size(), () -> source);
+                assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+                var numericRawString = tail.contains(rawAfterNumber);
+                var expected = numericRawString ? "4" : tail.startsWith("2") ? "2" : "3";
+                assertEquals(expected, assertInstanceOf(LiteralExpression.class,
+                        call.arguments().getLast()).sourceText(), () -> source);
+                var after = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast());
+                assertEquals("after", after.name(), () -> source);
+                var equals = source.indexOf("= [");
+                assertDamage(result, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, x, "variable.initializer",
+                        utf8Range(source, equals, equals + 1));
+                if (tail.startsWith(strayCrEscape)) {
+                    assertEquals(List.of(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN),
+                            errorsOf(result).stream().map(AstDiagnostic::code).toList());
+                    assertEquals(utf8Range(source, source.indexOf("g("), source.indexOf(eol)), call.range());
+                }
+                if (numericRawString) {
+                    assertFalse(errorsOf(result).stream()
+                            .anyMatch(diagnostic -> DiagnosticCodes.MISMATCHED_CLOSER_CALL.equals(diagnostic.code())));
+                    assertEquals(utf8Range(source, source.indexOf("g("), source.indexOf(eol)), call.range());
+                }
+            }
+        }
+        assertEquals(List.of(), parser.parse("var healthy = g(1, 2)\n").diagnostics());
+    }
+
+    @Test
+    void superCallWithDamagedArgumentContinuesFolding() {
         // `super(1+)+2`: the damaged argument list still settles `)` so `+ 2` folds onto the
         // CallExpression(SuperExpression, ...) and the statement survives.
         var result = recoverableParse("func f():\n\tsuper(1+)+2\n");
@@ -1870,17 +2985,22 @@ class GdScriptParserErrorRecoveryTest {
     }
 
     @Test
-    void groupingPureMissingDoesNotConsumeCloser() {
+    void emptyGroupingConsumesItsOwnCloserWithoutWideningTheMissingMarker() {
         // `var x = ()`: empty grouping settles its own `)` cleanly with only the content error,
         // `foo((), 1)` preserves the second argument, `(1+)` settles its own `)`, and `var x = (\n`
         // keeps a single primary diagnostic without emitting a duplicate missing-closer error.
-        var result = recoverableParse("func f():\n\tvar x = ()\n");
+        var source = "func f():\n\tvar x = ()\n";
+        var result = recoverableParse(source);
         assertEquals(List.of("Expected grouping expression."), errorMessages(result),
                 () -> errorMessages(result).toString());
         var body = onlyFunction(result).body().statements();
-        var marker = assertInstanceOf(ErrorExpression.class,
-                assertInstanceOf(VariableDeclaration.class, body.getFirst()).value());
-        assertEquals("grouping", marker.nodeType());
+        var variable = assertInstanceOf(VariableDeclaration.class, body.getFirst());
+        var opener = source.lastIndexOf('(');
+        assertMissingAt(source, variable.value(), "grouping", opener + 1);
+        assertEquals(utf8Range(source, source.indexOf("var"), opener + 2), variable.range());
+        assertDamage(result, DiagnosticCodes.SLOT_GROUPING, variable, "variable.initializer",
+                utf8Range(source, opener, opener + 1));
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
 
         var callResult = recoverableParse("func f():\n\tfoo((), 1)\n");
         assertEquals(List.of("Expected grouping expression."), errorMessages(callResult),
@@ -1898,11 +3018,17 @@ class GdScriptParserErrorRecoveryTest {
         assertInstanceOf(BinaryExpression.class,
                 assertInstanceOf(VariableDeclaration.class, damagedGrouping.ast().statements().getFirst()).value());
 
-        var open = recoverableParse("var x = (\n");
+        var openSource = "var x = (\n";
+        var open = recoverableParse(openSource);
         assertEquals(List.of("Expected grouping expression."), errorMessages(open),
                 () -> errorMessages(open).toString());
-        assertInstanceOf(ErrorExpression.class,
-                assertInstanceOf(VariableDeclaration.class, open.ast().statements().getFirst()).value());
+        var openVariable = assertInstanceOf(VariableDeclaration.class, open.ast().statements().getFirst());
+        var unmatched = openSource.indexOf('(');
+        assertMissingAt(openSource, openVariable.value(), "grouping", unmatched + 1);
+        assertEquals(utf8Range(openSource, 0, unmatched + 1), openVariable.range());
+        assertDamage(open, DiagnosticCodes.SLOT_GROUPING, openVariable, "variable.initializer",
+                utf8Range(openSource, unmatched, unmatched + 1));
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(openSource, open, () -> openSource);
     }
 
     @Test
@@ -2169,6 +3295,641 @@ class GdScriptParserErrorRecoveryTest {
     // -----------------------------------------------------------------------------------------
 
     @Test
+    void luaKeysDistinguishClosedContainersFromDamagedGrouping() {
+        for (var eol : List.of("\n", "\r\n")) {
+            for (var key : List.of("[1+]", "foo(1+)", "(1+)", "([1+])", "a[1+]")) {
+                var source = "# 😀" + eol + "var d = { " + key + " = 2 }" + eol + "var next = 3" + eol;
+                var result = recoverableParse(source);
+                assertEquals(List.of("CommentStatement", "d", "next"), topLevelMemberNames(result));
+                var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1));
+                var entry = assertInstanceOf(DictionaryExpression.class, owner.value()).entries().getFirst();
+                var inner = switch (key) {
+                    case "[1+]", "([1+])" -> assertInstanceOf(ArrayExpression.class, entry.key()).elements().getFirst();
+                    case "foo(1+)" -> assertInstanceOf(CallExpression.class, entry.key()).arguments().getFirst();
+                    case "a[1+]" -> assertInstanceOf(SubscriptExpression.class, entry.key()).arguments().getFirst();
+                    default -> entry.key();
+                };
+                var right = assertInstanceOf(BinaryExpression.class, inner).right();
+                var plus = source.indexOf('+');
+                assertMissingAt(source, right, "binary.right", plus + 1);
+                assertEquals("2", assertInstanceOf(LiteralExpression.class, entry.value()).sourceText());
+                assertEquals("(1+)".equals(key)
+                                ? List.of(DiagnosticCodes.SLOT_BINARY_RIGHT)
+                                : List.of(DiagnosticCodes.SLOT_BINARY_RIGHT, DiagnosticCodes.DICTIONARY_INVALID_LUA_KEY),
+                        errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> source);
+                assertDamage(result, DiagnosticCodes.SLOT_BINARY_RIGHT, owner, "variable.initializer",
+                        utf8Range(source, plus, plus + 1));
+                if (!"(1+)".equals(key)) {
+                    var equals = source.indexOf(" = 2") + 1;
+                    assertDamage(result, DiagnosticCodes.DICTIONARY_INVALID_LUA_KEY, owner, "variable.initializer",
+                            utf8Range(source, equals, equals + 1));
+                }
+                assertStrictSyntaxError(source);
+            }
+        }
+    }
+
+    @Test
+    void closedContainersRetainMissingSlotsAssignmentsAndPostfixFolds() {
+        for (var eol : List.of("\n", "\r\n")) {
+            for (var dictionary : List.of("{:}", "{\"a\": 1, :, \"b\": 2}", "{\"😀\": 1, :, \"b\": 2}")) {
+                var source = "# 😀" + eol + "var d = " + dictionary + eol;
+                var result = recoverableParse(source);
+                var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1));
+                var entries = assertInstanceOf(DictionaryExpression.class, owner.value()).entries();
+                var hasNeighbors = dictionary.contains(",");
+                assertEquals(hasNeighbors ? 3 : 1, entries.size());
+                if (hasNeighbors) {
+                    var firstKey = dictionary.contains("😀") ? "\"😀\"" : "\"a\"";
+                    assertEquals(firstKey, assertInstanceOf(LiteralExpression.class, entries.getFirst().key()).sourceText());
+                    assertEquals("\"b\"", assertInstanceOf(LiteralExpression.class, entries.getLast().key()).sourceText());
+                    assertEquals("1", assertInstanceOf(LiteralExpression.class, entries.getFirst().value()).sourceText());
+                    assertEquals("2", assertInstanceOf(LiteralExpression.class, entries.getLast().value()).sourceText());
+                }
+                var entry = entries.get(hasNeighbors ? 1 : 0);
+                var keyAnchorToken = source.indexOf(hasNeighbors ? ", :" : "{:");
+                var valueAnchorToken = source.lastIndexOf(hasNeighbors ? ":," : ":}");
+                assertMissingAt(source, entry.key(), "dictionary.key", keyAnchorToken + 1);
+                assertMissingAt(source, entry.value(), "dictionary.value", valueAnchorToken + 1);
+                assertEquals(2, errorsOf(result).size());
+                assertDamage(result, DiagnosticCodes.SLOT_DICTIONARY_KEY, owner, "variable.initializer",
+                        utf8Range(source, keyAnchorToken, keyAnchorToken + 1));
+                assertDamage(result, DiagnosticCodes.SLOT_DICTIONARY_VALUE, owner, "variable.initializer",
+                        utf8Range(source, valueAnchorToken, valueAnchorToken + 1));
+                assertStrictSyntaxError(source);
+            }
+
+            for (var expression : List.of("g([a=1], 2)", "{1: a=1}")) {
+                var source = "# 😀" + eol + "var d = " + expression + eol;
+                var result = recoverableParse(source);
+                var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1));
+                var embedded = switch (owner.value()) {
+                    case CallExpression(var callee, var arguments, _) -> {
+                        assertEquals("g", assertInstanceOf(IdentifierExpression.class, callee).name());
+                        assertEquals(2, arguments.size());
+                        assertEquals("2", assertInstanceOf(LiteralExpression.class, arguments.getLast()).sourceText());
+                        yield assertInstanceOf(ArrayExpression.class, arguments.getFirst()).elements().getFirst();
+                    }
+                    case DictionaryExpression(var entries, _, _) -> entries.getFirst().value();
+                    default -> throw new AssertionError(owner.value());
+                };
+                var assignment = assertInstanceOf(AssignmentExpression.class, embedded);
+                assertEquals("a", assertInstanceOf(IdentifierExpression.class, assignment.left()).name());
+                assertEquals("1", assertInstanceOf(LiteralExpression.class, assignment.right()).sourceText());
+                var a = source.indexOf("a=1");
+                assertEquals(utf8Range(source, a, a + 3), assignment.range());
+                assertEquals(1, errorsOf(result).size());
+                assertDamage(result, DiagnosticCodes.ASSIGNMENT_DISALLOWED_IN_EXPRESSION, owner,
+                        "variable.initializer", utf8Range(source, a + 1, a + 2));
+                assertStrictSyntaxError(source);
+            }
+
+            for (var expression : List.of("foo([1+]).bar", "foo(1+).bar")) {
+                var source = "func f():" + eol + "\t" + expression + eol + "\tpass" + eol;
+                var result = recoverableParse(source);
+                var statements = onlyFunction(result).body().statements();
+                var owner = assertInstanceOf(ExpressionStatement.class, statements.getFirst());
+                var attribute = assertInstanceOf(AttributeExpression.class, owner.expression());
+                var call = assertInstanceOf(CallExpression.class, attribute.base());
+                assertEquals("foo", assertInstanceOf(IdentifierExpression.class, call.callee()).name());
+                assertEquals("bar", assertInstanceOf(AttributePropertyStep.class, attribute.steps().getLast()).name());
+                assertInstanceOf(PassStatement.class, statements.getLast());
+                var plus = source.indexOf('+');
+                assertEquals(1, errorsOf(result).size());
+                assertDamage(result, DiagnosticCodes.SLOT_BINARY_RIGHT, owner, "expression",
+                        utf8Range(source, plus, plus + 1));
+                assertStrictSyntaxError(source);
+            }
+
+            var valid = String.join(eol, "var a = {}", "var b = {\"x\": 1,}", "var c = g([1,], 2,)",
+                    "var d = g()", "var e = foo([1]).bar", "func f(): a = 1") + eol;
+            var result = new GdScriptParserFacade().parse(valid);
+            assertEquals(List.of(), result.diagnostics());
+            assertEquals(result.ast(), new GdScriptParserFacade().parseStrict(valid));
+        }
+    }
+
+    @Test
+    void nonemptyInfixTypeDamageKeepsItsTextOperandAndOwner() {
+        for (var eol : List.of("\n", "\r\n")) {
+            for (var expression : List.of("x as Node.", "x as Array[Array[int]]", "x as Array[int",
+                    "x is Array[int", "x is Array[int)", "x as int", "x is not Array[int]")) {
+                var source = "func f():" + eol + "\tvar emoji = \"😀\"" + eol + "\t" + expression;
+                var result = new GdScriptParserFacade().parse(source);
+                var owner = assertInstanceOf(ExpressionStatement.class, onlyFunction(result).body().statements().getLast());
+                var type = switch (owner.expression()) {
+                    case CastExpression(var left, var targetType, _) -> {
+                        assertEquals("x", assertInstanceOf(IdentifierExpression.class, left).name());
+                        yield targetType;
+                    }
+                    case TypeTestExpression(var left, var targetType, var negated, _) -> {
+                        assertEquals("x", assertInstanceOf(IdentifierExpression.class, left).name());
+                        assertEquals(expression.contains(" not "), negated);
+                        yield targetType;
+                    }
+                    default -> throw new AssertionError(owner.expression());
+                };
+                var typeText = expression.substring(expression.lastIndexOf(' ') + 1);
+                var typeStart = source.lastIndexOf(typeText);
+                assertEquals(typeText, type.sourceText());
+                assertEquals(utf8Range(source, typeStart, source.length()), type.range());
+                if (List.of("x as int", "x is not Array[int]").contains(expression)) {
+                    assertEquals(List.of(), result.diagnostics());
+                    assertEquals(result.ast(), new GdScriptParserFacade().parseStrict(source));
+                } else {
+                    assertEquals(1, errorsOf(result).size(), () -> result.diagnostics().toString());
+                    var code = switch (typeText) {
+                        case "Array[int" -> DiagnosticCodes.MISSING_CLOSER_TYPE_BRACKET;
+                        case "Array[int)" -> DiagnosticCodes.MISMATCHED_CLOSER_TYPE_BRACKET;
+                        default -> DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN;
+                    };
+                    var diagnosticWidth = switch (typeText) {
+                        case "Array[int" -> 0;
+                        default -> 1;
+                    };
+                    var anchorEnd = "Array[Array[int]]".equals(typeText) ? source.length() - 1 : source.length();
+                    assertDamage(result, code, owner, "expression", utf8Range(source, anchorEnd - diagnosticWidth, anchorEnd));
+                    assertStrictSyntaxError(source);
+                }
+            }
+        }
+    }
+
+    @Test
+    void luaKeyChecksDoNotCascadeAfterDamagedInfixTypes() {
+        for (var type : List.of("Node.", "Array[Array[int]]", "Array[int")) {
+            var source = "var d = { x as " + type + " = 2 }\n";
+            var result = recoverableParse(source);
+            var dictionary = assertInstanceOf(DictionaryExpression.class,
+                    assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst()).value());
+            var entry = dictionary.entries().getFirst();
+            assertEquals(type, assertInstanceOf(CastExpression.class, entry.key()).targetType().sourceText());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, entry.value()).sourceText());
+            assertEquals(List.of("Array[int".equals(type) ? DiagnosticCodes.MISSING_CLOSER_TYPE_BRACKET
+                            : DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> source);
+        }
+
+        var completeType = recoverableParse("var d = { x as Node = 2 }\n");
+        assertEquals(List.of(DiagnosticCodes.DICTIONARY_INVALID_LUA_KEY),
+                errorsOf(completeType).stream().map(AstDiagnostic::code).toList());
+    }
+
+    @Test
+    void missingAndFailedInfixTypesKeepExactlyOneDiagnosticAndExactMarkerRange() {
+        for (var expression : List.of("x as", "x is not", "x as Array[]", "x is void")) {
+            var source = "var note = \"😀\"\r\nvar item = " + expression + "\r\n";
+            var result = recoverableParse(source);
+            var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast());
+            var recovered = assertInstanceOf(RecoveredInfixExpression.class, owner.value());
+            assertEquals("x", assertInstanceOf(IdentifierExpression.class, recovered.operand()).name());
+            var end = source.lastIndexOf("\r\n");
+            var diagnosticStart = switch (expression) {
+                case "x as" -> source.lastIndexOf("as");
+                case "x is not" -> source.lastIndexOf("not");
+                case "x as Array[]" -> source.lastIndexOf('[');
+                default -> source.lastIndexOf("void");
+            };
+            var diagnosticEnd = expression.endsWith("Array[]") ? diagnosticStart + 1 : end;
+            var code = switch (expression) {
+                case "x as" -> DiagnosticCodes.MISSING_TYPE_CAST;
+                case "x is not" -> DiagnosticCodes.MISSING_TYPE_TYPE_TEST;
+                case "x as Array[]" -> DiagnosticCodes.MISSING_TYPE_GENERIC_ARGUMENT;
+                default -> DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN;
+            };
+            assertEquals(1, errorsOf(result).size());
+            assertDamage(result, code, owner, "variable.initializer", utf8Range(source, diagnosticStart, diagnosticEnd));
+            switch (expression) {
+                case "x as" -> assertMissingAt(source, recovered.problem(), "cast.type", end);
+                case "x is not" -> assertMissingAt(source, recovered.problem(), "type_test.type", end);
+                default -> {
+                    var type = expression.substring(expression.lastIndexOf(' ') + 1);
+                    assertEquals(CstIssueKind.ERROR, recovered.problem().kind());
+                    assertEquals(type, recovered.problem().sourceText());
+                    assertEquals(utf8Range(source, end - type.length(), end), recovered.problem().range());
+                }
+            }
+            assertStrictSyntaxError(source);
+        }
+    }
+
+    @Test
+    void contextualIdentifierTypesParseStrictlyWithExactRanges() {
+        var source = """
+                var note = "😀"
+                var x: when
+                var y: Array[when]
+                func f(a: match) -> when:
+                \treturn a is match
+                """;
+        var facade = new GdScriptParserFacade();
+        assertEquals(List.of(), facade.parse(source).diagnostics());
+        var statements = facade.parseStrict(source).statements();
+        var variable = assertInstanceOf(VariableDeclaration.class, statements.get(1));
+        var array = assertInstanceOf(VariableDeclaration.class, statements.get(2));
+        var function = assertInstanceOf(FunctionDeclaration.class, statements.getLast());
+        var returned = assertInstanceOf(ReturnStatement.class, function.body().statements().getFirst());
+        var typeTest = assertInstanceOf(TypeTestExpression.class, returned.value());
+        var variableStart = source.indexOf("when");
+        var arrayStart = source.indexOf("Array[when]");
+        var parameterStart = source.indexOf("match");
+        var returnStart = source.lastIndexOf("when");
+        var typeTestStart = source.lastIndexOf("match");
+        assertEquals(new TypeRef("when", utf8Range(source, variableStart, variableStart + "when".length())),
+                variable.type());
+        assertEquals(new TypeRef("Array[when]", utf8Range(source, arrayStart, arrayStart + "Array[when]".length())),
+                array.type());
+        assertEquals(new TypeRef("match", utf8Range(source, parameterStart, parameterStart + "match".length())),
+                function.parameters().getFirst().type());
+        assertEquals(new TypeRef("when", utf8Range(source, returnStart, returnStart + "when".length())),
+                function.returnType());
+        assertEquals(new TypeRef("match", utf8Range(source, typeTestStart, typeTestStart + "match".length())),
+                typeTest.targetType());
+    }
+
+    @Test
+    void dottedTypeFragmentsSurviveVariableParameterAndReturnSlots() {
+        var source = "var note = \"😀\"\r\nvar a: Foo.\r\nfunc f(p: Bar.) -> Baz.:\r\n\tpass\r\n";
+        var result = recoverableParse(source);
+        var variable = assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1));
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getLast());
+        var parameter = function.parameters().getFirst();
+        assertEquals(3, errorsOf(result).size());
+        var types = List.of(requireNotNull(variable.type()), requireNotNull(parameter.type()),
+                requireNotNull(function.returnType()));
+        var owners = List.of(variable, parameter, function);
+        var facets = List.of("variable.type", "parameter.type", "function.return_type");
+        var typeNames = List.of("Foo.", "Bar.", "Baz.");
+        for (var i = 0; i < typeNames.size(); i++) {
+            var typeText = typeNames.get(i);
+            var start = source.indexOf(typeText);
+            assertEquals(new TypeRef(typeText, utf8Range(source, start, start + typeText.length())), types.get(i));
+            var diagnostic = errorsOf(result).get(i);
+            assertEquals(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, diagnostic.code());
+            assertEquals(utf8Range(source, start + typeText.length() - 1, start + typeText.length()), diagnostic.range());
+            assertSame(owners.get(i), requireNotNull(diagnostic.recovery()).owner());
+            assertEquals(facets.get(i), requireNotNull(diagnostic.recovery()).facet());
+        }
+        assertStrictSyntaxError(source);
+    }
+
+    @Test
+    void brokenForTypesResumeAtSameLineInWithoutCrossingBoundaries() {
+        for (var eol : List.of("\n", "\r\n")) {
+            for (var type : List.of("Foo.", "Array[int", "Array[Array[int]]", "Array[]", "")) {
+                var source = String.join(eol, "func f():", "\tvar note = \"😀\"",
+                        "\tfor i: " + type + " ??? in xs:", "\t\tpass", "\tpass", "var after = 1") + eol;
+                var result = recoverableParse(source);
+                assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+                var body = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst()).body();
+                assertEquals(3, body.statements().size());
+                var owner = assertInstanceOf(ForStatement.class, body.statements().get(1));
+                assertEquals("xs", assertInstanceOf(IdentifierExpression.class, owner.iterable()).name());
+                assertInstanceOf(PassStatement.class, owner.body().statements().getFirst());
+                assertInstanceOf(PassStatement.class, body.statements().getLast());
+                var start = source.indexOf("i: ") + 3;
+                var end = start + type.length();
+                var code = switch (type) {
+                    case "Array[int" -> DiagnosticCodes.MISSING_CLOSER_TYPE_BRACKET;
+                    case "Array[]" -> DiagnosticCodes.MISSING_TYPE_GENERIC_ARGUMENT;
+                    case "" -> DiagnosticCodes.MISSING_TYPE_FOR_ITERATOR;
+                    default -> DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN;
+                };
+                var expectedType = switch (type) {
+                    case "", "Array[]" -> null;
+                    default -> new TypeRef(type, utf8Range(source, start, end));
+                };
+                var diagnosticRange = switch (type) {
+                    case "Array[int" -> utf8Range(source, end, end);
+                    case "Array[]" -> utf8Range(source, end - 2, end - 1);
+                    case "Array[Array[int]]" -> utf8Range(source, end - 2, end - 1);
+                    case "" -> utf8Range(source, start - 2, start - 1);
+                    default -> utf8Range(source, end - 1, end);
+                };
+                assertEquals(expectedType, owner.iteratorType());
+                assertEquals(1, errorsOf(result).size(), () -> result.diagnostics().toString());
+                assertDamage(result, code, owner, "for.iterator", diagnosticRange);
+                assertStrictSyntaxError(source);
+            }
+        }
+
+        for (var suffix : List.of(": int:", ": Foo. :", ": Foo. : in xs")) {
+            var source = "func f():\n\tfor i" + suffix + "\n\t\tpass\n";
+            var result = recoverableParse(source);
+            var owner = assertInstanceOf(ForStatement.class, onlyFunction(result).body().statements().getFirst());
+            var diagnostic = findErrorByCode(result, DiagnosticCodes.FOR_MISSING_IN);
+            assertEquals("Expected \"in\" after \"for\" variable type specifier.",
+                    diagnostic.message());
+            assertSame(owner, requireNotNull(diagnostic.recovery()).owner());
+            assertEquals("for.iterator", requireNotNull(diagnostic.recovery()).facet());
+        }
+        var noAnnotation = recoverableParse("func f():\n\tfor i xs:\n\t\tpass\n");
+        assertEquals("Expected \"in\" or \":\" after \"for\" variable name.",
+                findErrorByCode(noAnnotation, DiagnosticCodes.FOR_MISSING_IN).message());
+        var healthy = "func f():\n\tfor i: Array[int] in xs:\n\t\tpass\n";
+        assertEquals(List.of(), new GdScriptParserFacade().parse(healthy).diagnostics());
+        new GdScriptParserFacade().parseStrict(healthy);
+    }
+
+    @Test
+    void brokenForTypeAcceptsOnlyVisibleInOnItsLogicalHeader() {
+        for (var eol : List.of("\n", "\r\n")) {
+            var prefix = "func f():" + eol + "\tfor i: Foo.";
+            var continued = prefix + " \\" + eol + "\tin xs:" + eol + "\t\tpass" + eol + "\tpass" + eol;
+            var result = recoverableParse(continued);
+            var statements = onlyFunction(result).body().statements();
+            assertEquals(2, statements.size());
+            var loop = assertInstanceOf(ForStatement.class, statements.getFirst());
+            assertEquals("xs", assertInstanceOf(IdentifierExpression.class, loop.iterable()).name());
+            assertInstanceOf(PassStatement.class, loop.body().statements().getFirst());
+            assertInstanceOf(PassStatement.class, statements.getLast());
+            assertEquals(List.of(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            var dot = prefix.length() - 1;
+            assertDamage(result, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, loop, "for.iterator",
+                    utf8Range(continued, dot, dot + 1));
+
+            for (var newline : List.of(eol + "\tin", " \\" + eol + "\t??? in")) {
+                var broken = prefix + newline + " xs:" + eol + "\t\tpass" + eol;
+                var brokenResult = recoverableParse(broken);
+                var brokenLoop = assertInstanceOf(ForStatement.class,
+                        onlyFunction(brokenResult).body().statements().getFirst());
+                assertFalse(brokenLoop.iterable() instanceof IdentifierExpression(var name, _) && "xs".equals(name));
+                var missingIn = findErrorByCode(brokenResult, DiagnosticCodes.FOR_MISSING_IN);
+                assertSame(brokenLoop, requireNotNull(missingIn.recovery()).owner());
+                assertEquals("for.iterator", requireNotNull(missingIn.recovery()).facet());
+            }
+        }
+    }
+
+    @Test
+    void lexicallyDamagedIteratorTypesRecoverToInWithOriginalOwner() {
+        for (var spelling : List.of("§Foo", "Foo§.Bar", "Foo.§Bar", "Array§[int]", "Array[§int]",
+                "Dictionary[int§, String]", "Array[int §]")) {
+            var source = "func f():\r\n\tvar note = \"😀\"\r\n\tfor i: " + spelling
+                    + " ??? in xs:\r\n\t\tpass\r\n\tpass\r\n";
+            var result = recoverableParse(source);
+            var statements = onlyFunction(result).body().statements();
+            assertEquals(3, statements.size(), () -> source);
+            var loop = assertInstanceOf(ForStatement.class, statements.get(1));
+            assertEquals("xs", assertInstanceOf(IdentifierExpression.class, loop.iterable()).name(), () -> source);
+            assertInstanceOf(PassStatement.class, loop.body().statements().getFirst());
+            assertInstanceOf(PassStatement.class, statements.getLast());
+            var text = spelling.startsWith("§") ? spelling.substring(1) : spelling;
+            var typeStart = source.indexOf(spelling) + spelling.length() - text.length();
+            assertEquals(new TypeRef(text, utf8Range(source, typeStart, typeStart + text.length())), loop.iteratorType());
+            assertEquals(List.of(DiagnosticCodes.LEXICAL_ERROR),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> source);
+            var bad = source.indexOf('§');
+            assertDamage(result, DiagnosticCodes.LEXICAL_ERROR, loop, "for.iterator", utf8Range(source, bad, bad + 1));
+            assertStrictSyntaxError(source);
+        }
+    }
+
+    @Test
+    void luaKeyChecksDistinguishLexicalDamageInsideAndAfterACloser() {
+        var eol = "\r\n";
+        for (var key : List.of("x as Array[int §]", "x as Array[int" + eol + "\t§]", "x as Foo.§Bar",
+                "(1 §)", "(1" + eol + "\t§)", "(§1)", "[1 §]", "[1 §,]", "foo(1 §)", "foo(1 §,)",
+                "a[1 §]", "preload(\"a\" §)", "preload(\"a\" §,)", "{\"a\": 1 §}", "{\"a\" §: 1}",
+                "(1) §", "x as Array[int] §")) {
+            var source = "var note = \"😀\"" + eol + "var d = { " + key + " = 2 }" + eol;
+            var result = recoverableParse(source);
+            var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast());
+            var entry = assertInstanceOf(DictionaryExpression.class, owner.value(),
+                    () -> source + result.diagnostics()).entries().getFirst();
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, entry.value()).sourceText(), () -> source);
+            var insideGrouping = key.startsWith("(") && key.endsWith(")");
+            var insideType = key.startsWith("x as ") && !key.endsWith("§");
+            assertEquals(insideGrouping || insideType
+                            ? List.of(DiagnosticCodes.LEXICAL_ERROR)
+                            : List.of(DiagnosticCodes.LEXICAL_ERROR, DiagnosticCodes.DICTIONARY_INVALID_LUA_KEY),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> source);
+            var bad = source.indexOf('§');
+            assertDamage(result, DiagnosticCodes.LEXICAL_ERROR, owner, "variable.initializer",
+                    utf8Range(source, bad, bad + 1));
+            if (insideType) {
+                var type = assertInstanceOf(CastExpression.class, entry.key()).targetType();
+                var typeStart = source.indexOf("x as ") + "x as ".length();
+                var typeEnd = source.indexOf(" = 2");
+                assertEquals(new TypeRef(source.substring(typeStart, typeEnd), utf8Range(source, typeStart, typeEnd)),
+                        type);
+            }
+            assertStrictSyntaxError(source);
+        }
+    }
+
+    @Test
+    void luaKeysDoNotCascadeAfterDamagedPrattTokens() {
+        var keys = List.of("(1 § + 2)", "1 § + 2", "(1 \\\n\t§ + 2)", "(1 § + 2) * 3", "1 + §2",
+                "§[1]", "§[1].size()", "(a § .b)", "(a. § b)", "a § (1)", "a § [1]",
+                "a.b § .c", "a.b § (1)", "a.b § [1]", "a § .b.c(1)[0]",
+                "(1 if true § else 2)", "(a not § in b)", "(a is § not int)",
+                "(preload § (\"x\"))", "(super § (1))", "(super § .f())", "(super. § f())", "(super.f § ())",
+                "($a § /b)", "($ § /a)", "($ § \"a\")", "($a/ § %b)", "(% § a)");
+        assertAll(keys.stream().map(key -> () ->
+                assertLuaKeyLexicalDamage(key, List.of(DiagnosticCodes.LEXICAL_ERROR))));
+    }
+
+    @Test
+    void luaKeysDoNotCascadeAfterLexicallyDamagedLambdaSignatures() {
+        var signatures = List.of("func § f():", "func § ():", "func(§ a):", "func(a § , b):", "func(a § ):",
+                "func() § -> void:", "func() -> §void:", "func() § :");
+        assertAll(signatures.stream().map(signature -> () -> assertLambdaKeyLexicalDamage(signature, false)));
+    }
+
+    @Test
+    void luaKeysDoNotCascadeAfterStructurallyDamagedLambdaSignatures() {
+        var signatures = Map.of(
+                "func(a b):", DiagnosticCodes.MISSING_SEPARATOR_COMMA,
+                "func() -> :", DiagnosticCodes.MISSING_TYPE_RETURN_TYPE,
+                "func() -> Node.:", DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN,
+                "func() -> void:", DiagnosticCodes.DICTIONARY_INVALID_LUA_KEY);
+        assertAll(signatures.entrySet().stream().map(test -> () -> {
+            var source = "var d = { (" + test.getKey() + " pass) = 3 }\n";
+            var result = recoverableParse(source);
+            var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+            var entry = assertInstanceOf(DictionaryExpression.class, owner.value()).entries().getFirst();
+            var lambda = assertInstanceOf(LambdaExpression.class, entry.key());
+            assertInstanceOf(PassStatement.class, lambda.body().statements().getFirst());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, entry.value()).sourceText(), () -> source);
+            assertEquals(List.of(test.getValue()),
+                    result.diagnostics().stream().map(AstDiagnostic::code).toList(), () -> source);
+        }));
+    }
+
+    @Test
+    void luaKeysStillCheckClosedContainersThatEncloseDamagedPrattExpressions() {
+        var keys = List.of("[§1]", "[1 § + 2]", "[(1 § + 2)]", "foo(1 § + 2)",
+                "a[1 § + 2]", "{\"a\": 1 § + 2}", "[preload § (\"x\")]", "[$a § /b]", "[super § .f()]",
+                "preload(§\"x\")", "super(§1)", "super.f(§1)");
+        assertAll(keys.stream().map(key -> () -> assertLuaKeyLexicalDamage(key,
+                List.of(DiagnosticCodes.LEXICAL_ERROR, DiagnosticCodes.DICTIONARY_INVALID_LUA_KEY))));
+        assertLambdaKeyLexicalDamage("func() -> §void:", true);
+    }
+
+    private static void assertLambdaKeyLexicalDamage(String signature, boolean enclosed) {
+        var key = enclosed ? "[" + signature + " pass]" : "(" + signature + " pass)";
+        var source = "var d = { " + key + " = 3 }\n";
+        var result = recoverableParse(source);
+        var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+        var entry = assertInstanceOf(DictionaryExpression.class, owner.value()).entries().getFirst();
+        var lambda = assertInstanceOf(LambdaExpression.class, enclosed
+                ? assertInstanceOf(ArrayExpression.class, entry.key()).elements().getFirst()
+                : entry.key());
+        assertInstanceOf(PassStatement.class, lambda.body().statements().getFirst());
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, entry.value()).sourceText(), () -> source);
+        assertEquals(enclosed
+                        ? List.of(DiagnosticCodes.LEXICAL_ERROR, DiagnosticCodes.DICTIONARY_INVALID_LUA_KEY)
+                        : List.of(DiagnosticCodes.LEXICAL_ERROR),
+                result.diagnostics().stream().map(AstDiagnostic::code).toList(), () -> source);
+        var bad = source.indexOf('§');
+        var facet = switch (signature) {
+            case "func § f():" -> "variable.initializer";
+            case "func() -> §void:" -> "function.return_type";
+            default -> "function.signature";
+        };
+        assertDamage(result, DiagnosticCodes.LEXICAL_ERROR,
+                "variable.initializer".equals(facet) ? owner : lambda, facet, utf8Range(source, bad, bad + 1));
+        if ("function.return_type".equals(facet)) {
+            var typeStart = source.indexOf("void");
+            assertEquals(new TypeRef("void", utf8Range(source, typeStart, typeStart + "void".length())),
+                    lambda.returnType());
+        }
+    }
+
+    private static void assertLuaKeyLexicalDamage(String key, List<String> expectedCodes) {
+        var source = "var d = { " + key + " = 3 }\n";
+        var result = recoverableParse(source);
+        var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+        var entries = assertInstanceOf(DictionaryExpression.class, owner.value()).entries();
+        assertEquals(1, entries.size(), () -> source);
+        assertEquals("3", assertInstanceOf(LiteralExpression.class, entries.getFirst().value()).sourceText(),
+                () -> source);
+        assertEquals(expectedCodes, result.diagnostics().stream().map(AstDiagnostic::code).toList(), () -> source);
+        var bad = source.indexOf('§');
+        assertDamage(result, DiagnosticCodes.LEXICAL_ERROR, owner, "variable.initializer",
+                utf8Range(source, bad, bad + 1));
+    }
+
+    @Test
+    void mixedStyleDictionaryKeyDoesNotAddAnOuterLuaShapeDiagnostic() {
+        for (var inner : List.of("{a = 1, b: 2}", "{a: 1, b = 2}")) {
+            var source = "var d = { " + inner + " = 3 }\n";
+            var result = recoverableParse(source);
+            var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+            var outer = assertInstanceOf(DictionaryExpression.class, owner.value()).entries().getFirst();
+            var entries = assertInstanceOf(DictionaryExpression.class, outer.key()).entries();
+            assertEquals(List.of("1", "2"), entries.stream()
+                    .map(entry -> assertInstanceOf(LiteralExpression.class, entry.value()).sourceText())
+                    .toList());
+            assertEquals("3", assertInstanceOf(LiteralExpression.class, outer.value()).sourceText());
+            assertEquals(List.of(DiagnosticCodes.DICTIONARY_MIXED_STYLE),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList(), () -> source);
+            var separator = source.indexOf("b") + (inner.contains("b:") ? 1 : 2);
+            assertDamage(result, DiagnosticCodes.DICTIONARY_MIXED_STYLE, owner, "variable.initializer",
+                    utf8Range(source, separator, separator + 1));
+            assertStrictSyntaxError(source);
+        }
+        var colonWitnessed = recoverableParse("var d = { {:} = 3 }\n");
+        assertEquals(List.of(DiagnosticCodes.SLOT_DICTIONARY_KEY, DiagnosticCodes.SLOT_DICTIONARY_VALUE,
+                        DiagnosticCodes.DICTIONARY_INVALID_LUA_KEY),
+                errorsOf(colonWitnessed).stream().map(AstDiagnostic::code).toList());
+    }
+
+    @Test
+    void forTypeSyncLeavesEnclosingCallCommaAndCloser() {
+        for (var eol : List.of("\n", "\r\n")) {
+            for (var tail : List.of(", 2)", ")")) {
+                var source = "var note = \"😀\"" + eol
+                        + "func f(): g(func(): for i: Foo. ???" + tail + eol + "var after = 1" + eol;
+                var result = recoverableParse(source);
+                assertEquals(List.of("note", "f", "after"), topLevelMemberNames(result));
+                var fn = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().get(1));
+                var call = assertInstanceOf(CallExpression.class,
+                        assertInstanceOf(ExpressionStatement.class, fn.body().statements().getFirst()).expression());
+                var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+                var owner = assertInstanceOf(ForStatement.class, lambda.body().statements().getFirst());
+                var dot = source.indexOf("Foo.") + 3;
+                assertDamage(result, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, owner, "for.iterator",
+                        utf8Range(source, dot, dot + 1));
+                findErrorByCode(result, DiagnosticCodes.FOR_MISSING_IN);
+                assertFalse(errorsOf(result).stream().anyMatch(diag ->
+                        DiagnosticCodes.MISSING_CLOSER_CALL.equals(diag.code())
+                                || DiagnosticCodes.MISMATCHED_CLOSER_CALL.equals(diag.code())));
+                assertEquals(utf8Range(source, source.indexOf("g(func"), source.lastIndexOf(tail) + tail.length()),
+                        call.range());
+                if (tail.startsWith(",")) {
+                    assertEquals(2, call.arguments().size());
+                    assertEquals("2", assertInstanceOf(LiteralExpression.class, call.arguments().getLast()).sourceText());
+                } else {
+                    assertEquals(1, call.arguments().size());
+                }
+            }
+        }
+    }
+
+    @Test
+    void forTypeRecoveryScansEachBadHeaderTokenOnceAndResetsOnReuse() {
+        var parser = new GdScriptParser();
+        var facade = new GdScriptParserFacade();
+        for (var count : List.of(256, 512, 1024, 2048)) {
+            var source = "func f():\r\n\tfor i: Array[int " + "?".repeat(count) + " in xs:\r\n\t\tpass\r\n";
+            var result = parser.parse(source);
+            var owner = assertInstanceOf(ForStatement.class, onlyFunction(result).body().statements().getFirst());
+            assertEquals("xs", assertInstanceOf(IdentifierExpression.class, owner.iterable()).name());
+            assertInstanceOf(PassStatement.class, owner.body().statements().getFirst());
+            assertEquals(List.of(DiagnosticCodes.MISSING_CLOSER_TYPE_BRACKET),
+                    errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertEquals(count, parser.forIteratorTypeSyncSteps());
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            IO.println("iterator recovery: bytes=%d tokens=%d discarded=%d oracle scans=%d".formatted(
+                    utf8Length(source), facade.tokenize(source).size(), parser.forIteratorTypeSyncSteps(),
+                    parser.bracketOracleScanCount()));
+        }
+        var healthy = parser.parse("func f():\n\tfor i: Array[int] in xs:\n\t\tpass\n");
+        assertEquals(List.of(), healthy.diagnostics());
+        assertEquals(0, parser.forIteratorTypeSyncSteps());
+    }
+
+    /// Computes the expected half-open byte and point range from literal UTF-16 source indices.
+    static Range utf8Range(String source, int start, int end) {
+        return new Range(utf8Length(source.substring(0, start)), utf8Length(source.substring(0, end)),
+                utf8Point(source, start), utf8Point(source, end));
+    }
+
+    private static Point utf8Point(String source, int offset) {
+        var prefix = source.substring(0, offset);
+        return new Point((int) prefix.chars().filter(ch -> ch == '\n').count(),
+                utf8Length(prefix.substring(prefix.lastIndexOf('\n') + 1)));
+    }
+
+    private static int utf8Length(String source) {
+        return source.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    private static void assertMissingAt(String source, Node node, String slot, int offset) {
+        var marker = assertInstanceOf(ErrorExpression.class, node);
+        assertEquals(CstIssueKind.MISSING, marker.kind());
+        assertEquals(slot, marker.nodeType());
+        assertEquals("", marker.sourceText());
+        assertEquals(utf8Range(source, offset, offset), marker.range());
+    }
+
+    private static void assertDamage(AstMappingResult result, String code, Node owner, String facet, Range range) {
+        var diagnostic = findErrorByCode(result, code);
+        assertEquals(range, diagnostic.range(), () -> code + ": " + diagnostic.message());
+        var link = requireNotNull(diagnostic.recovery());
+        assertSame(owner, link.owner());
+        assertEquals(facet, link.facet());
+    }
+
+    private static void assertStrictSyntaxError(String source) {
+        var error = assertThrows(IllegalStateException.class, () -> new GdScriptParserFacade().parseStrict(source));
+        assertTrue(error.getMessage().startsWith("Parsing failed at "), error::getMessage);
+    }
+
+    @Test
     void damagedShapesSurviveSerdeRoundTrip() {
         var serializer = new AstSexprSerializer();
         var deserializer = new AstSexprDeserializer();
@@ -2180,7 +3941,12 @@ class GdScriptParserErrorRecoveryTest {
                 // Damaged ternary branches.
                 "var x = 1 if + else 2\n",
                 // Dictionary-pattern ERROR fallback fragment.
-                "func f():\n\tmatch x:\n\t\t{1+}: pass\n"
+                "func f():\n\tmatch x:\n\t\t{1+}: pass\n",
+                // Closed container markers and type fragments with non-ASCII text before them.
+                "var d = {\"😀\": 1, :, \"b\": 2}\r\n"
+                        + "func f(p: Foo.) -> Bar.:\r\n\tx as Node.\r\n\tx is Array[int",
+                "var note = \"😀\"\r\nvar a = x as\r\nvar b = x is not\r\nvar c = x as Array[]\r\n"
+                        + "var d = x is void\r\n"
         );
         for (var source : corpus) {
             var ast = parse(source).ast();
@@ -2366,19 +4132,76 @@ class GdScriptParserErrorRecoveryTest {
 
         // Ancestor closer takes precedence over a single-layer mismatch: `foo([1)` closes `foo(...)`
         // and reports missing `]` on `[1`.
-        var ancestorOwned = recoverableParse("var x = foo([1)\n");
+        var ancestorSource = "var x = foo([1)\n";
+        var ancestorOwned = recoverableParse(ancestorSource);
         findErrorByCode(ancestorOwned, DiagnosticCodes.MISSING_CLOSER_ARRAY);
         assertTrue(errorsOf(ancestorOwned).stream()
                 .noneMatch(d -> DiagnosticCodes.MISMATCHED_CLOSER_ARRAY.equals(d.code())));
-        var call = assertInstanceOf(CallExpression.class,
-                assertInstanceOf(VariableDeclaration.class, ancestorOwned.ast().statements().getFirst()).value());
+        var ancestorOwner = assertInstanceOf(VariableDeclaration.class, ancestorOwned.ast().statements().getFirst());
+        var call = assertInstanceOf(CallExpression.class, ancestorOwner.value());
         assertEquals(1, call.arguments().size());
-        assertInstanceOf(ArrayExpression.class, call.arguments().getFirst());
+        var array = assertInstanceOf(ArrayExpression.class, call.arguments().getFirst());
+        var opener = ancestorSource.indexOf('[');
+        var closer = ancestorSource.indexOf(')');
+        assertEquals(utf8Range(ancestorSource, opener, closer), array.range());
+        assertEquals(closer + 1, call.range().endByte());
+        assertEquals(1, ancestorOwned.diagnostics().size());
+        assertDamage(ancestorOwned, DiagnosticCodes.MISSING_CLOSER_ARRAY, ancestorOwner, "variable.initializer",
+                utf8Range(ancestorSource, closer, closer));
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(ancestorSource, ancestorOwned, () -> ancestorSource);
 
         // Unowned closer triggers single-layer replacement: `[1)` reports `MISMATCHED_CLOSER_ARRAY`.
-        var singleReplacement = recoverableParse("var x = [1)\n");
+        var replacementSource = "var x = [1)\n";
+        var singleReplacement = recoverableParse(replacementSource);
         var mismatchDiag = findErrorByCode(singleReplacement, DiagnosticCodes.MISMATCHED_CLOSER_ARRAY);
         assertEquals("Expected \"]\" to close array elements, found \")\" instead.", mismatchDiag.message());
+        var replacementOwner = assertInstanceOf(VariableDeclaration.class, singleReplacement.ast().statements().getFirst());
+        var replacedArray = assertInstanceOf(ArrayExpression.class, replacementOwner.value());
+        var replacement = replacementSource.indexOf(')');
+        assertEquals(utf8Range(replacementSource, replacementSource.indexOf('['), replacement + 1), replacedArray.range());
+        assertEquals(1, singleReplacement.diagnostics().size());
+        assertDamage(singleReplacement, DiagnosticCodes.MISMATCHED_CLOSER_ARRAY, replacementOwner,
+                "variable.initializer", utf8Range(replacementSource, replacement, replacement + 1));
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(replacementSource, singleReplacement,
+                () -> replacementSource);
+    }
+
+    @Test
+    void unclosedContainersWithTrailingCommaYieldAtARealStatementBoundary() {
+        for (var initializer : List.of("[1,", "{\"k\": 1,", "target(1,")) {
+            var source = "func f():\n\tvar x = " + initializer + "\n\tpass\n\tprint(2)\nvar after = 1";
+            var result = recoverableParse(source);
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var body = function.body().statements();
+            assertEquals(3, body.size(), source);
+            var variable = assertInstanceOf(VariableDeclaration.class, body.getFirst());
+            assertInstanceOf(PassStatement.class, body.get(1));
+            var nextCall = assertInstanceOf(CallExpression.class,
+                    assertInstanceOf(ExpressionStatement.class, body.getLast()).expression());
+            assertEquals("print", assertInstanceOf(IdentifierExpression.class, nextCall.callee()).name());
+            assertPatternLiteral(source, nextCall.arguments().getFirst(), "2", source.indexOf('2'));
+            var atComma = source.indexOf(',') + 1;
+            var code = switch (initializer.charAt(0)) {
+                case '[' -> DiagnosticCodes.MISSING_CLOSER_ARRAY;
+                case '{' -> DiagnosticCodes.MISSING_CLOSER_DICTIONARY;
+                default -> DiagnosticCodes.MISSING_CLOSER_CALL;
+            };
+            assertEquals(1, result.diagnostics().size());
+            assertDamage(result, code, variable, "variable.initializer", utf8Range(source, atComma, atComma));
+            assertEquals(List.of("f", "after"), topLevelMemberNames(result));
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+
+        var matched = "func f():\n\tvar x = target(1,\n\t\tprint(2))\nvar after = 1";
+        var result = parse(matched);
+        assertTrue(result.diagnostics().isEmpty());
+        var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        assertEquals(1, function.body().statements().size());
+        var variable = assertInstanceOf(VariableDeclaration.class, function.body().statements().getFirst());
+        var call = assertInstanceOf(CallExpression.class, variable.value());
+        assertEquals(2, call.arguments().size());
+        assertInstanceOf(CallExpression.class, call.arguments().getLast());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(result));
     }
 
     @Test
@@ -2745,6 +4568,69 @@ class GdScriptParserErrorRecoveryTest {
         var returnType = assertInstanceOf(TypeRef.class, lambda.returnType());
         assertEquals("Dictionary[String, int]", returnType.sourceText());
         assertInstanceOf(AttributeExpression.class, validCall.arguments().get(1));
+    }
+
+    @Test
+    void unpairedDictionaryTypePreservesOuterArgumentsAcrossLines() {
+        for (var eol : List.of("\n", "\r\n")) {
+            var source = ("var note = \"😀\"\nvar x = g(func() -> Dictionary[String, Array[\n,\n\tnode.\n\tpa\n)\n")
+                    .replace("\n", eol);
+            var result = recoverableParse(source);
+            var declaration = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast());
+            var call = assertInstanceOf(CallExpression.class, declaration.value());
+            var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals(List.of(), lambda.body().statements());
+            assertEquals("Dictionary[String", requireNotNull(lambda.returnType()).sourceText());
+            var member = assertInstanceOf(AttributeExpression.class, call.arguments().getLast());
+            assertEquals("node", assertInstanceOf(IdentifierExpression.class, member.base()).name());
+            assertEquals("pa", assertInstanceOf(AttributePropertyStep.class, member.steps().getFirst()).name());
+            assertEquals("node." + eol + "\tpa", utf8Slice(source, member.range()));
+            var comma = source.indexOf(',');
+            assertDamage(result, DiagnosticCodes.MISSING_CLOSER_TYPE_BRACKET, lambda, "function.return_type",
+                    utf8Range(source, comma, comma));
+            assertStrictSyntaxError(source);
+        }
+    }
+
+    @Test
+    void unpairedDictionaryTypeYieldsBothKindsOfSameLineOuterArgument() {
+        for (var argument : List.of("Array[i]", "other")) {
+            var source = "var x = g(func() -> Dictionary[String, " + argument + ")";
+            var result = recoverableParse(source);
+            var declaration = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+            var call = assertInstanceOf(CallExpression.class, declaration.value());
+            assertEquals(2, call.arguments().size(), () -> source);
+            var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+            assertEquals(List.of(), lambda.body().statements());
+            assertEquals("Dictionary[String", requireNotNull(lambda.returnType()).sourceText());
+            var second = call.arguments().getLast();
+            assertEquals(argument, utf8Slice(source, second.range()));
+            if (argument.equals("Array[i]")) {
+                var subscript = assertInstanceOf(SubscriptExpression.class, second);
+                assertEquals("Array", assertInstanceOf(IdentifierExpression.class, subscript.base()).name());
+                assertEquals("i", assertInstanceOf(IdentifierExpression.class, subscript.arguments().getFirst()).name());
+            } else {
+                assertEquals("other", assertInstanceOf(IdentifierExpression.class, second).name());
+            }
+            assertStrictSyntaxError(source);
+        }
+    }
+
+    @Test
+    void pairedDictionaryTypeKeepsItsOwnCommaAndRejectsNestedCollections() {
+        var facade = new GdScriptParserFacade();
+        for (var source : List.of("var x: Dictionary[String, int]\n",
+                "var x = g(func() -> Dictionary[String, int]: pass, 2)\n")) {
+            var result = facade.parse(source);
+            assertEquals(List.of(), result.diagnostics(), () -> source);
+            assertEquals(result.ast(), facade.parseStrict(source));
+        }
+        var nested = "var x = g(func() -> Dictionary[String, Array[int]]: pass, 2)\n";
+        var result = recoverableParse(nested);
+        assertEquals(List.of(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN),
+                errorsOf(result).stream().map(AstDiagnostic::code).toList());
+        assertTrue(errorsOf(result).getFirst().message().contains("Nested typed collections"));
+        assertStrictSyntaxError(nested);
     }
 
     @Test
@@ -3158,48 +5044,71 @@ class GdScriptParserErrorRecoveryTest {
     @Test
     void phase4MatchSectionMissingColonWithBodyAndSibling() {
         // Missing `:` followed by indented body retains both the current section's body and later `2:`.
-        var withBody = recoverableParse("""
+        var bodySource = """
                 func f():
                 \tmatch x:
                 \t\t1
                 \t\t\tpass
                 \t\t2:
                 \t\t\tpass
-                """);
+                var after = 1
+                """;
+        var withBody = recoverableParse(bodySource);
         assertEquals(1, errorsOf(withBody).size(), () -> errorsOf(withBody).toString());
         var colonErr = findErrorByCode(withBody, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON);
         var match = assertInstanceOf(MatchStatement.class,
-                onlyFunction(withBody).body().statements().getFirst());
+                assertInstanceOf(FunctionDeclaration.class, withBody.ast().statements().getFirst())
+                        .body().statements().getFirst());
         assertEquals(2, match.sections().size());
         var firstSection = assertInstanceOf(MatchSection.class, match.sections().getFirst());
         assertSame(firstSection, colonErr.recovery().owner());
         assertEquals("match.section", colonErr.recovery().facet());
         assertInstanceOf(PassStatement.class, firstSection.body().statements().getFirst());
         assertInstanceOf(PassStatement.class, match.sections().get(1).body().statements().getFirst());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class,
+                match.sections().getLast().patterns().getFirst()).sourceText());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(withBody));
+        assertMatchColon(bodySource, withBody, firstSection, bodySource.indexOf("1\n"), 1);
 
         // Missing `:` without an indented body does not steal `2:` or ancestor DEDENT.
-        var withoutBody = recoverableParse("""
+        var noBodySource = """
                 func f():
                 \tmatch x:
                 \t\t1
                 \t\t2:
                 \t\t\tpass
-                \tvar after = 1
-                """);
+                \tvar local = 1
+                var after = 2
+                """;
+        var withoutBody = recoverableParse(noBodySource);
         findErrorByCode(withoutBody, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON);
-        var fnBody = onlyFunction(withoutBody).body().statements();
+        var fnBody = assertInstanceOf(FunctionDeclaration.class,
+                withoutBody.ast().statements().getFirst()).body().statements();
         assertEquals(2, fnBody.size());
         var match2 = assertInstanceOf(MatchStatement.class, fnBody.getFirst());
         assertEquals(2, match2.sections().size());
         assertTrue(match2.sections().getFirst().body().statements().isEmpty());
         assertEquals(1, match2.sections().get(1).body().statements().size());
-        assertEquals("after", assertInstanceOf(VariableDeclaration.class, fnBody.get(1)).name());
+        assertEquals("local", assertInstanceOf(VariableDeclaration.class, fnBody.get(1)).name());
+        assertEquals("2", assertInstanceOf(LiteralExpression.class,
+                match2.sections().getLast().patterns().getFirst()).sourceText());
+        assertEquals(List.of("f", "after"), topLevelMemberNames(withoutBody));
+        assertMatchColon(noBodySource, withoutBody, match2.sections().getFirst(), noBodySource.indexOf("1\n"), 1);
+    }
+
+    private static void assertMatchColon(String source, AstMappingResult result, MatchSection owner,
+                                         int start, int width) {
+        assertEquals(1, result.diagnostics().size());
+        assertDamage(result, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON, owner, "match.section",
+                utf8Range(source, start, start + width));
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
     }
 
     @Test
     void phase4MissingHeaderNamesAndControlNegative() {
         // `for in arr:` retains ForStatement, iterable, and body with FOR_MISSING_ITERATOR.
-        var forRes = recoverableParse("func f():\n\tfor in arr:\n\t\tpass\n");
+        var forSource = "func f():\n\tfor in arr:\n\t\tpass\n";
+        var forRes = recoverableParse(forSource);
         var forErr = findErrorByCode(forRes, DiagnosticCodes.FOR_MISSING_ITERATOR);
         var forStmt = assertInstanceOf(ForStatement.class,
                 onlyFunction(forRes).body().statements().getFirst());
@@ -3208,9 +5117,12 @@ class GdScriptParserErrorRecoveryTest {
         assertEquals("", forStmt.iterator());
         assertEquals("arr", assertInstanceOf(IdentifierExpression.class, forStmt.iterable()).name());
         assertInstanceOf(PassStatement.class, forStmt.body().statements().getFirst());
+        assertEquals(utf8Range(forSource, 11, 14), forErr.range());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(forSource, forRes, () -> forSource);
 
         // `const A` retains VariableDeclaration(CONST, "A", Missing("constant.value")).
-        var constRes = recoverableParse("const A\nvar ok = 1\n");
+        var constSource = "const A\nvar ok = 1\n";
+        var constRes = recoverableParse(constSource);
         var constErr = findErrorByCode(constRes, DiagnosticCodes.SLOT_CONSTANT_VALUE);
         var constDecl = assertInstanceOf(VariableDeclaration.class, constRes.ast().statements().getFirst());
         assertEquals(DeclarationKind.CONST, constDecl.kind());
@@ -3220,10 +5132,14 @@ class GdScriptParserErrorRecoveryTest {
         var constMarker = assertInstanceOf(ErrorExpression.class, constDecl.value());
         assertEquals(CstIssueKind.MISSING, constMarker.kind());
         assertEquals("constant.value", constMarker.nodeType());
+        assertMissingAt(constSource, constMarker, "constant.value", 7);
+        assertEquals(utf8Range(constSource, 6, 7), constErr.range());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(constSource, constRes, () -> constSource);
         assertEquals("ok", assertInstanceOf(VariableDeclaration.class, constRes.ast().statements().get(1)).name());
 
         // `var = 1` retains VariableDeclaration(VAR, "", 1) with DECLARATION_MISSING_NAME.
-        var varRes = recoverableParse("var = 1\n");
+        var varSource = "var = 1\n";
+        var varRes = recoverableParse(varSource);
         var varErr = findErrorByCode(varRes, DiagnosticCodes.DECLARATION_MISSING_NAME);
         var varDecl = assertInstanceOf(VariableDeclaration.class, varRes.ast().statements().getFirst());
         assertEquals(DeclarationKind.VAR, varDecl.kind());
@@ -3231,6 +5147,8 @@ class GdScriptParserErrorRecoveryTest {
         assertEquals("1", assertInstanceOf(LiteralExpression.class, varDecl.value()).sourceText());
         assertSame(varDecl, varErr.recovery().owner());
         assertEquals("declaration.name", varErr.recovery().facet());
+        assertEquals(utf8Range(varSource, 0, 3), varErr.range());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(varSource, varRes, () -> varSource);
 
         // Class-body `func (a: int):\n\tpass\n` retains FunctionDeclaration with DECLARATION_MISSING_NAME.
         var fnRes = recoverableParse("func (a: int):\n\tpass\n");
@@ -3241,6 +5159,18 @@ class GdScriptParserErrorRecoveryTest {
         assertInstanceOf(PassStatement.class, fnDecl.body().statements().getFirst());
         assertSame(fnDecl, fnErr.recovery().owner());
         assertEquals("function.name", fnErr.recovery().facet());
+
+        var emptyFnSource = "func (): pass\nvar after = 1";
+        var emptyFnResult = recoverableParse(emptyFnSource);
+        var emptyFn = assertInstanceOf(FunctionDeclaration.class, emptyFnResult.ast().statements().getFirst());
+        assertEquals("", emptyFn.name());
+        assertTrue(emptyFn.parameters().isEmpty());
+        assertInstanceOf(PassStatement.class, emptyFn.body().statements().getFirst());
+        assertEquals(List.of("", "after"), topLevelMemberNames(emptyFnResult));
+        assertEquals(1, emptyFnResult.diagnostics().size());
+        assertDamage(emptyFnResult, DiagnosticCodes.DECLARATION_MISSING_NAME, emptyFn, "function.name",
+                utf8Range(emptyFnSource, 0, 4));
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(emptyFnSource, emptyFnResult, () -> emptyFnSource);
 
         // Negative: legal anonymous enum has 0 diagnostics; suite-level bare `func` stays distinct.
         assertEquals(List.of(), errorsOf(parse("enum { A, B }\n")));
@@ -3259,18 +5189,98 @@ class GdScriptParserErrorRecoveryTest {
         assertInstanceOf(PassStatement.class, fnBody.get(1));
 
         // 120 trailing annotations at scope end never falsely consume circuit-breaker budget.
-        var danglingMany = parse("func f():\n" + "\t@warning_ignore(\"a\")\n".repeat(120));
+        var annotationSource = "func f():\n" + "\t@warning_ignore(\"a\")\n".repeat(120);
+        var danglingMany = parse(annotationSource);
         assertTrue(errorsOf(danglingMany).stream()
                 .noneMatch(d -> DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS.equals(d.code())),
                 () -> errorsOf(danglingMany).toString());
         assertEquals(120, onlyFunction(danglingMany).body().statements().size());
+        var annotations = onlyFunction(danglingMany).body().statements();
+        var diagnostics = danglingMany.diagnostics();
+        var annotation = "@warning_ignore(\"a\")";
+        assertEquals(120, diagnostics.size());
+        for (var i = 0; i < annotations.size(); i++) {
+            var node = assertInstanceOf(AnnotationStatement.class, annotations.get(i));
+            var start = annotationSource.indexOf('@') + i * (annotation.length() + 2);
+            var expectedRange = utf8Range(annotationSource, start, start + annotation.length());
+            var diagnostic = diagnostics.get(i);
+            assertEquals(DiagnosticCodes.ANNOTATION_DANGLING, diagnostic.code());
+            assertEquals(expectedRange, diagnostic.range());
+            assertEquals(expectedRange, node.range());
+            assertSame(node, diagnostic.recovery().owner());
+            assertEquals("annotation.target", diagnostic.recovery().facet());
+        }
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(annotationSource, danglingMany,
+                () -> annotationSource);
+    }
+
+    @Test
+    void missingCommasUseZeroWidthAnchorsAndKeepSubsequentItems() {
+        for (var prefix : List.of("", "var note = \"😀\"\r\n")) {
+            for (var snippet : List.of("var x = foo(1 2)", "var x = [1 2]", "func f(a b): pass", "signal f(a b)")) {
+                var source = prefix + snippet;
+                var result = recoverableParse(source);
+                assertEquals(1, result.diagnostics().size());
+                var owner = result.ast().statements().getLast();
+                var anchor = prefix.length() + snippet.lastIndexOf(snippet.startsWith("var") ? " 2" : " b");
+                String facet;
+                if (owner instanceof VariableDeclaration variable) {
+                    facet = "variable.initializer";
+                    var items = variable.value() instanceof CallExpression call ? call.arguments()
+                            : assertInstanceOf(ArrayExpression.class, variable.value()).elements();
+                    assertEquals(List.of("1", "2"), items.stream()
+                            .map(item -> assertInstanceOf(LiteralExpression.class, item).sourceText()).toList());
+                } else if (owner instanceof FunctionDeclaration function) {
+                    facet = "function.signature";
+                    assertEquals(List.of("a", "b"), function.parameters().stream().map(Parameter::name).toList());
+                    assertInstanceOf(PassStatement.class, function.body().statements().getFirst());
+                } else {
+                    facet = "signal.parameter";
+                    var signal = assertInstanceOf(SignalStatement.class, owner);
+                    assertEquals(List.of("a", "b"), signal.parameters().stream().map(Parameter::name).toList());
+                }
+                assertDamage(result, DiagnosticCodes.MISSING_SEPARATOR_COMMA, owner, facet,
+                        utf8Range(source, anchor, anchor));
+                GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+            }
+        }
+    }
+
+    @Test
+    void mixedDictionarySeparatorsPreserveRealCloserAndFollowingEntries() {
+        for (var dictionaryText : List.of("{\"a\": 1, b = 2, \"c\": 3}", "{a = 1, \"b\": 2, c = 3}",
+                "{\"a\": 1, b = , \"c\": 3}", "{a = 1, \"b\": , c = 3}")) {
+            var source = "var d = " + dictionaryText + "\r\nvar after = 1";
+            var result = recoverableParse(source);
+            var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+            var dictionary = assertInstanceOf(DictionaryExpression.class, owner.value());
+            var separator = source.indexOf(dictionaryText.startsWith("{\"") ? "b =" : "\"b\":")
+                    + (dictionaryText.startsWith("{\"") ? 2 : 3);
+            assertDamage(result, DiagnosticCodes.DICTIONARY_MIXED_STYLE, owner, "variable.initializer",
+                    utf8Range(source, separator, separator + 1));
+            assertEquals(utf8Range(source, source.indexOf('{'), source.indexOf('}') + 1), dictionary.range());
+            assertEquals(3, dictionary.entries().size());
+            var middle = dictionary.entries().get(1);
+            var hasMissingValue = source.charAt(separator + 2) == ',';
+            assertEquals(hasMissingValue ? 2 : 1, result.diagnostics().size());
+            if (hasMissingValue) {
+                assertMissingAt(source, middle.value(), "dictionary.value", separator + 1);
+                assertDamage(result, DiagnosticCodes.SLOT_DICTIONARY_VALUE, owner, "variable.initializer",
+                        utf8Range(source, separator, separator + 1));
+            } else {
+                assertPatternLiteral(source, middle.value(), "2", separator + 2);
+            }
+            assertPatternLiteral(source, dictionary.entries().getLast().value(), "3", source.indexOf('3'));
+            assertEquals(List.of("d", "after"), topLevelMemberNames(result));
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
     }
 
     @Test
     void phase4LinearScanBoundsAndParserReuseBalanceInvariant() {
         // Large missing-comma and missing-separator lists stay single-pass without rescanning.
         var parser = new GdScriptParser();
-        for (var n : List.of(128, 512)) {
+        for (var n : List.of(256, 512, 1024, 2048)) {
             var missingCommaCall = "var x = foo(" + "1 ".repeat(n) + ")\n";
             var callRes = parser.parse(missingCommaCall);
             assertTrue(parser.bracketOracleScanCount() <= 1,
@@ -3278,6 +5288,8 @@ class GdScriptParserErrorRecoveryTest {
             var call = assertInstanceOf(CallExpression.class,
                     assertInstanceOf(VariableDeclaration.class, callRes.ast().statements().getFirst()).value());
             assertEquals(n, call.arguments().size());
+            assertListScale("missing call commas", parser, n);
+            assertHealthyReuse(parser);
 
             var missingSepDict = "var d = {" + "\"k\"\n".repeat(n) + "}\n";
             var dictRes = parser.parse(missingSepDict);
@@ -3286,6 +5298,8 @@ class GdScriptParserErrorRecoveryTest {
             var dict = assertInstanceOf(DictionaryExpression.class,
                     assertInstanceOf(VariableDeclaration.class, dictRes.ast().statements().getFirst()).value());
             assertEquals(n, dict.entries().size());
+            assertListScale("missing dictionary separators", parser, n);
+            assertHealthyReuse(parser);
         }
 
         // Repeated recovery parses followed by a clean parse leave stacks balanced and reusable.
@@ -3300,6 +5314,15 @@ class GdScriptParserErrorRecoveryTest {
         var clean = parser.parse("var ok = 1\n");
         assertEquals(List.of(), errorsOf(clean));
         assertEquals("ok", assertInstanceOf(VariableDeclaration.class, clean.ast().statements().getFirst()).name());
+    }
+
+    private static void assertListScale(String workload, GdScriptParser parser, int n) {
+        var steps = parser.separatedListSteps() + parser.lineIndentScanSteps() + parser.statementHeadColonScanSteps();
+        // Each item can make one loop entry and one separator decision. No continuation line
+        // has indentation or a statement head, and a closing-delimiter attempt adds one step.
+        var limit = 2L * n + 1;
+        assertTrue(steps >= n && steps <= limit, () -> workload + ": " + steps);
+        assertTrue(parser.bracketOracleScanCount() <= 1);
     }
 
     @Test
@@ -3400,9 +5423,11 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void matchSectionMissingColonAfterLambdaGuardPreservesNextBranch() {
-        var inlineGuard = recoverableParse("func f():\n\tmatch x:\n\t\t1 when func(): pass\n\t\t2: pass\n");
+        var inlineSource = "func f():\n\tmatch x:\n\t\t1 when func(): pass\n\t\t2: pass\nvar after = 1";
+        var inlineGuard = recoverableParse(inlineSource);
         var inlineMatch = assertInstanceOf(MatchStatement.class,
-                onlyFunction(inlineGuard).body().statements().getFirst());
+                assertInstanceOf(FunctionDeclaration.class, inlineGuard.ast().statements().getFirst())
+                        .body().statements().getFirst());
         assertEquals(2, inlineMatch.sections().size(), () -> inlineMatch.sections().toString());
         var inlineFirst = inlineMatch.sections().getFirst();
         assertInstanceOf(LambdaExpression.class, inlineFirst.guard());
@@ -3410,8 +5435,11 @@ class GdScriptParserErrorRecoveryTest {
         assertEquals(new RecoveryLink(inlineFirst, "match.section"),
                 findErrorByCode(inlineGuard, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON).recovery());
         assertInstanceOf(PassStatement.class, inlineMatch.sections().get(1).body().statements().getFirst());
+        assertMatchColon(inlineSource, inlineGuard, inlineFirst, inlineSource.indexOf("pass\n") + 4, 1);
+        assertEquals(List.of("f", "after"), topLevelMemberNames(inlineGuard));
 
-        var multilineGuard = recoverableParse("func f():\n\tmatch x:\n\t\t1 when func():\n\t\t\tpass\n\t\t2: pass\n");
+        var multiSource = "func f():\n\tmatch x:\n\t\t1 when func():\n\t\t\tpass\n\t\t2: pass\n";
+        var multilineGuard = recoverableParse(multiSource);
         var multiMatch = assertInstanceOf(MatchStatement.class,
                 onlyFunction(multilineGuard).body().statements().getFirst());
         assertEquals(2, multiMatch.sections().size(), () -> multiMatch.sections().toString());
@@ -3421,6 +5449,7 @@ class GdScriptParserErrorRecoveryTest {
         assertEquals(new RecoveryLink(multiFirst, "match.section"),
                 findErrorByCode(multilineGuard, DiagnosticCodes.MISSING_SEPARATOR_MATCH_COLON).recovery());
         assertInstanceOf(PassStatement.class, multiMatch.sections().get(1).body().statements().getFirst());
+        assertMatchColon(multiSource, multilineGuard, multiFirst, multiSource.indexOf("\t\t2:"), 2);
     }
 
     @Test
@@ -3444,6 +5473,52 @@ class GdScriptParserErrorRecoveryTest {
                 assertInstanceOf(VariableDeclaration.class, lambdaInCall.ast().statements().getFirst()).value());
         assertInstanceOf(LambdaExpression.class, outerCall.arguments().getFirst());
         assertEquals("2", assertInstanceOf(LiteralExpression.class, outerCall.arguments().getLast()).sourceText());
+    }
+
+    @Test
+    void superAndNamelessMemberRecoveryDoNotReclassifyTailOrOuterComma() {
+        for (var statementText : List.of("super. var y = 1", "f(func(): super., 1)", "self.b.(1)")) {
+            var source = "func f():\r\n\t" + statementText + "\r\n\tpass";
+            var result = recoverableParse(source);
+            var body = onlyFunction(result).body().statements();
+            assertEquals(2, body.size());
+            assertInstanceOf(PassStatement.class, body.getLast());
+            var owner = assertInstanceOf(ExpressionStatement.class, body.getFirst());
+            var expression = owner.expression();
+            if (statementText.startsWith("f(")) {
+                var call = assertInstanceOf(CallExpression.class, expression);
+                assertEquals(2, call.arguments().size());
+                var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+                owner = assertInstanceOf(ExpressionStatement.class, lambda.body().statements().getFirst());
+                expression = owner.expression();
+                assertPatternLiteral(source, call.arguments().getLast(), "1", source.indexOf('1'));
+            }
+            var code = statementText.startsWith("self") ? DiagnosticCodes.ATTRIBUTE_MISSING_NAME
+                    : DiagnosticCodes.SUPER_MISSING_NAME;
+            var dot = source.lastIndexOf('.');
+            assertDamage(result, code, owner, "expression", utf8Range(source, dot, dot + 1));
+            if (statementText.startsWith("self")) {
+                var call = assertInstanceOf(CallExpression.class, expression);
+                var callee = assertInstanceOf(AttributeExpression.class, call.callee());
+                assertEquals(2, callee.steps().size());
+                assertEquals("b", assertInstanceOf(AttributePropertyStep.class, callee.steps().getFirst()).name());
+                var missing = assertInstanceOf(MissingAttributeStep.class, callee.steps().getLast());
+                assertEquals(utf8Range(source, dot + 1, dot + 1), missing.range());
+                assertPatternLiteral(source, call.arguments().getFirst(), "1", source.indexOf('1'));
+            } else {
+                var chain = assertInstanceOf(AttributeExpression.class, expression);
+                assertInstanceOf(MissingAttributeStep.class, chain.steps().getLast());
+                assertEquals(utf8Range(source, source.indexOf("super"), dot + 1), chain.range());
+            }
+            if (statementText.contains("var y")) {
+                assertEquals(2, result.diagnostics().size());
+                assertDamage(result, DiagnosticCodes.STATEMENT_TRAILING, owner, "statement.trailing",
+                        utf8Range(source, source.indexOf("var y"), source.indexOf('1') + 1));
+            } else {
+                assertEquals(1, result.diagnostics().size());
+            }
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
     }
 
     @Test
@@ -3605,14 +5680,24 @@ class GdScriptParserErrorRecoveryTest {
         findErrorByCode(singleLineColonFn, DiagnosticCodes.MISSING_CLOSER_PARAMETER_LIST);
         assertEquals("ok", assertInstanceOf(VariableDeclaration.class, singleLineColonFn.ast().statements().get(1)).name());
 
-        var inlineTypeParser = new GdScriptParser();
-        inlineTypeParser.parse("var x = g(func(" + "a: int, ".repeat(200) + "z)" + " ".repeat(2000));
-        assertEquals(0, inlineTypeParser.signatureContinuationScanSteps());
+        var parser = new GdScriptParser();
+        for (var n : List.of(256, 512, 1024, 2048)) {
+            var inline = "var x = g(func(" + "a: int, ".repeat(n) + "z)" + " ".repeat(n);
+            parser.parse(inline);
+            assertEquals(0, parser.signatureContinuationScanSteps());
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            assertHealthyReuse(parser);
 
-        var multilineColonParser = new GdScriptParser();
-        multilineColonParser.parse("var x = g(func(" + "a:\n\tint, ".repeat(50) + "z:\n\tpass\n)" + " ".repeat(1000));
-        assertTrue(multilineColonParser.signatureContinuationScanSteps() <= 1050,
-                () -> "Expected linear scan budget <= 1050, got: " + multilineColonParser.signatureContinuationScanSteps());
+            var multiline = "var x = g(func(" + "a:\n\tint, ".repeat(n) + "z:\n\tpass\n)" + " ".repeat(n);
+            parser.parse(multiline);
+            var steps = parser.signatureContinuationScanSteps();
+            // Each multiline parameter contributes one disjoint post-colon run; a final scan can
+            // cover the suffix whitespace once. Per record there are 9 source bytes plus 1 padding byte.
+            var limit = 10L * n + 16;
+            assertTrue(steps > 0 && steps <= limit, () -> "signature continuation steps: " + steps);
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            assertHealthyReuse(parser);
+        }
     }
 
     @Test
@@ -3991,14 +6076,21 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void circuitBreakerLocalBracketStackOperationsStayLinear() {
-        var n = 2_000;
-        var source = "func f():\n" + "\tvar\n".repeat(102) + "\t" + "(".repeat(n) + "1" + "]".repeat(n) + "\nvar after = 1\n";
         var parser = new GdScriptParser();
-        var result = parser.parse(source);
-        assertEquals(2, result.ast().statements().size(), () -> result.ast().statements().toString());
-        assertEquals("after", assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1)).name());
-        assertTrue(parser.circuitBreakerStackOps() <= 4 * n,
-                () -> "Expected linear circuit-breaker stack ops <= " + (4 * n) + " but got " + parser.circuitBreakerStackOps());
+        for (var n : List.of(256, 512, 1024, 2048)) {
+            var source = "func f():\n" + "\tvar\n".repeat(102) + "\t" + "(".repeat(n) + "1" + "]".repeat(n)
+                    + "\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(2, result.ast().statements().size(), () -> result.ast().statements().toString());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast()).name());
+            assertTrue(parser.circuitBreakerStackOps() <= 4 * n,
+                    () -> "Expected at most four stack operations per opener/closer pair, got " + parser.circuitBreakerStackOps());
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            var breaker = findErrorByCode(result, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertSame(result.ast().statements().getFirst(), requireNotNull(breaker.recovery()).owner());
+            assertEquals("suite.body", breaker.recovery().facet());
+            assertTrue(parser.parse("func f():\n\tpass\n").diagnostics().isEmpty());
+        }
     }
 
     @Test
@@ -4730,6 +6822,68 @@ class GdScriptParserErrorRecoveryTest {
             var res = new GdScriptParser().parse(validSource);
             assertTrue(errorsOf(res).isEmpty(), () -> validSource + " -> " + errorsOf(res));
         }
+    }
+
+    @Test
+    void requiredTypeSlotsAnchorToTheirColonAndLeaveFollowingDelimiters() {
+        for (var snippet : List.of("func f(x:): pass", "func f(x:, y: int): pass", "signal s(x:)",
+                "var fn = func(x:): return x", "func f():\r\n\tvar x:;\r\n\tpass", "const X:")) {
+            var source = "var note = \"😀\"\r\n" + snippet;
+            var result = recoverableParse(source);
+            var host = result.ast().statements().getLast();
+            var colon = source.lastIndexOf("x:") + 1;
+            switch (host) {
+                case FunctionDeclaration fn when !fn.parameters().isEmpty() -> {
+                    var parameter = fn.parameters().getFirst();
+                    assertNull(parameter.type());
+                    assertTypeSlot(source, result, DiagnosticCodes.MISSING_TYPE_PARAMETER, parameter, "parameter.type",
+                            colon, 1);
+                    if (snippet.contains(",")) {
+                        assertEquals("int", fn.parameters().getLast().type().sourceText());
+                    }
+                    assertInstanceOf(PassStatement.class, fn.body().statements().getFirst());
+                }
+                case SignalStatement signal -> {
+                    var parameter = signal.parameters().getFirst();
+                    assertNull(parameter.type());
+                    assertTypeSlot(source, result, DiagnosticCodes.MISSING_TYPE_SIGNAL_PARAMETER, parameter,
+                            "parameter.type", colon, 1);
+                    assertEquals(utf8Range(source, source.indexOf("signal"), source.length()), signal.range());
+                }
+                case VariableDeclaration variable when variable.value() instanceof LambdaExpression lambda -> {
+                    var parameter = lambda.parameters().getFirst();
+                    assertNull(parameter.type());
+                    assertTypeSlot(source, result, DiagnosticCodes.MISSING_TYPE_LAMBDA_PARAMETER, parameter,
+                            "parameter.type", colon, 1);
+                    var owner = assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+                    assertEquals("x", assertInstanceOf(IdentifierExpression.class, owner.value()).name());
+                }
+                case FunctionDeclaration fn -> {
+                    var variable = assertInstanceOf(VariableDeclaration.class, fn.body().statements().getFirst());
+                    assertNull(variable.type());
+                    assertTypeSlot(source, result, DiagnosticCodes.MISSING_TYPE_VARIABLE, variable, "variable.type",
+                            colon, 1);
+                    assertInstanceOf(PassStatement.class, fn.body().statements().getLast());
+                }
+                case VariableDeclaration constant -> {
+                    var constantColon = source.lastIndexOf(':');
+                    assertNull(constant.type());
+                    assertTypeSlot(source, result, DiagnosticCodes.MISSING_TYPE_CONSTANT, constant, "constant.type",
+                            constantColon, 2);
+                    assertDamage(result, DiagnosticCodes.SLOT_CONSTANT_VALUE, constant, "constant.value",
+                            utf8Range(source, constantColon, constantColon + 1));
+                    assertMissingAt(source, constant.value(), "constant.value", constantColon + 1);
+                }
+                default -> throw new AssertionError("unexpected type host: " + host);
+            }
+        }
+    }
+
+    private static void assertTypeSlot(String source, AstMappingResult result, String code, Node owner,
+                                       String facet, int colon, int diagnosticCount) {
+        assertEquals(diagnosticCount, result.diagnostics().size());
+        assertDamage(result, code, owner, facet, utf8Range(source, colon, colon + 1));
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
     }
 
     @Test

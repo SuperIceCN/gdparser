@@ -9,6 +9,7 @@ enum StructuralRole {
     SUITE,
     MATCH_BODY,
     LAMBDA,
+    PROPERTY_ACCESSORS,
     GROUPING,
     ARRAY,
     DICTIONARY,
@@ -52,9 +53,24 @@ final class StructuralFrame {
     @NotNull SeparatorPhase separatorPhase = SeparatorPhase.NONE;
     boolean allowsTypeComma;
     boolean parsingDictionaryKey;
+    /// A separator was missing or inconsistent, or the list skipped an invalid item tail.
+    boolean damagedListSyntax;
+    /// A real separator closed an item with trailing lexical damage.
+    boolean lexicalDamageBeforeListSeparator;
     boolean pendingSync;
     boolean settled;
+    /// Original rejection line for an unpaired frame left open by depth recovery, or zero.
+    int depthPoisonLine;
     byte unclosedParamListCache = -1;
+
+    boolean ownsComma() {
+        return switch (role) {
+            case ARRAY, DICTIONARY, CALL, PARAMETER_LIST, ANNOTATION, ASSERT, PRELOAD,
+                 MATCH_ARRAY_PATTERN, MATCH_DICTIONARY_PATTERN, ENUM, PROPERTY_ACCESSORS -> true;
+            case TYPE_BRACKET -> allowsTypeComma && separatorPhase == SeparatorPhase.EXPECT_SEPARATOR_OR_CLOSER;
+            case CLASS_BODY, SUITE, MATCH_BODY, LAMBDA, GROUPING, SUBSCRIPT -> false;
+        };
+    }
 
     private StructuralFrame(
             @NotNull StructuralRole role,

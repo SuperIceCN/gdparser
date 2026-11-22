@@ -3,6 +3,7 @@ package dev.superice.gdparser.frontend.gdscript;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.AstMappingResult;
+import dev.superice.gdparser.frontend.ast.DictionaryPatternFixture;
 import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
 import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.Range;
@@ -93,6 +94,13 @@ class GdScriptParserFacadeTest {
         assertEquals(List.of(), facade.parse(source).diagnostics());
         var ast = facade.parseStrict(source);
         assertEquals(1, ast.statements().size());
+        var allKeys = DictionaryPatternFixture.parse();
+        var strict = facade.parseStrict(DictionaryPatternFixture.SOURCE);
+        assertEquals(allKeys, strict);
+        var patterns = DictionaryPatternFixture.patternEntries(strict);
+        DictionaryPatternFixture.assertKeys(patterns);
+        patterns.forEach(entry -> assertNull(entry.value()));
+        DictionaryPatternFixture.literalEntries(strict).forEach(entry -> assertNotNull(entry.value()));
     }
 
     @Test

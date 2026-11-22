@@ -3,7 +3,9 @@ package dev.superice.gdparser.frontend.gdscript;
 import dev.superice.gdparser.frontend.ast.AnnotationStatement;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
+import dev.superice.gdparser.frontend.ast.AstMappingResult;
 import dev.superice.gdparser.frontend.ast.Block;
+import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.CommentStatement;
 import dev.superice.gdparser.frontend.ast.ElifClause;
 import dev.superice.gdparser.frontend.ast.ErrorExpression;
@@ -18,6 +20,7 @@ import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.Range;
 import dev.superice.gdparser.frontend.ast.RecoveryLink;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
+import dev.superice.gdparser.frontend.ast.SignalStatement;
 import dev.superice.gdparser.frontend.ast.SourceFile;
 import dev.superice.gdparser.frontend.ast.Statement;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
@@ -36,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -148,6 +152,45 @@ class DiagnosticRecoveryFoundationTest {
                 DiagnosticCodes.MISSING_CLOSER_GROUPING, ReturnStatement.class, "variable.initializer"));
         assertFalse(DiagnosticCodes.isValidPairing(
                 "parse.unregistered", VariableDeclaration.class, "variable.initializer"));
+    }
+
+    @Test
+    void boundaryCodesKeepClosedPairingsAndStandaloneEligibilitySeparate() {
+        assertTrue(DiagnosticCodes.allowsNullRecovery(DiagnosticCodes.UNEXPECTED_CLOSER));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.UNEXPECTED_CLOSER, PassStatement.class, "statement.trailing"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.UNEXPECTED_CLOSER, FunctionDeclaration.class, "suite.body"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.UNEXPECTED_CLOSER, ClassDeclaration.class, "class.body"));
+        assertFalse(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.UNEXPECTED_CLOSER, SourceFile.class, "class.body"));
+
+        assertTrue(DiagnosticCodes.allowsNullRecovery(DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, FunctionDeclaration.class, "suite.body"));
+        assertFalse(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, ClassDeclaration.class, "class.body"));
+        assertFalse(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, SourceFile.class, "suite.body"));
+
+        assertFalse(DiagnosticCodes.allowsNullRecovery(DiagnosticCodes.MISSING_CLOSER_GROUPING));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.MISSING_CLOSER_GROUPING, FunctionDeclaration.class, "function.signature"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.MISSING_CLOSER_GROUPING, SignalStatement.class, "signal.parameter"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.SLOT_RETURN_VALUE, FunctionDeclaration.class, "function.signature"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.MISSING_TYPE_LAMBDA_PARAMETER, SignalStatement.class, "signal.parameter"));
+        for (var code : List.of(DiagnosticCodes.PROPERTY_DUPLICATE_GETTER, DiagnosticCodes.CLASS_DUPLICATE_EXTENDS,
+                DiagnosticCodes.MISSING_CLOSER_ENUM, DiagnosticCodes.MISMATCHED_CLOSER_ENUM,
+                DiagnosticCodes.SLOT_ENUM_VALUE)) {
+            assertFalse(DiagnosticCodes.isValidPairing(code, FunctionDeclaration.class, "function.signature"));
+            assertFalse(DiagnosticCodes.isValidPairing(code, SignalStatement.class, "signal.parameter"));
+        }
+        assertFalse(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.FUNCTION_INVALID_STATIC_INIT, SignalStatement.class, "signal.parameter"));
     }
 
     @Test
@@ -283,6 +326,54 @@ class DiagnosticRecoveryFoundationTest {
             assertNotNull(diagnostic.recovery());
             assertSame(rootVariable, diagnostic.recovery().owner());
             assertEquals("variable.property", diagnostic.recovery().facet());
+        }
+    }
+
+    @Test
+    void abandonedFallbackChainsVisitAndCacheEachFrameOnlyOncePerCode() {
+        var source = "var root = 1";
+        var parser = new GdScriptParser();
+        var tracker = new RecoveryTransactionTracker();
+        for (var n : List.of(256, 512, 1024, 2048)) {
+            var ast = parser.parse(source).ast();
+            var owner = assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
+            var parent = tracker.pushFrame("variable.initializer");
+            tracker.commit(parent, owner);
+            var frames = new ArrayList<RecoveryTransactionTracker.ProvisionalFrame>(n);
+            for (var i = 0; i < n; i++) {
+                var child = tracker.pushChildFrame("annotation.target", parent,
+                        i == 0 ? "variable.property" : "annotation.target");
+                tracker.abandon(child);
+                frames.add(child);
+                parent = child;
+            }
+            // Resolve deepest first for a full walk followed by cache hits at every shallower depth.
+            for (var frame : frames.reversed()) {
+                tracker.emitError("Dangling annotation", owner.range(), DiagnosticCodes.ANNOTATION_DANGLING,
+                        AttributionPolicy.TARGET_FRAME, frame);
+            }
+            for (var i = 0; i <= n; i++) {
+                tracker.popFrame();
+            }
+            assertTrue(tracker.isBalanced());
+            var diagnostics = tracker.finalizeDiagnostics(ast);
+            var steps = tracker.fallbackResolutionSteps();
+            // Each discarded frame is visited and cached once, then each remaining diagnostic hits the cache.
+            var limit = 3L * n - 1;
+            assertTrue(steps >= 2L * n && steps <= limit, () -> "fallback steps: " + steps);
+            assertEquals(n, diagnostics.size());
+            for (var diagnostic : diagnostics) {
+                assertEquals(owner.range(), diagnostic.range());
+                assertSame(owner, diagnostic.recovery().owner());
+                assertEquals("variable.property", diagnostic.recovery().facet());
+            }
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source,
+                    new AstMappingResult(ast, diagnostics), () -> "discarded frames: " + n);
+            assertTrue(tracker.isBalanced());
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            assertTrue(parser.parse(source).diagnostics().isEmpty());
+            tracker.reset();
+            assertEquals(0, tracker.fallbackResolutionSteps());
         }
     }
 

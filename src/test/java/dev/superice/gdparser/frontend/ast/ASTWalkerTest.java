@@ -7,6 +7,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /// Verifies traversal order, dispatch, pruning, and defensive checks for ASTWalker.
@@ -96,6 +99,51 @@ class ASTWalkerTest {
         assertThrows(NullPointerException.class, () -> new ASTWalker(new ASTNodeHandler() {
         }).walk(null));
         assertThrows(NullPointerException.class, () -> walker.walk(new PassStatement(RANGE)));
+    }
+
+    @Test
+    void walkParsedDictionaryPatternsAndLiteralsVisitsOnlyExistingValues() {
+        var root = DictionaryPatternFixture.parse();
+        var patterns = DictionaryPatternFixture.patternEntries(root);
+        var literals = DictionaryPatternFixture.literalEntries(root);
+        DictionaryPatternFixture.assertKeys(patterns);
+        DictionaryPatternFixture.assertKeys(literals);
+
+        var visited = new ArrayList<Node>();
+        new ASTWalker(new ASTNodeHandler() {
+            @Override
+            public FrontendASTTraversalDirective handleNode(Node node) {
+                visited.add(node);
+                return FrontendASTTraversalDirective.CONTINUE;
+            }
+        }).walk(root);
+
+        var entries = new ArrayList<>(patterns);
+        entries.addAll(literals);
+        assertEquals(entries, visited.stream().filter(DictEntry.class::isInstance).toList());
+        for (var i = 0; i < entries.size(); i++) {
+            var entry = entries.get(i);
+            var index = visited.indexOf(entry);
+            var subtree = new ArrayList<Node>();
+            subtree.add(entry);
+            subtree.add(entry.key());
+            if (entry.key() instanceof BinaryExpression sum) {
+                subtree.add(sum.left());
+                subtree.add(sum.right());
+            }
+            if (i < patterns.size()) {
+                assertNull(entry.value());
+            } else {
+                assertNotNull(entry.value());
+                subtree.add(entry.value());
+            }
+            for (var j = 0; j < subtree.size(); j++) {
+                assertSame(subtree.get(j), visited.get(index + j));
+            }
+            if (i + 1 < entries.size() && i + 1 != patterns.size()) {
+                assertSame(entries.get(i + 1), visited.get(index + subtree.size()));
+            }
+        }
     }
 
     @Test

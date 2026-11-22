@@ -16,6 +16,7 @@ import dev.superice.gdparser.frontend.ast.ConditionalExpression;
 import dev.superice.gdparser.frontend.ast.DeclarationKind;
 import dev.superice.gdparser.frontend.ast.DictEntry;
 import dev.superice.gdparser.frontend.ast.DictionaryExpression;
+import dev.superice.gdparser.frontend.ast.DictionaryPatternFixture;
 import dev.superice.gdparser.frontend.ast.ErrorExpression;
 import dev.superice.gdparser.frontend.ast.ErrorStatement;
 import dev.superice.gdparser.frontend.ast.Expression;
@@ -61,6 +62,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.DynamicTest.dynamicTest;
@@ -225,6 +228,25 @@ class AstSexprSerdeTest {
 
         assertThrows(IllegalArgumentException.class, () -> deserializer.deserialize(invalidInt));
         assertThrows(IllegalArgumentException.class, () -> deserializer.deserialize(invalidList));
+    }
+
+    @Test
+    void shouldRoundTripParsedDictionaryPatternsAndLiteralsInBothFormats() {
+        var ast = DictionaryPatternFixture.parse();
+        for (var serialized : List.of(serializer.serialize(ast), serializer.serializePretty(ast))) {
+            var roundTrip = deserializer.deserialize(serialized);
+            assertEquals(ast, roundTrip);
+            var patterns = DictionaryPatternFixture.patternEntries(roundTrip);
+            var literals = DictionaryPatternFixture.literalEntries(roundTrip);
+            DictionaryPatternFixture.assertKeys(patterns);
+            DictionaryPatternFixture.assertKeys(literals);
+            for (var entry : patterns) {
+                assertNull(entry.value());
+            }
+            for (var entry : literals) {
+                assertNotNull(entry.value());
+            }
+        }
     }
 
     @Test

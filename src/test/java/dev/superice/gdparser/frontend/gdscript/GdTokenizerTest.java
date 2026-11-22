@@ -27,13 +27,18 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 class GdTokenizerTest {
 
     private static final Path FIXTURE_DIR = Path.of("src", "test", "resources", "gdscript");
+    static final String MULTILINE_LAMBDA = "func f():\n\tvar x = target(func():\n"
+            + "\t\treturn node.part\n\t)\n\treturn x\nvar tail = 1";
 
     // --- Helpers -----------------------------------------------------------------------
 
     /// Scans the whole stream, EOF token included. Fails instead of hanging if the
     /// tokenizer stops making progress.
     private static List<GdToken> tokenize(String source) {
-        var tokenizer = new GdTokenizer(source);
+        return drain(new GdTokenizer(source));
+    }
+
+    private static List<GdToken> drain(GdTokenizer tokenizer) {
         var tokens = new ArrayList<GdToken>();
         for (var i = 0; i < 100_000; i++) {
             var token = tokenizer.scan();
@@ -45,7 +50,7 @@ class GdTokenizerTest {
         return fail("tokenizer did not reach EOF within 100k scans");
     }
 
-    private static List<GdToken> tokenizeManaged(String source) {
+    static List<GdToken> tokenizeManaged(String source) {
         var tokenizer = GdTokenizer.managed(source);
         var tokens = new ArrayList<GdToken>();
         for (var i = 0; i < 100_000; i++) {
@@ -442,6 +447,63 @@ class GdTokenizerTest {
         assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN, GdTokenType.BRACE_OPEN,
                 GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF), typesOf(multiSkipped));
         assertTrue(errorsOf(multiSkipped).isEmpty());
+    }
+
+    @Test
+    void closerErrorsAndRealManagedClosersKeepExactPhysicalSpans() {
+        var facade = new GdScriptParserFacade();
+        var prefix = "\"😀中\";\t";
+        var prefixSize = prefix.getBytes(StandardCharsets.UTF_8).length;
+        var column = prefix.codePointCount(0, prefix.length()) + 1;
+        for (var bracketText : List.of("[)", "([)]", "([{)", ")", "([{1}])")) {
+            var source = prefix + bracketText;
+            var publicTokens = facade.tokenize(source);
+            var managedTokens = tokenizeManaged(source);
+            var badClosers = switch (bracketText) {
+                case "[)" -> List.of(1);
+                case "([)]" -> List.of(2, 3);
+                case "([{)" -> List.of(3);
+                case ")" -> List.of(0);
+                default -> List.<Integer>of();
+            };
+            assertEquals(badClosers.size(), errorsOf(publicTokens).size(), source);
+            assertTrue(errorsOf(managedTokens).isEmpty(), source);
+            for (var i = 0; i < bracketText.length(); i++) {
+                var character = bracketText.charAt(i);
+                if (character != ')' && character != ']' && character != '}') {
+                    continue;
+                }
+                var start = prefixSize + i;
+                var managedToken = managedTokens.stream().filter(t -> t.startByte() == start
+                        && t.endByte() == start + 1).findFirst().orElseThrow();
+                var publicToken = publicTokens.stream().filter(t -> t.startByte() == start
+                        && t.endByte() == start + 1).findFirst().orElseThrow();
+                assertEquals(switch (character) {
+                    case ')' -> GdTokenType.PARENTHESIS_CLOSE;
+                    case ']' -> GdTokenType.BRACKET_CLOSE;
+                    default -> GdTokenType.BRACE_CLOSE;
+                }, managedToken.type());
+                assertEquals(badClosers.contains(i) ? GdTokenType.ERROR : managedToken.type(), publicToken.type());
+                assertSpan(managedToken, start, start + 1, 1, column + i, 1, column + i + 1);
+                assertSpan(publicToken, start, start + 1, 1, column + i, 1, column + i + 1);
+            }
+        }
+    }
+
+    @Test
+    void publicTokenizationSuppressesLambdaLayoutButKeepsOuterSuiteLayout() {
+        var tokens = new GdScriptParserFacade().tokenize(MULTILINE_LAMBDA);
+        assertTrue(errorsOf(tokens).isEmpty());
+        var target = tokens.stream().filter(token -> token.source().equals("target")).findFirst().orElseThrow();
+        var close = typesOf(tokens).lastIndexOf(GdTokenType.PARENTHESIS_CLOSE);
+        var inner = typesOf(tokens).subList(tokens.indexOf(target) + 1, close);
+        assertTrue(inner.contains(GdTokenType.RETURN));
+        assertTrue(inner.stream().noneMatch(type ->
+                type == GdTokenType.INDENT || type == GdTokenType.DEDENT || type == GdTokenType.NEWLINE));
+        assertEquals(GdTokenType.NEWLINE, tokens.get(close + 1).type());
+        assertEquals(GdTokenType.RETURN, tokens.get(close + 2).type());
+        assertEquals(1, tokens.stream().filter(token -> token.type() == GdTokenType.INDENT).count());
+        assertEquals(1, tokens.stream().filter(token -> token.type() == GdTokenType.DEDENT).count());
     }
 
     @Test
@@ -1071,6 +1133,7 @@ class GdTokenizerTest {
                 "if a:\n\t  pass\n",
                 "if a:\n\tpass\nif b:\n  pass\n",
                 "\tvar 变量 = \"😀\"",
+                "func f():\r\n\tvar 变量 = \"\"\"😀\r\n界\"\"\"\r\n\tvar " + "界".repeat(4096) + " = 7\r§",
                 "var " + "a".repeat(4100),
                 "([)]",
                 "((]",
@@ -1089,6 +1152,26 @@ class GdTokenizerTest {
         var crlfNewline = tokenize("pass\r\n").get(1);
         assertEquals(GdTokenType.NEWLINE, crlfNewline.type());
         assertSpan(crlfNewline, 5, 6, 1, 6, 2, 1);
+    }
+
+    @Test
+    void longUnicodeLineKeepsExactNumberErrorAndSyntheticEofCoordinates() {
+        var source = "func f():\r\n\tvar 名 = \"\"\"😀\r\n界\"\"\"\r\n\tvar " + "界".repeat(4096) + " = 7\r§";
+        var byteEnd = source.getBytes(StandardCharsets.UTF_8).length;
+        var digitColumn = 4105;
+        for (var tokens : List.of(tokenize(source), tokenizeManaged(source))) {
+            var tail = tokens.subList(tokens.size() - 6, tokens.size());
+            assertEquals(List.of(GdTokenType.LITERAL, GdTokenType.ERROR, GdTokenType.ERROR,
+                    GdTokenType.NEWLINE, GdTokenType.DEDENT, GdTokenType.EOF), typesOf(tail));
+            assertEquals("7", tail.getFirst().source());
+            assertSpan(tail.getFirst(), byteEnd - 4, byteEnd - 3, 4, digitColumn, 4, digitColumn + 1);
+            assertSpan(tail.get(1), byteEnd - 3, byteEnd - 2, 4, digitColumn + 1, 4, digitColumn + 2);
+            assertSpan(tail.get(2), byteEnd - 2, byteEnd, 4, digitColumn + 2, 4, digitColumn + 3);
+            for (var token : tail.subList(3, 6)) {
+                assertSpan(token, byteEnd, byteEnd, 4, digitColumn + 3, 4, digitColumn + 3);
+            }
+            assertPhysicalCoordinatesMatchBytes(source, tokens);
+        }
     }
 
     @Test
@@ -1185,6 +1268,44 @@ class GdTokenizerTest {
         assertEquals(GdTokenType.PARENTHESIS_CLOSE, managed.get(count).type());
         assertEquals(GdTokenType.NEWLINE, managed.get(count * 2).type());
         assertEquals(GdTokenType.EOF, managed.getLast().type());
+    }
+
+    @Test
+    void scanningAndDelimiterWorkHaveLinearBoundsAtFourScales() {
+        var standalone = new GdTokenizer();
+        var managed = GdTokenizer.managed("");
+        var parser = new GdScriptParser();
+        for (var n : List.of(256, 512, 1024, 2048)) {
+            for (var workload : List.of("unmatched", "skipped", "long", "short")) {
+                var source = switch (workload) {
+                    case "unmatched" -> "[".repeat(n) + ")".repeat(n);
+                    case "skipped" -> "(" + "[{".repeat(n) + ")";
+                    case "long" -> "var value = " + "界".repeat(n);
+                    case "short" -> "pass\r\n".repeat(n);
+                    default -> throw new AssertionError(workload);
+                };
+                for (var tokenizer : List.of(standalone, managed)) {
+                    tokenizer.setSourceCode(source);
+                    assertEquals(0, tokenizer.scanSteps());
+                    var tokens = drain(tokenizer);
+                    assertTrue(tokenizer.hasBalancedLayoutState());
+                    assertTrue(tokenizer.hasBalancedPersistentState());
+                    assertTrue(tokenizer.hasBalancedDelimiterState());
+                    var expectedErrors = tokenizer == managed ? 0
+                            : workload.equals("unmatched") ? n : workload.equals("skipped") ? 1 : 0;
+                    assertEquals(expectedErrors, errorsOf(tokens).size());
+                    // Each unit has at most six characters. Dispatch, whitespace, and token scanning
+                    // do at most five counted operations per character; on mismatch each opener is
+                    // pushed, inspected for the error text, and popped at most once.
+                    var limit = 36L * n + 80;
+                    var steps = tokenizer.scanSteps();
+                    assertTrue(steps >= n && steps <= limit, () -> workload + ": " + steps + " > " + limit);
+                }
+                parser.parse(source);
+                assertTrue(parser.bracketOracleScanCount() <= 1);
+                assertTrue(parser.parse("var ok = 1\n").diagnostics().isEmpty());
+            }
+        }
     }
 
     @Test
@@ -1349,7 +1470,7 @@ class GdTokenizerTest {
         for (var i = 0; i < source.length(); ) {
             var codePoint = source.codePointAt(i);
             i += Character.charCount(codePoint);
-            byteOffset += SourceTextIndex.utf8Length(codePoint);
+            byteOffset += new String(Character.toChars(codePoint)).getBytes(StandardCharsets.UTF_8).length;
             if (codePoint == '\n') {
                 line++;
                 column = 1;

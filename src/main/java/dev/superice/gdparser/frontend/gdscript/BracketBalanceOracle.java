@@ -30,26 +30,45 @@ final class BracketBalanceOracle {
     /// @param pairedCloserByte UTF-8 start byte offset of the paired closer, or `-1` when missing
     /// @param pairedCloserLine 1-based physical line of the paired closer, or `-1` when missing
     /// @param effectiveRecoveryEnd UTF-8 byte offset where an unclosed construct should stop
+    /// @param crossesNewline whether an unsuppressed newline separates the opener and closer
+    /// @param crossesSemicolon whether a semicolon token separates the opener and closer
+    /// @param minAnyLineIndent least indent of a token at a noncontinued line start, excluding closers
+    /// @param minNonCommaLineIndent same minimum, excluding lines starting with a comma
     record OpenerFact(
             int openerByte,
             GdTokenType openerType,
             OpenerStatus status,
             int pairedCloserByte,
             int pairedCloserLine,
-            int effectiveRecoveryEnd
+            int effectiveRecoveryEnd,
+            boolean crossesNewline,
+            boolean crossesSemicolon,
+            int minAnyLineIndent,
+            int minNonCommaLineIndent
     ) {
+        OpenerFact(int openerByte, GdTokenType openerType, OpenerStatus status, int effectiveRecoveryEnd) {
+            this(openerByte, openerType, status, -1, -1, effectiveRecoveryEnd, false, false,
+                    Integer.MAX_VALUE, Integer.MAX_VALUE);
+        }
     }
 
     private static final class OpenEntry {
         final int openerByte;
         final GdTokenType openerType;
         final char expectedCloser;
+        final int openerLogicalLine;
+        final int openerSemicolonCount;
         int firstStopByte = -1;
+        int minAnyLineIndent = Integer.MAX_VALUE;
+        int minNonCommaLineIndent = Integer.MAX_VALUE;
 
-        OpenEntry(int openerByte, GdTokenType openerType, char expectedCloser) {
+        OpenEntry(int openerByte, GdTokenType openerType, char expectedCloser,
+                  int openerLogicalLine, int openerSemicolonCount) {
             this.openerByte = openerByte;
             this.openerType = openerType;
             this.expectedCloser = expectedCloser;
+            this.openerLogicalLine = openerLogicalLine;
+            this.openerSemicolonCount = openerSemicolonCount;
         }
     }
 
@@ -59,6 +78,8 @@ final class BracketBalanceOracle {
     private final Set<Integer> structuralStops = new HashSet<>();
     private int scanCount;
     private int scanLine = 1;
+    private int logicalLine = 1;
+    private int semicolonCount;
 
     BracketBalanceOracle(int[] chars, int[] byteOffsets) {
         this.chars = chars;
@@ -94,6 +115,8 @@ final class BracketBalanceOracle {
         var firstTokenOnLine = true;
         var lineHeadAnchor = -1;
         var lineContinuation = false;
+        var leadingIndent = true;
+        var currentLineIndent = 0;
         var len = chars.length;
         var pos = 0;
         scanLine = 1;
@@ -102,6 +125,9 @@ final class BracketBalanceOracle {
             var ch = chars[pos];
 
             if (ch == ' ' || ch == '\t') {
+                if (leadingIndent) {
+                    currentLineIndent += ch == '\t' ? GdTokenizer.TAB_SIZE : 1;
+                }
                 pos++;
                 continue;
             }
@@ -120,7 +146,10 @@ final class BracketBalanceOracle {
             if (ch == '\n') {
                 pos++;
                 scanLine++;
+                leadingIndent = true;
+                currentLineIndent = 0;
                 if (!lineContinuation) {
+                    logicalLine++;
                     firstTokenOnLine = true;
                     lineHeadAnchor = -1;
                 }
@@ -138,6 +167,8 @@ final class BracketBalanceOracle {
                     pos += 2;
                     scanLine++;
                     lineContinuation = true;
+                    leadingIndent = true;
+                    currentLineIndent = 0;
                     continue;
                 }
                 if (pos + 2 < len && chars[pos + 1] == '\r' && chars[pos + 2] == '\n') {
@@ -145,22 +176,42 @@ final class BracketBalanceOracle {
                     pos += 3;
                     scanLine++;
                     lineContinuation = true;
+                    leadingIndent = true;
+                    currentLineIndent = 0;
                     continue;
                 }
                 if (firstTokenOnLine && lineHeadAnchor < 0) {
                     lineHeadAnchor = pos;
                 }
                 lineContinuation = false;
+                leadingIndent = false;
                 pos++;
                 continue;
             }
 
+            var continuedLine = lineContinuation;
             lineContinuation = false;
             var tokenStart = pos;
             var atLineHead = firstTokenOnLine;
             var stopAnchor = lineHeadAnchor >= 0 ? lineHeadAnchor : tokenStart;
+            var isOpener = ch == '(' || ch == '[' || ch == '{';
+            // A line leading with an opener is inside its parent, not the new frame.
+            if (atLineHead && leadingIndent && !continuedLine && !stack.isEmpty()
+                    && (isOpener || ch == '"' || ch == '\'' || ch == '@' || ch == '.' || GdTokenizer.isDigit(ch)
+                        || isIdentifierStart(ch) || isValidNonIdentifierTokenChar(ch))) {
+                var top = stack.getLast();
+                top.minAnyLineIndent = Math.min(top.minAnyLineIndent, currentLineIndent);
+                if (ch != ',') {
+                    top.minNonCommaLineIndent = Math.min(top.minNonCommaLineIndent, currentLineIndent);
+                }
+            }
+            leadingIndent = false;
             firstTokenOnLine = false;
             lineHeadAnchor = -1;
+
+            if (ch == ';') {
+                semicolonCount++;
+            }
 
             // String literals (regular, triple-quoted, raw, StringName, NodePath).
             if (ch == '"' || ch == '\''
@@ -185,7 +236,7 @@ final class BracketBalanceOracle {
                 continue;
             }
 
-            if (ch == '(' || ch == '[' || ch == '{') {
+            if (isOpener) {
                 var openerType = switch (ch) {
                     case '(' -> GdTokenType.PARENTHESIS_OPEN;
                     case '[' -> GdTokenType.BRACKET_OPEN;
@@ -197,7 +248,8 @@ final class BracketBalanceOracle {
                     default -> '}';
                 };
                 var idx = stack.size();
-                stack.add(new OpenEntry(byteOffsets[tokenStart], openerType, expectedCloser));
+                stack.add(new OpenEntry(byteOffsets[tokenStart], openerType, expectedCloser,
+                        logicalLine, semicolonCount));
                 indexStack(openerType, parenIndices, bracketIndices, braceIndices).add(idx);
                 pos++;
                 continue;
@@ -210,6 +262,10 @@ final class BracketBalanceOracle {
                 continue;
             }
 
+            if (GdTokenizer.isDigit(ch) || ch == '.') {
+                pos = skipNumberOrPeriod(pos);
+                continue;
+            }
             if (isIdentifierStart(ch)) {
                 pos++;
                 while (pos < len && isIdentifierContinue(chars[pos])) {
@@ -227,9 +283,8 @@ final class BracketBalanceOracle {
                 continue;
             }
 
-            // Numbers and valid punctuation advance one code point at a time and mark the line as
-            // having seen a real token; unrecognized lexical-error characters keep `firstTokenOnLine`
-            // intact so a following declaration keyword still acts as an unclosed-multiline stop.
+            // Punctuation marks the line as having a token; lexical-error characters keep
+            // `firstTokenOnLine` intact so a following declaration can still stop recovery.
             if (isValidNonIdentifierTokenChar(ch)) {
                 pos++;
                 continue;
@@ -246,7 +301,7 @@ final class BracketBalanceOracle {
             var entry = popTop(stack, parenIndices, bracketIndices, braceIndices);
             var end = entry.firstStopByte >= 0 ? entry.firstStopByte : eofByte;
             factsByOpenerByte.put(entry.openerByte,
-                    new OpenerFact(entry.openerByte, entry.openerType, OpenerStatus.MISSING, -1, -1, end));
+                    new OpenerFact(entry.openerByte, entry.openerType, OpenerStatus.MISSING, end));
         }
     }
 
@@ -257,14 +312,16 @@ final class BracketBalanceOracle {
         }
     }
 
-    private static void propagateStopDown(List<OpenEntry> stack, int childStopByte) {
-        if (childStopByte < 0 || stack.isEmpty()) {
+    private static void propagateRecoveryFacts(List<OpenEntry> stack, OpenEntry child) {
+        if (stack.isEmpty()) {
             return;
         }
         var parent = stack.getLast();
-        if (parent.firstStopByte < 0 || childStopByte < parent.firstStopByte) {
-            parent.firstStopByte = childStopByte;
+        if (child.firstStopByte >= 0 && (parent.firstStopByte < 0 || child.firstStopByte < parent.firstStopByte)) {
+            parent.firstStopByte = child.firstStopByte;
         }
+        parent.minAnyLineIndent = Math.min(parent.minAnyLineIndent, child.minAnyLineIndent);
+        parent.minNonCommaLineIndent = Math.min(parent.minNonCommaLineIndent, child.minNonCommaLineIndent);
     }
 
     private void settleCloser(char closerChar, int closerStartByte, int closerEndByte, int closerLine,
@@ -278,10 +335,8 @@ final class BracketBalanceOracle {
         var top = stack.getLast();
         if (top.expectedCloser == closerChar) {
             var popped = popTop(stack, parenIndices, bracketIndices, braceIndices);
-            factsByOpenerByte.put(popped.openerByte,
-                    new OpenerFact(popped.openerByte, popped.openerType, OpenerStatus.MATCHED,
-                            closerStartByte, closerLine, closerEndByte));
-            propagateStopDown(stack, popped.firstStopByte);
+            recordPair(popped, OpenerStatus.MATCHED, closerStartByte, closerEndByte, closerLine);
+            propagateRecoveryFacts(stack, popped);
             return;
         }
         var expectedType = openerTypeForCloser(closerChar);
@@ -294,21 +349,25 @@ final class BracketBalanceOracle {
                         ? skipped.firstStopByte
                         : closerStartByte;
                 factsByOpenerByte.put(skipped.openerByte,
-                        new OpenerFact(skipped.openerByte, skipped.openerType, OpenerStatus.MISSING, -1, -1, end));
-                propagateStopDown(stack, skipped.firstStopByte);
+                        new OpenerFact(skipped.openerByte, skipped.openerType, OpenerStatus.MISSING, end));
+                propagateRecoveryFacts(stack, skipped);
             }
             var matched = popTop(stack, parenIndices, bracketIndices, braceIndices);
-            factsByOpenerByte.put(matched.openerByte,
-                    new OpenerFact(matched.openerByte, matched.openerType, OpenerStatus.MATCHED,
-                            closerStartByte, closerLine, closerEndByte));
-            propagateStopDown(stack, matched.firstStopByte);
+            recordPair(matched, OpenerStatus.MATCHED, closerStartByte, closerEndByte, closerLine);
+            propagateRecoveryFacts(stack, matched);
             return;
         }
         var replaced = popTop(stack, parenIndices, bracketIndices, braceIndices);
-        factsByOpenerByte.put(replaced.openerByte,
-                new OpenerFact(replaced.openerByte, replaced.openerType, OpenerStatus.REPLACED,
-                        closerStartByte, closerLine, closerEndByte));
-        propagateStopDown(stack, replaced.firstStopByte);
+        recordPair(replaced, OpenerStatus.REPLACED, closerStartByte, closerEndByte, closerLine);
+        propagateRecoveryFacts(stack, replaced);
+    }
+
+    private void recordPair(OpenEntry opener, OpenerStatus status,
+                            int closerStartByte, int closerEndByte, int closerLine) {
+        factsByOpenerByte.put(opener.openerByte,
+                new OpenerFact(opener.openerByte, opener.openerType, status, closerStartByte, closerLine, closerEndByte,
+                        logicalLine != opener.openerLogicalLine, semicolonCount != opener.openerSemicolonCount,
+                        opener.minAnyLineIndent, opener.minNonCommaLineIndent));
     }
 
     private static OpenEntry popTop(List<OpenEntry> stack,
@@ -415,6 +474,10 @@ final class BracketBalanceOracle {
             if (ch == ':' && depth == 0) {
                 return true;
             }
+            if (GdTokenizer.isDigit(ch) || ch == '.') {
+                pos = skipNumberOrPeriod(pos);
+                continue;
+            }
             if (isIdentifierStart(ch)) {
                 var start = pos;
                 pos++;
@@ -431,6 +494,21 @@ final class BracketBalanceOracle {
             pos++;
         }
         return false;
+    }
+
+    private int skipNumberOrPeriod(int pos) {
+        if (chars[pos] != '.') {
+            return GdTokenizer.numberLiteralEnd(chars, pos);
+        }
+        if (pos + 1 < chars.length) {
+            if (chars[pos + 1] == '.') {
+                return pos + (pos + 2 < chars.length && chars[pos + 2] == '.' ? 3 : 2);
+            }
+            if (GdTokenizer.isDigit(chars[pos + 1])) {
+                return GdTokenizer.numberLiteralEnd(chars, pos);
+            }
+        }
+        return pos + 1;
     }
 
     private int skipString(int pos, boolean countLines) {
@@ -460,10 +538,14 @@ final class BracketBalanceOracle {
                         pos++;
                     }
                 } else {
-                    if (countLines && chars[pos] == '\n') {
+                    var escaped = chars[pos++];
+                    if (escaped == '\r' && pos < len) {
+                        // The tokenizer consumes the next code point even for a stray CR.
+                        escaped = chars[pos++];
+                    }
+                    if (countLines && escaped == '\n') {
                         scanLine++;
                     }
-                    pos++;
                 }
                 continue;
             }
@@ -488,11 +570,8 @@ final class BracketBalanceOracle {
     }
 
     private static boolean isValidNonIdentifierTokenChar(int c) {
-        if (c >= '0' && c <= '9') {
-            return true;
-        }
         return switch (c) {
-            case '+', '-', '*', '/', '%', '&', '|', '^', '~', '!', '=', '<', '>', '.', ',', ':', ';',
+            case '+', '-', '*', '/', '%', '&', '|', '^', '~', '!', '=', '<', '>', ',', ':', ';',
                  '$', '?', '`' -> true;
             default -> false;
         };

@@ -104,6 +104,7 @@ public final class GdTokenizer {
     private int position;
     private int line = 1;
     private int column = 1;
+    private long scanSteps;
 
     // Current multi-char token window (Godot's `_start`/`start_line`/`start_column`).
     private int tokenStart;
@@ -198,6 +199,7 @@ public final class GdTokenizer {
         this.chars = codePoints;
         this.byteOffsets = offsets;
         position = 0;
+        scanSteps = 0;
         line = 1;
         column = 1;
         tokenStart = 0;
@@ -357,6 +359,11 @@ public final class GdTokenizer {
 
     boolean hasBalancedPersistentState() {
         return indentStackStack.isEmpty() && suppressedNewline == null;
+    }
+
+    boolean hasBalancedDelimiterState() {
+        return parenStack.isEmpty() && openParenIndices.isEmpty()
+                && openBracketIndices.isEmpty() && openBraceIndices.isEmpty();
     }
 
     /// Reconciles suppressed multiline layout against `indentStack` once multiline suppression
@@ -567,6 +574,7 @@ public final class GdTokenizer {
             clearSuppressedOnNextScan = false;
         }
         while (true) {
+            scanSteps++;
             if (hasError()) {
                 return popError();
             }
@@ -1575,6 +1583,7 @@ public final class GdTokenizer {
     ///      and emits an ERROR naming every unclosed opener skipped along the way.
     ///   4. No ancestor: pops only the mismatched top and emits an ERROR naming it.
     private GdToken handleCloser(int closerChar, int expectedOpener, GdTokenType tokenType) {
+        scanSteps++;
         if (emitRawClosers) {
             return makeToken(tokenType);
         }
@@ -1591,6 +1600,7 @@ public final class GdTokenizer {
             var matchIndex = expectedStack.getLast();
             var skipped = new StringBuilder();
             for (var i = matchIndex + 1; i < parenStack.size(); i++) {
+                scanSteps++;
                 if (!skipped.isEmpty()) {
                     skipped.append(", ");
                 }
@@ -1616,6 +1626,7 @@ public final class GdTokenizer {
     /// Port of `_peek(offset)`: code point at `position + offset`, or 0 out of bounds.
     /// Negative offsets look backwards; `peek(-1)` is the most recently consumed char.
     private int peek(int offset) {
+        scanSteps++;
         var index = position + offset;
         return index >= 0 && index < chars.length ? chars[index] : 0;
     }
@@ -1649,6 +1660,7 @@ public final class GdTokenizer {
         if (emitRawClosers) {
             return;
         }
+        scanSteps++;
         var index = parenStack.size();
         parenStack.add(paren);
         var stack = openerIndexStack(paren);
@@ -1658,12 +1670,18 @@ public final class GdTokenizer {
     }
 
     private int popTopParen() {
+        scanSteps++;
         var top = parenStack.removeLast();
         var stack = openerIndexStack(top);
         if (stack != null) {
             stack.removeLast();
         }
         return top;
+    }
+
+    /// Scan-dispatch iterations, code-point lookups, and standalone delimiter operations.
+    long scanSteps() {
+        return scanSteps;
     }
 
     private boolean hasError() {
@@ -1684,7 +1702,7 @@ public final class GdTokenizer {
 
     // --- Character classification (port of core/string/char_utils.h) ---------------------
 
-    private static boolean isDigit(int c) {
+    static boolean isDigit(int c) {
         return c >= '0' && c <= '9';
     }
 
@@ -1706,6 +1724,42 @@ public final class GdTokenizer {
             case 2 -> isBinaryDigit(c);
             default -> isDigit(c);
         };
+    }
+
+    /// Skips a number with the same token boundaries as `number()`, without reporting errors.
+    static int numberLiteralEnd(int[] chars, int start) {
+        var len = chars.length;
+        var pos = start + 1; // The tokenizer has already consumed the first digit or period.
+        var leadingPeriod = chars[start] == '.';
+        if (chars[start] == '0' && pos < len) {
+            var base = switch (chars[pos]) {
+                case 'x', 'X' -> 16;
+                case 'b', 'B' -> 2;
+                default -> 10;
+            };
+            if (base != 10) {
+                return skipNumberDigits(chars, pos + 1, base);
+            }
+        }
+        pos = skipNumberDigits(chars, pos, 10);
+        if (!leadingPeriod && pos < len && chars[pos] == '.' && (pos + 1 == len || chars[pos + 1] != '.')) {
+            pos = skipNumberDigits(chars, pos + 1, 10);
+        }
+        if (pos < len && (chars[pos] == 'e' || chars[pos] == 'E')) {
+            pos++;
+            if (pos < len && (chars[pos] == '+' || chars[pos] == '-')) {
+                pos++;
+            }
+            pos = skipNumberDigits(chars, pos, 10);
+        }
+        return pos;
+    }
+
+    private static int skipNumberDigits(int[] chars, int pos, int base) {
+        while (pos < chars.length && (digitCheck(base, chars[pos]) || isUnderscore(chars[pos]))) {
+            pos++;
+        }
+        return pos;
     }
 
     /// Returns the end byte offset of an error-only `0x`/`0X`/`0b`/`0B` prefix (including

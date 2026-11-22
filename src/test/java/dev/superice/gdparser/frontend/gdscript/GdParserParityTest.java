@@ -1,5 +1,10 @@
 package dev.superice.gdparser.frontend.gdscript;
 
+import dev.superice.gdparser.frontend.ast.AstDiagnostic;
+import dev.superice.gdparser.frontend.ast.ExpressionStatement;
+import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
+import dev.superice.gdparser.frontend.ast.LambdaExpression;
+import dev.superice.gdparser.frontend.ast.PassStatement;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
@@ -10,6 +15,9 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
 /// Dual-path parity for the declaration layer: program prefix, class-body declarations,
@@ -163,6 +171,16 @@ class GdParserParityTest extends GdParserParityTestSupport {
                     actual.diagnostics().getFirst().code()
             );
         }
+    }
+
+    @Test
+    void damagedAssignmentAndCallKeepOnlyPrimaryErrorsWithoutRelaxingHealthyParity() {
+        var source = "func f():\n\t(a ?) = 2\n\tx as = 2\n\t(a ?)(2)\n";
+        var result = parseViaGdScript(source);
+        assertEquals(List.of(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, DiagnosticCodes.MISSING_TYPE_CAST,
+                        DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN),
+                result.diagnostics().stream().map(AstDiagnostic::code).toList());
+        assertCleanParity("func f():\n\t(x) = 2\n\tf()[0] = 2\n\t(f)(1)\n");
     }
 
     @Test
@@ -349,6 +367,23 @@ class GdParserParityTest extends GdParserParityTestSupport {
             org.junit.jupiter.api.Assertions.assertTrue(actual.diagnostics().stream()
                     .anyMatch(d -> "parse.lambda.bare_statement".equals(d.code())));
         }
+    }
+
+    @Test
+    void groupedBareLambdaMatchesTheAstButIsRejectedByThePureJavaParser() {
+        var source = "func f():\n\t(func(): pass)\n\tpass\n";
+        assertParity(source);
+        var result = parseViaGdScript(source);
+        var fn = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+        var statement = assertInstanceOf(ExpressionStatement.class, fn.body().statements().getFirst());
+        var lambda = assertInstanceOf(LambdaExpression.class, statement.expression());
+        assertInstanceOf(PassStatement.class, fn.body().statements().getLast());
+        assertEquals(1, result.diagnostics().size());
+        var diagnostic = result.diagnostics().getFirst();
+        assertEquals(DiagnosticCodes.LAMBDA_BARE_STATEMENT, diagnostic.code());
+        assertEquals(lambda.range(), diagnostic.range());
+        assertSame(statement, diagnostic.recovery().owner());
+        assertEquals("expression", diagnostic.recovery().facet());
     }
 
     /// Comment/region attribution: trailing, whole-line, dedent boundaries, annotation

@@ -22,9 +22,8 @@
 4. 新增纯 Java 路径的补全上下文分类能力（`GdScriptParserFacade.parseCompletionContext`）。
 5. 更新两份事实源文档的产出政策条款。
 
-**明确不做（本轮）**：`:`（非 `:=`）后缺类型保持零诊断（D7，已接受为与 vendor 一致的接受面）；
-`parseType`/`parseNameAndType` 签名与行为不变；match `var` 绑定缺名仍丢弃（无节点可承载名字）；
-增量解析（迁移报告已登记的非目标）；GDCC 侧消费改动（仅定义合同点，见 §7）。
+**边界**：类型恢复不改变公开 `TypeRef` 结构与 serde；match `var` 绑定缺名仍丢弃（无节点可承载名字）；
+不做增量解析（迁移报告已登记的非目标）或 GDCC 侧消费改动（仅定义合同点，见 §7）。
 
 ## 2. 决策记录
 
@@ -37,13 +36,13 @@
 | D3 编辑器范围 | super 前缀保留与补全上下文分类纳入本次交付；signature help DTO 属 GDCC 侧后续能力，本计划只保证 `CALL_ARGUMENT` 分类与 callee 定位 | 用户任务；调研 §8.5-5 |
 | D4 诊断结构 | **API 稳定性不作约束**（用户 2026-10-08）：`AstDiagnostic` 直接修改，不兼容由下游承担 | 用户决策；调研 §7.4-7.5 |
 | D5 旧路径弃用 | 旧 tree-sitter 补全/解析入口在本计划交付后**标注弃用**（`@Deprecated` + 迁移指引注释），移除另排（§8.3） | 用户决策 2026-10-08 |
-| D6 sealed-outcome | §8.2 的损伤传播编码采用 **`ParseOutcome<T>` 密封接口**（用户 2026-10-14），取代此前的受损节点身份集合方案：损伤随返回值沿调用栈流动，吸收 = 宿主解包后返回 `Ok`，无需旁路状态机；代价是表达式族签名从 `@Nullable Expression` 改为 `ParseOutcome<Expression>`（接受大范围机械重构） | 用户决策；§8.2 |
-| D7 `:` 缺类型 | **接受**（用户 2026-10-14）：已消费 `:`（非 `:=`）后缺类型与 vendor Godot 一致（静默、按未标注 Variant 处理），不补诊断、不实施原 Phase 2 #4 与 T11；登记为接受面事实而非偏差 | 用户决策；回归报告 §2 |
+| D6 sealed-outcome | §8.2 的损伤传播采用 **`ParseOutcome<T>` 密封接口**。表达式和类型的损伤都随返回值传播；吸收宿主在自身结构完整时返回 `EnclosedDamage`，保留子损伤但不阻断续折或表面形态检查。 | §8.2 |
+| D7 `:` 缺类型 | 早期计划曾允许静默省略；现行必选类型槽明确诊断已写 `:` 但缺失类型，合法省略与 `:=` 推断不受影响。 | §2.2 |
 | D8 闭合符诊断 | 采纳 2C（§8.4）：缺闭合符产零宽诊断 + code + `RecoveryLink`（owner/facet），不改 AST 形状，不做纯几何归属 | review-expert-c 方案；用户决策 2026-10-14 |
 | D9 C3 槽位 marker | 采纳 3A（§8.5）：guard/enum 值/elif 条件/字典 pattern key 的「置 null/丢槽」改为 Phase 1 式槽位 marker；字典 pattern 无载体分支整体 ERROR 回退 | review-expert-c 方案；用户决策 2026-10-14 |
 | D10 C2 存活 | assert/const/match 值在槽位失败后**带 marker 存活并消费成功路径尾部**（`)`/`endStatement` 照走），取代「提前 return + 由 synchronize 吃残余」的过渡形态；vendor 对 assert/const 是丢弃，此处为有意优于 vendor 的恢复（登记偏差） | sealed-outcome 使存活消费等价可论证；§8.2.5 |
 
-### 2.2 四态槽位合同（MISSING/ERROR 细化规则）
+### 2.2 槽位合同（五态与 MISSING/ERROR 细化规则）
 
 | 源码情形 | 槽位值 | 诊断 | 例子 |
 |---|---|---|---|
@@ -51,22 +50,21 @@
 | 合法空列表/尾逗号 | 空列表/正常节点 | 无 | `f()`、`f(1,)`、`{}`、`[1,2,]` |
 | 已开启但零消费（内容完全缺失） | `ErrorExpression(MISSING, slotName, "", zeroWidth)` | 一条槽位诊断（outcome 为 `Missing` 时由槽位宿主补发，§3.4） | `func f(x=)`、`var x =`+换行、`{"a":}` |
 | 已开启且有消费（坏 token 片段） | 可结构化的部分节点（内部含 marker），或 `ErrorExpression(ERROR, "ERROR", fragment, consumedSpan)` | 内层根因诊断（槽位宿主不补发泛化消息，§3.4） | `var hp=1+`（BinaryExpression+MISSING 右槽）、`return 1+`、`@export_range(0,1+,2)` |
-| 类型槽位（`TypeRef` 非 Expression，无法持节点） | `null`，**无诊断**（D7：与 vendor 一致） | 无 | `func f(x:)`、`var x:;`、`signal s(x:)` |
+| 已写的类型槽位（`TypeRef` 不承载表达式 marker） | 有可用片段时保留 `TypeRef`，否则声明类型为 `null`；`as`/`is` 缺失或失败时保留含表达式 marker 的恢复中缀节点 | `Missing` 由宿主报告，已报错的坏类型不重复补发 | `var x: Foo.`、`func f(x:)`、`x as Array[]` |
 
 机械判定规则（消除主观性）：
 
-- 「消费」不由游标比较判定，而由 outcome 变体承载（§8.2.2）：`Missing` = 零消费且未推诊断；`Failed` =
-  已推诊断、无节点（通常有消费；唯一的零消费来源是深度预算拒绝）；`Damaged` = 有部分节点且已推诊断。
-  槽位宿主按变体机械选择 MISSING 零宽 / ERROR 片段 / 保留节点。
+- 槽位的形态和根因不靠游标差值或诊断计数推断（§8.2.2）：`Missing` = 零消费且未推诊断；`Failed` =
+  已推诊断、无节点（深度预算拒绝可以零消费）；`Damaged` = 可保留的部分节点带外露损伤；
+  `EnclosedDamage` = 本层结构完整但含子损伤；`Ok` = 健康值。宿主按变体选择零宽 MISSING、ERROR 片段或原节点。
 - **marker 的右端/锚点统一取构造当时的 `extentEnd()`**（最后消费 token 末端，含尾部 lambda 的特例调整，
   `GdScriptParser.java:263-265`），不取 `previous.endByte()`——尾部 lambda 实参场景两者可不同
   （`var x = f(, func(): return 1\n` 中 `previous.endByte()` 会越过 lambda 消费调整点），而父节点 range 均按
   `extentEnd()` 计算，同一基准保证 I3 包络（二审 C-F1）。
 - **ERROR span = `[slotStart, extentEnd())`**，即实际消费区间，不含尾随空白；**MISSING = `[extentEnd(), extentEnd())`** 零宽。
-- `return` 特判：值槽只在「`return` 后非语句尾/lambda 内跟真实 token」时开启（`GdScriptParser.java:1230-1240`）。
-  outcome 为 `Missing`（零消费，如 lambda 内 `return` 后接 `,`/`)`、`return =3` 的 `=`）保持 `value=null`
-  且**不新增诊断**，垃圾 token 仍由既有 `endStatement`/`synchronize` 路径处理（一审 A-2）；`Failed` 填
-  ERROR 片段，`Damaged` 保留节点。`return =3` 的受损身份由 §7 第 1 条的诊断重叠门禁（判据 b）表达。
+- `return` 特判：真正的语句末尾（含 lambda 的外层闭合符与逗号）不开值槽，保留 `value=null`。开启值槽后，
+  `Missing` 走有界残片恢复（如 `return =3`），`Failed` 填 ERROR 片段；`Ok`、`EnclosedDamage` 和
+  `Damaged` 都保留已建节点。
 
 ### 2.3 节点语义纪律（调研 §7.3）
 
@@ -81,28 +79,18 @@
 ### 3.1 I1 控制流守恒（sealed-outcome 版）
 
 - marker 构造不消费任何 token（不调用 `advance`/`match`/`consume`）。
-- **Pratt 停折语义守恒**：循环头把「`left == null` 停折」扩展为「`left` 非 `Ok` 停折」，其余三个子条件
-  （`infix() == null`、`lambdaEnded`、`stopOnAssign && EQUAL`）原样保留；受损节点携带部分结构上上浮到宿主，
-  但不再参与折叠——控制流与今天的 null 逐点等价。
-- 列表循环（实参/数组/字典/注解/pattern）推进仍由 `match(COMMA)`/闭合 token 驱动，marker 只追加列表，
-  终止性与现状相同。
+- **Pratt 停折**：无值的 `Missing`/`Failed` 停折；`Ok`、`EnclosedDamage` 和 `Damaged` 都可继续折叠，
+  但不得绕过结构、预算、优先级、lambda、赋值等原有边界守卫。续折不得擦除左操作数已有的损伤。
+- 列表循环由分隔符、闭合符与有界的分隔恢复驱动；marker 本身不移动游标。
 - C2 存活位点（assert/const/match 值）失败后消费**成功路径**的完整尾部（比今天提前 return 多消费 `)`/
   `endStatement`），这是有意行为改进，逐点论证见 §5.2。
-- 语句分派 D：`Missing` 走今天的 null 路径逐字不变；`Damaged` 仅在 `isStatementEndToken() || lambdaEnded`
-  门控下存活（§8.2.4；`isStatementEnd()` 在 lambda 内因 `inLambda` 恒真，不能作门控）。
+- 语句分派 D：有值的 outcome 都保留为表达式语句；`finishStatement` 负责语句尾及虚拟 lambda 边界（§8.2.4）。
 
 ### 3.2 I2 语句级推进
 
-`parseSuiteImpl` 熔断只统计 null 语句（`lastStatementWasNull`）。本计划改动后：语句分派要么返回消费了
-≥1 token 的节点（存活），要么返回 null——`Missing` 路径在非 lambda 下由分派点 `advance()` 推进；`Failed`/丢弃的
-`Damaged` 路径在非 lambda 下一律按 EOF 守卫 `advance()` 一次（含深度预算置位、零消费的情形：毒区扫描的
-行首停止点只停不消费，不先推进会在同一 token 上零消费空转至熔断；先推进只吃掉触发行的内容 token，
-毒区扫描照常消费后续行）；**lambda 内这三条（`Missing`/`Failed`/丢弃的 `Damaged`）都只置
-`lambdaEnded`、不 advance**（suite 循环条件含 `!lambdaEnded`，置位即停，不存在空转；先推进会吃掉
-`synchronize` 本应停在其前的同步关键字）。`parseSuite`/`parseLambdaLike`/`parseNestedClass`/`parseMatchPattern`/`parseType`
-的预算拒绝不经语句分派 D 路径——它们不 advance，把 NEWLINE/INDENT 留给外层 `synchronize`
-（`rejectedSuiteLayoutDoesNotLeakIntoOuterScopes` 依赖的是这条路径，不得改成先推进）。熔断继续作为
-兜底（口径见 §8.2.4）。
+`parseSuiteImpl` 熔断只统计 null 语句。表达式语句只在 `Missing` 或 `Failed` 无节点可承载时被丢弃；在
+lambda 的真实终止边界可置 `lambdaEnded` 而不吃外层 token，其他路径按 EOF 守卫推进并交给同步。
+局部递归入口的预算拒绝不自行吃布局 token，交给包围它的构造恢复。熔断继续作为兜底（§8.2.4）。
 
 ### 3.3 I3 范围包络
 
@@ -113,10 +101,10 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
 
 ### 3.4 I4 槽位诊断归属（outcome 机械化版）
 
-**槽位宿主只在 outcome 为 `Missing` 时补发本槽位的泛化消息**；`Failed`/`Damaged` 已在内部推过根因诊断，
-补发即双报。该规则由 `absorbSlot` 统一实施（§8.2.2），等价于原「诊断计数快照」规则但无时间窗：
-`f(g(1+))` 的内层诊断属于内层槽位，外层调用实参槽收到的是 `Damaged`，不补发。缺闭合符诊断（2C）与
-槽位诊断独立，不受抑制。
+**槽位宿主只在 outcome 为 `Missing` 时补发本槽位的泛化消息**；`Failed`、`Damaged` 和
+`EnclosedDamage` 已有根因诊断。表达式的 `absorbSlot` 与类型宿主按变体分派（§8.2.2）：
+`f(g(1+))` 的诊断来自 `1+` 的右槽，外层实参收到 `EnclosedDamage`，不补发。缺闭合符诊断（2C）与
+槽位诊断独立。
 
 ## 4. 行为需求（按槽位）
 
@@ -126,26 +114,26 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
 
 | # | 位点 | 位置 | 目标行为 |
 |---|---|---|---|
-| E1 | Pratt 核心 | 2576-2641 | `parseExpression`/`parsePrecedence` 返回 `ParseOutcome<Expression>`；前缀无规则 → `Missing`（零消费、不推诊断）；深度预算 → `Failed`（诊断已推）；循环头非 `Ok` 停折 |
-| E2 | 终端前缀 | 2643-2657 | literal/identifier/self → `Ok`；lambda 前缀 → `Ok`（内部损伤被自身槽位吸收） |
-| E3 | 一元/二元/`not in`/三元/赋值 | 2943-3085 | 子槽失败 → `absorbSlot` 填 marker 建成现有节点（BinaryExpression/UnaryExpression/ConditionalExpression/AssignmentExpression），右端 `extentEnd()`；任一子槽非 `Ok` → 整节点 `Damaged`；消费顺序不变（三元 condition→`else`→false 照走） |
-| E4 | cast/`is`/`?` | 3029-3094 | 维持现状（类型缺失返回 left，诊断已存在）→ `Ok(left)` |
-| E5 | 分组 | 2662-2671 | 内层 `Ok` → 由分组自己处理 `)`：有则消费，缺则发 2C 零宽诊断（不算槽位损伤），均返回 `Ok(内层)`；内层 `Damaged` → `Damaged(内层)` 不消费 `)`；内层 `Missing`/`Failed` → `Damaged(slotMarker("grouping"))` 不消费 `)`，`Missing` 时补发 "Expected grouping expression." |
-| E6 | 数组 | 2675-2695 | 失败元素填 marker（`"array.element"`）追加进列表；数组恒 `Ok`（吸收宿主）；缺 `]` 走 2C |
-| E7 | 字典 | 2707-2797 | key/value 分侧 marker（`"dictionary.key"`/`"dictionary.value"`），删除 `nullPlaceholder`；Lua 风格名归一化只对 `Ok` key 进行（marker/受损 key 不再触发额外类型抱怨，I4）；双侧 `Missing` 仍丢 entry；entry 范围按 §3.3 重算；缺 `}` 走 2C |
+| E1 | Pratt 核心 | 2576-2641 | `parseExpression`/`parsePrecedence` 返回 `ParseOutcome<Expression>`；前缀无规则 → `Missing`；深度预算 → `Failed`；只有无值 outcome 或原有边界守卫使循环停折 |
+| E2 | 终端前缀 | 2643-2657 | literal/identifier/self → `Ok`；lambda 头部健康 → `Ok`，签名自身或返回类型有词法或结构损伤 → `Damaged`，函数体恢复留在自身槽位 |
+| E3 | 一元/二元/`not in`/三元/赋值 | 2943-3085 | 失败子槽由 `absorbSlot` 保留载体；运算符无须抹去 `EnclosedDamage`，未收口的操作数或运算符自己的语法损伤则为 `Damaged`。三元仍按 condition → `else` → false 解析 |
+| E4 | cast/`is`/`?` | 3029-3094 | `as`/`is` 保留已消费的 `TypeRef`，坏类型使表达式为 `Damaged`；无类型节点时用 `RecoveredInfixExpression` 保留左操作数及 MISSING/ERROR marker；非法 `?` 也保留带 ERROR marker 的恢复节点 |
+| E5 | 分组 | 2662-2671 | 真实 `)` 闭合后继承内层有值 outcome；缺失或错闭合返回 `Damaged`。内层无节点时保留 `Damaged(slotMarker("grouping"))` 并结算本层闭合符 |
+| E6 | 数组 | 2675-2695 | 保留坏元素及 `array.element` marker；结构完整的数组返回 `EnclosedDamage`，自身未闭合或列表分隔损坏时返回 `Damaged` |
+| E7 | 字典 | 2707-2797 | 键值各有 marker；显式 `:`/`=` 可见证双侧 `Missing` 的条目。结构完整的字典吸收子损伤。Lua 风格键只在 `Ok` 或 `EnclosedDamage` 时检查表面形态，分组中的外露损伤不触发二次形态诊断 |
 | E8 | getNode | 2807-2865 | 6 个失败位点 → `Failed`（消费过、诊断已推、无节点）；成功 → `Ok` |
-| E9 | preload | 2870-2885 | 路径槽 `absorbSlot("preload.path")`；节点建成，路径非 `Ok` → `Damaged`；缺 `)` 走 2C |
-| E10 | await | 2889-2897 | 操作数槽 `absorbSlot("await.operand")`；节点建成，操作数非 `Ok` → `Damaged` |
-| E11 | super | 2907-2939 | 裸 `super` 无 `.`/`(` → 一条诊断 + `Damaged(superIdent)`；`super.` 缺名 → `Damaged(AttributeExpression(super,[MissingAttributeStep]))`；`super.name` 缺 `(` → `Damaged(AttributeExpression(super,[AttributePropertyStep]))`；实参受损 → `Damaged` 调用/链；范围右端 `extentEnd()` |
-| E12 | 后缀链 | 3121-3208 | 缺名点号 → 报错 + 追加 `MissingAttributeStep`（点号末端零宽）+ 链标 `damaged`，**链继续**（`Missing` 末步使后续 `(`/`[` 的 `instanceof AttributePropertyStep` 折叠分派不命中 → 走 `finishChain` + 新 `CallExpression`/`SubscriptExpression`，形成折叠障碍）；实参/索引受损 → 走完既有清理（pop multiline、closer 处理）建成节点后**立即返回 `Damaged`，链内不再续折**（`foo(1+).bar` 的 `.bar` 留给外层停折/sync，与今天 null 上浮等价）；调用/下标节点与折进链的 `AttributeCallStep`/`AttributeSubscriptStep` 的右端统一取 closer 处理后的 `extentEnd()`（成功时等于 `)`/`]` 末端；closer 缺失且尾部为 lambda 时等于 lambda body 末端），`finishChain` 以末步该右端为链右端 |
-| E13 | 实参列表 | 3227-3247 | `parseCallArguments` 返回 `ParseOutcome<List<Expression>>`：失败实参填 marker（`"call.argument"`）追加进列表，列表恒携带；有 marker/受损实参 → `Damaged(list)`（实参列表**不是**吸收宿主——损伤继续传播给调用节点并触发 E12 的建后即返）；缺 `)` 只走 2C（不算受损） |
-| E14 | 下标索引 | 3165-3189 | 索引槽 `absorbSlot("subscript.index")`；索引非 `Ok` → 链 `Damaged`；缺 `]` 走 2C |
+| E9 | preload | 2870-2885 | 路径槽 `absorbSlot("preload.path")`；路径损伤由闭合的 `preload(...)` 吸收；缺 `)` 则本层 `Damaged` |
+| E10 | await | 2889-2897 | 操作数槽 `absorbSlot("await.operand")` 并传播该操作数的损伤（同 E3） |
+| E11 | super | 2907-2939 | 裸 `super`、`super.` 缺名、`super.name` 缺 `(` 均保留部分节点并返回 `Damaged`；完整调用边界吸收实参损伤 |
+| E12 | 后缀链 | 3121-3208 | 缺名点号追加零宽 `MissingAttributeStep`，标记本链 `Damaged`；缺名末步阻止后续 `(`/`[` 折向前一个属性。实参/索引损伤由完整调用/下标吸收；在结构、优先级、预算与 lambda 守卫允许时继续折叠 |
+| E13 | 实参列表 | 3227-3247 | `parseCallArguments` 始终带列表；坏实参用 `call.argument` marker 或部分节点保留。实际闭合且分隔完整时吸收子损伤，否则为 `Damaged` |
+| E14 | 下标索引 | 3165-3189 | 索引槽 `absorbSlot("subscript.index")`；当实际 `]` 闭合且链自身完整时吸收索引损伤，缺失或错闭合则为 `Damaged` |
 
 ### 4.2 语句/声明槽位
 
 | # | 槽位 | 位置 | 目标行为 |
 |---|---|---|---|
-| S1 | return 值 | 1227-1243 | §2.2 特判：`Missing` 保持 `value=null` 不新增诊断；`Failed` → ERROR 片段；`Damaged` → 保留节点；owner facet `return.value` |
+| S1 | return 值 | 1227-1243 | 真正语句结束时可省略值；开启的槽按 §2.2 恢复并绑定 `return.value` |
 | S2 | 变量初始化器 | 1950-1955 | `absorbSlot("variable.initializer")`；声明恒存活；owner facet 同名 |
 | S3 | 参数默认值 | 2147-2150 | `absorbSlot("parameter.default")`；`=` 后缺失与从未写 `=` 可辨。**批次耦合**：marker 使 `defaultValue() != null` 影响 `defaultUsed` 判定（2314-2322），必须与 S12 同批 |
 | S4 | 注解实参 | 1811-1821 | 失败实参填 marker（`"annotation.argument"`）追加进列表；缺 `)` 走 2C；owner facet `annotation.arguments` |
@@ -160,11 +148,11 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
 | S13 | elif 条件 | 1341-1353 | `absorbSlot("elif.condition")`；分支**保留**（带 marker 条件与健康 body），不再整条丢弃（3A） |
 | S14 | enum 值 | 2225-2233 | 写了 `=` 但失败 → `absorbSlot("enum.value")`，且 `memberEnd` 扩展到 marker 末端（I3）；无 `=` 保持 null（3A） |
 | S15 | 缺名点号 | 3131-3145 | 见 E12（MissingAttributeStep 障碍） |
-| S16 | 语句分派 D | 1281-1302 | 见 §8.2.4（Missing→null 路径；Failed→丢弃；Damaged→`isStatementEndToken() || lambdaEnded` 门控存活） |
+| S16 | 语句分派 D | 1281-1302 | 见 §8.2.4（无值丢弃；有值的三态均保留） |
 
 ### 4.3 显式不改
 
-- `parseType`/`parseNameAndType` 与 `:` 缺类型零诊断接受面（D7）；signal 参数缺名 `break`、signal 拒默认值检查
+- 公开 `TypeRef` 与 serde 合同；signal 参数缺名 `break`、signal 拒默认值检查
   （2180-2182 在 S3 marker 化后会把 `signal s(x = )` 识别为有默认值而报错——可接受的更严格识别，登记 §6.2）。
 - match 缺 INDENT 的 body 归属（头部换行已消费时 `synchronize` 立即停，body 归外层 suite，不变）。
 - `frontend.cst`/`frontend.lowering` 与 `CstToAstMapperErrorRecoveryTest`（旧路径，不在本计划）。
@@ -183,7 +171,7 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
      **token 流契约**：独立 facade `tokenize` 用自己的括号验证与布局处理，补全不依赖该入口。
      补全视图按**有效 multiline 上下文**处理托管 tokenizer 的布局：
      - 以一个小栈复现 parser 语义：表达式分组、调用、下标与签名参数表的 `(`/`[`/`{` 压入启用帧；
-       **类型容器的 `[`/`]` 只跟踪配平、继承当前 multiline 状态，不自行启用**（parser 的 `parseType`
+       **类型容器的 `[`/`]` 只跟踪配平、继承当前 multiline 状态，不自行启用**（parser 的 `parseTypeInternal`
        不 push multiline，`var x: Array[\nInner` 的换行是硬边界）；**识别到 `func`（lambda）即压入
        禁用帧**（parser 无条件禁用，单行/多行 body 同样隔离）；其签名参数的 `(` 临时压入启用帧，
        **在消费 `)` 之前弹出**（与 `parseFunctionSignature` 的 `popMultiline` 同点）——`)`、`->` 返回类型与
@@ -296,27 +284,17 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
 
 ### 5.1 表达式失败传播路径（sealed-outcome 版）
 
-失败以 `ParseOutcome` 变体沿 `parseSuffixChain`/`parsePrecedence` 上浮：循环头在非 `Ok` 左操作数处停折
-（与今天 null 停折逐点等价），宿主按吸收/传播纪律落成 marker 或 `Damaged` 节点；到达语句分派时按 §8.2.4
-门控。消费序列逐位点论证：传播父节点与成功路径同序（三元/二元/赋值均照原顺序解析子槽）；后缀链失败点
-先走完既有清理（pop multiline、closer 处理）再建节点；列表循环由 `match(COMMA)`/闭合 token 推进。
+失败以 `ParseOutcome` 变体沿 `parseSuffixChain`/`parsePrecedence` 传播：仅无值结果不参与后续折叠，
+有值结果按原有结构与优先级守卫续折并保留损伤；语句分派见 §8.2.4。传播父节点保持三元、二元、赋值的
+子槽消费顺序；后缀链先结算 multiline 和闭合符再建节点；列表由有界分隔恢复和闭合 token 推进。
 `if f(,): pass`、`assert(f(,))`、`preload(f(,))` 等嵌套失败：内层 `Missing` 填 marker、宿主存活，
 `synchronize` 不再介入这些位点（无 panic 尾差）——`panicMode` 仍由诊断触发，语句尾 `synchronize`
 （1311-1312）照常，但当前 token 已是行尾/同步点，零消费退出。
 
 ### 5.2 存活变化的逐路径论证（取代原 super 门控分析）
 
-唯一的「今天丢 → 存活」变化集中在语句分派 D 的 `Damaged` 门控与 C1/C2 存活：
-
-- **D 门控 `isStatementEndToken() || lambdaEnded`**：
-  - NEWLINE/SEMICOLON/EOF（非 lambda）：存活路径由 `endStatement` 消费结束符；今天 null 路径 `advance()`
-    消费当前 token + 报错后由 `synchronize` 吃到行尾。两者之后同经 `panicMode → synchronize`，兄弟起点一致。
-  - lambda 内：`f(func(): super., 1)`——受损 `super.` 在 `,` 处不满足门控，丢弃并 sync（`, 1)` 被吃），
-    与今天 null 路径一致；`f(func(): super. + 1)` 同理在 `+` 处丢弃。lambda 内真边界（NEWLINE/EOF）存活的
-    语句与健康语句的 `endStatement` 行为一致。
-  - 多结束符 delta（原六审 A 登记项）保持：`endStatement` 吃整串连续 NEWLINE/SEMICOLON，
-    `var f = func():\n\tsuper.;\n\tvar y = 1` 存活后 `var y` 留在 lambda body 且 `consume(DEDENT)`——
-    本计划接受该变化（兄弟留在声明作用域、减少级联错误），由 T10 钉死。
+- **D 语句分派**：有值结果（含 `Damaged`）保留为语句，由 `finishStatement` 处理同行垃圾和真实结束符。
+  lambda 的外层逗号或闭合符属于外层构造，不能因保留部分节点而被内层同步吃掉。
 - **C1（if/while/for）**：失败路径今天已消费整链（suite 照走），存活只改返回值，token 流不变。
 - **C2（assert/const/match 值）**：失败路径今天少消费（assert 不吃 `)` 不调 `endStatement`、const 不调
   `endStatement`）。存活后按**成功路径**消费：对良形尾部（`assert(1+, "msg")`、`const A = 1+`、`match 1+:`）
@@ -325,9 +303,8 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
   func 语句解析，存活后 `func(): pass` 被解析为 assert 的消息槽。这是对消费与归属的**有意改变**（消息槽
   拿到结构、减少裸 sync 丢弃），同样情形还有跨行消息与连续结束符；垃圾尾部（`assert(1+ @`）存活后
   closer 诊断 + `endStatement` 报错 + `synchronize` 吃残余，比今天多一条 `endStatement` 诊断（D10 接受）。
-- **super 三分支**（E11）：原 Phase 2 #2/#3 的专用门控公式被 D 门控与 Pratt 停折取代——`super. + 1` 中
-  受损链在循环头停折，`+ 1` 不续折，语句级非边界丢弃；`return super.`、`var x = super.` 由宿主槽位吸收；
-  `if super.:` 由 C1 存活。行为等价于原门控分析（含 lambda 内 `,`/`)`/`:` 情形）。
+- **super 三分支**（E11）：受损前缀仍带节点，与其他有值 outcome 共用续折和语句分派规则。`return super.`、
+  `var x = super.` 和 `if super.:` 保留前缀及其原发诊断。
 
 ### 5.3 其余护栏核对
 
@@ -350,17 +327,17 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
 
 | 编号 | 位置 | 断言要点 |
 |---|---|---|
-| T1 | `GdScriptParserErrorRecoveryTest` 新增 | `return 1+` → `value` 为 `BinaryExpression(1, MISSING("binary.right"))`，诊断恰好 1 条（内层 `+` 根因）；裸 `return`、`return 1`、`call(func(): return, 1)`（lambda 内零消费不产 marker 不新增诊断）、`return =3`（保持 value=null，仅 endStatement 诊断）为控制例 |
+| T1 | `GdScriptParserErrorRecoveryTest` 新增 | `return 1+` 保留二元表达式与右槽 MISSING，只有原发诊断；裸 `return`、`return 1`、`call(func(): return, 1)` 为健康对照；`return =3` 保留 ERROR 片段 |
 | T2 | 同上 | `var hp = 1+` → value 为带 MISSING 右槽的 BinaryExpression；`var hp =`+换行 → MISSING 零宽于 `=` 末端；`var hp = $/!!`（getNode `Failed`）→ ERROR 片段；健康 `var mp = 2` 兄弟不变 |
 | T3 | 同上 | `func f(x: int = 1+)` → 名/类型保留 + 受损默认值；`func f(x=)` → MISSING 零宽；`func f(x:=1)`、`func f(x)` 零诊断 |
 | T4 | 同上 | `@export_range(0, 1+, 2)` → 实参 `[0, BinaryExpression(1,MISSING), 2]` 三位置保留；`@export_enum("A", ,"B")` → 中位 MISSING；合法注解零诊断 |
-| T5 | 同上 | `[1,,3]` → 中位 MISSING；`{"a":}` → value MISSING 锚在 `:` 末端且包络自洽；`{:1}` → key MISSING 且 entry 起点前移到锚点；`{1+:2}` → key 为受损 BinaryExpression、entry start 断言；`{(a): 1}` 合法分组 key 的 entry 含 `(`（控制例，`GdScriptParserTest.java:1010-1017` 不回归）；`{:}` 双侧 Missing 仍丢 entry；`f()`/`f(1,)`/`[1,2,]` 零 marker 零诊断 |
+| T5 | 同上 | `[1,,3]` → 中位 MISSING；`{"a":}` → value MISSING 锚在 `:` 末端；`{:1}` → key MISSING；`{1+:2}` → 受损 BinaryExpression；`{(a): 1}` 的 entry 含 `(`；`{:}` 保留带两个 MISSING marker 的条目；空容器和尾逗号不制造伪条目 |
 | T6 | 同上（更新+新增） | 2C：`var hp = (1` → value 健康 Literal(1) + 缺 `)` 零宽诊断带 code `parse.missing_closer.grouping` 且 `recovery` 绑定该 VariableDeclaration/facet `variable.initializer`；`var cb = (func(): return 1` 绑定外层变量、`var cb = func(): return (1` 绑定内层 return（归属边界）；`target(1` EOF → CallExpression 存活 + 缺 `)` 诊断（现状锁定）；诊断不跨 serde 持久化的限制写入文档（§7 第 8 条） |
 | T7 | 新增范围不变量测试 | 恢复语料 + 合法 fixture 全 AST 递归断言 I3 包络（零宽等于父端点合法），含尾随空白/EOF/垃圾前缀用例与 `var x = f(, func(): return 1\n` 的 `extentEnd()` 特例；不许新增豁免 |
 | T8 | `AstSexprSerdeTest` 新增 | 含 ERROR/MISSING marker 的 AST serde 往返相等 |
 | T9 | `GdScriptParserTest` 更新+新增 | `self.b.(1)` → `CallExpression(callee=AttributeExpression(self,[b,Missing]))` 不折进 `b`；`self.p.[0]` 同理；`a.b(1)`/`a.b[0]`/`a. b`（空白合法）健康链形状不变；`a..(1)` 仍按单 token `..` 报错不误判 |
-| T10 | 同上 | `node.` EOF → `AttributeExpression(node,[Missing])`；`super.`/`super.ba` 在语句终止位存活；`super. var y = 1`（同行垃圾仍吞）、`super.ba + 1`（不续折）、`f(func(): super. + 1)`（停折不消费）、`f(func(): super., 1)`（`, 1)` 仍被 sync 吃掉，与今天一致）；lambda 单 NEWLINE 归属控制例与多结束符有意 delta（§5.2）逐条钉死 |
-| T11 | ~~删除~~ | D7 接受 `:` 缺类型零诊断，原 T11 不实施 |
+| T10 | 同上 | `node.` EOF 保留零宽缺名 step；`super.`/`super.ba` 保留前缀。受损语句可续折，同行尾垃圾交 `finishStatement`，lambda 外层分隔符仍交给其所有者 |
+| T11 | 类型槽位回归测试 | 已写但空的必选类型槽补发上下文诊断；非法非空类型保留可用片段或报告自己的根因，无重复缺类型诊断 |
 | T12 | 同上 | `func f(a: int = 1, b: int)` 两参数均在列表 + 顺序诊断保留；`func f(...args = 1+)` rest 带坏默认值：variadic 重建保留 default marker 与参数 range；含 lambda 默认值的 rest 参数范围不倒挂；`func f(...args = (1` 的缺 `)` RecoveryLink 绑到**重建后**的最终 Parameter（owner 身份可从最终 AST 到达，按 `assertSame` 语义校验） |
 | T13 | 既有恢复测试 | 全部通过（除 §6.2 登记项）；`@Timeout` 不触发；嵌套坏调用 `f(g(1+))`、lambda 默认值、`lambdaEnded` 边界、深度预算用例不回归 |
 | T14 | parity 测试组 | `GdParserParityTest`/`GdParityReferenceTest`/`GdFixtureParityAuditTest` 全绿（合法语料不进恢复分支） |
@@ -379,7 +356,7 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
      → 非 TYPE_POSITION（按表达式上下文分类） |
 | T18 | `GdScriptParserErrorRecoveryTest` 新增 | C1：`if 1+: pass`、`while : pass`、`for x in : pass` 语句带 marker 存活且 body/兄弟归属不变；C2：`assert(1+, "msg")`、`assert(true, 1+)`、`const A = 1+`、`match 1+:\n\t1: pass` 存活且消费尾部；C2 同步集早停差异：`assert(1+, func(): pass)` 的 `func(): pass` 进消息槽（今天 sync 在 `func` 前停）；熔断口径：`func f():\n` + 150 行 `)` 仍报 Too many statement errors，另加健康/失败语句交错用例（累计计数不被健康语句重置、第 102 次 null 触发） |
 | T19 | 同上 | 3A：`match x:\n\t1 when : pass` guard marker；`enum E { A =, B }` value marker + memberEnd 包住 marker；`if a: pass\nelif : pass` 受损 elif 保留 body；`match x:\n\t{1+: 1}: pass` 受损 key 保留 entry；`match x:\n\t{1+}: pass` 无载体整体 ERROR 回退且 key-only 警告不发；`match x:\n\t{1+, 2: 3}: pass` 混合 entry 整 pattern 回退；`match x:\n\t{1+ var x: 3}: pass` 无逗号尾部按逗号循环停在 `var`，回退片段覆盖 `{1+`、缺 `}` 诊断照发、残余由 section 冒号恢复消化（勘误：原写的 `{1+ 2: 3}` 中 `1+ 2` 折叠为健康二元 key，不触发该路径，实施时按机制语义替换输入） |
-| T20 | 同上 | 协议定向：`foo(1+)\nvar y`（停折+兄弟存活）、`a[1+]+2`、`(1+)+2`、`foo(1+, [2+])`、`foo([1+])`（吸收宿主不冒泡）、`foo(1+).bar` 与 `foo(1+)(2)`、`a[1+][2]`（受损实参/索引后链内停折，后续 suffix 不消费）、`foo(1+, func(): pass)`（lambda 边界）、`var x = func(a = 1+): pass + 2`（`+ 2` 不折进 lambda）、`super(1+)+2`（停折）、`var x = ()` 与 `var x = (\n`（分组纯 Missing 分支，不消费 `)`）、`var x = a = 1`/`var x = a =`/`return a =`（赋值 `!canAssign` 降级：不建 AssignmentExpression、`a =` 的 RHS Missing 改发 Failed 不双报）、深度预算边界含空白（不抛异常、I3 成立） |
+| T20 | 同上 | `foo(1+)` 保留后续兄弟；`a[1+]+2`、`(1+)+2`、`foo([1+]).bar`、`foo(1+).bar` 和 `a[1+][2]` 保留续折；`foo(1+)(2)` 还报告外层非法直接调用。lambda 边界、空分组、嵌入式非法赋值节点及深度预算均检查原发诊断与节点范围 |
 | T21 | 同上 | serde 往返覆盖新形状（带 marker 的调用/链/三元/字典 pattern 回退片段） |
 
 ### 6.2 需要更新的既有测试（登记理由）
@@ -456,40 +433,46 @@ marker 范围统一以**该侧失败点**的 `extentEnd()` 为基准（§2.2）�
 
 | 类别 | 位点 | 原行为 | 新编码 |
 |---|---|---|---|
-| A（宿主存活槽位） | 变量/参数默认/注解/数组/字典列表槽 | 宿主存活、槽位 null | `absorbSlot` 填 marker（return 例外，走 S1 三路开关） |
-| B（表达式内部传播点） | 分组/实参/下标/操作数/await/preload/super | null 上浮 = 停折信号 | 非 `Ok` outcome 上浮 = 停折信号（§8.2.3） |
+| A（宿主存活槽位） | 变量/参数默认/注解/数组/字典列表槽 | 宿主存活、槽位 null | `absorbSlot` 保留节点或填 marker；表达式吸收宿主报告 `EnclosedDamage`，return 例外见 S1 |
+| B（表达式内部传播点） | 分组/实参/下标/操作数/await/preload/super | null 上浮 = 停折信号 | 有值结果保留损伤并可续折；无值结果停折（§8.2.3） |
 | C1（失败后仍消费整链） | if/while/for 头部 | 吃完 suite 返回 null | 带 marker 存活（S5） |
 | C2（失败提前返回） | assert/const/match 值/match pattern | 提前 return null | 带 marker 存活 + 消费成功路径尾部（S6-S9，D10） |
 | C3（宿主存活仅丢槽） | guard/enum 值/elif/字典 pattern key | 置 null/丢槽 | 槽位 marker（S10/S11/S13/S14，3A） |
 | D（语句级分派） | 表达式语句 1281-1302 | null → drop+熔断 | 按 outcome 门控（§8.2.4） |
 
-lambda 前缀恒 `Ok`（内部损伤被签名默认值槽与 body 语句自身吸收）；`cast`/`is`/`?` 失败返回 left
-（诊断已存在）编码为 `Ok(left)` 的降级成功。
+lambda 头部健康时返回 `Ok`；签名自身或返回类型有词法或结构损伤时，保留节点并返回 `Damaged`。
+返回类型诊断仍由其槽位持有，函数体的恢复不改变前缀结果。`as`/`is` 的类型失败和非法 `?`
+保留左操作数与原发诊断，返回 `Damaged`，不降级为健康左操作数。
 
 #### 8.2.2 `ParseOutcome<T>` 类型与机械化规则
 
-新建包私有密封接口 `frontend/gdscript/ParseOutcome.java`：
+包私有密封接口 `frontend/gdscript/ParseOutcome.java`：
 
 ```java
 sealed interface ParseOutcome<T> {
     record Ok<T>(T value) implements ParseOutcome<T> {}        // 健康节点
+    record EnclosedDamage<T>(T value) implements ParseOutcome<T> {} // 结构完整，子树受损
     record Missing<T>() implements ParseOutcome<T> {}          // 零消费失败，未推诊断
     record Failed<T>() implements ParseOutcome<T> {}           // 已推诊断，无节点（通常有消费；深度预算拒绝时为零消费）
     record Damaged<T>(T value) implements ParseOutcome<T> {}   // 部分节点，已推诊断
 }
 ```
 
-- **诊断携带合同**：`Missing` 由槽位宿主补发本槽位上下文消息（I4）；`Failed`/`Damaged` 的根因已在内部
-  推过，宿主不得再发泛化消息。`valueOrNull()`/`valueOrThrow()` 供确知携带值的宿主（如实参列表）使用。
+- **诊断携带合同**：`Missing` 由槽位宿主补发上下文消息（I4）；`Failed`、`Damaged` 与
+  `EnclosedDamage` 的根因已在内部报告。`valueOrThrow()` 只供一定携带值的路径使用（如实参列表）。
 - **`slotMarker(outcome, slotStartByte, slotName)`**：`Missing` → `ErrorExpression(MISSING, slotName, "",
   [extentEnd(), extentEnd()))`；`Failed` → `ErrorExpression(ERROR, "ERROR", slice, [min(slotStart, end), end))`
   其中 `end = extentEnd()`——`Failed` 允许零消费（深度预算拒绝发生在任何消费之前，`extentEnd()` 可以落在
   `slotStart` 之前），此时退化为 `[extentEnd(), extentEnd())` 零宽片段，不构造倒置区间（`SourceTextIndex`
   拒绝 `start > end`）。不触碰游标。
-- **`absorbSlot(outcome, slotStartByte, slotName, contextMessage)`**：`Ok`/`Damaged` → 返回节点；
-  `Missing` → 补发 contextMessage（带 code）+ MISSING marker；`Failed` → ERROR 片段。统一实施 I4。
-  **例外**：`return` 值槽不走 `absorbSlot`（S1 特判：`Missing` 保持 null 且不诊断）；`parseCallArguments`/
-  下标索引自行展开 switch（损伤须传播给调用节点，E12/E13）。
+- **`absorbSlot(outcome, slotStartByte, slotName, contextMessage)`**：`Ok`、`EnclosedDamage`、`Damaged`
+  直接保留节点；`Missing` 补发上下文消息并建零宽 marker，`Failed` 保留 ERROR 片段。已有归属的词法片段优先保留。
+  `return` 用自己的值槽规则（S1）；调用/下标槽用 `absorbSlot` 保留值，同时用原 outcome 计算宿主损伤。
+- **类型槽**：内部 `ParseOutcome<ParsedType>` 同时保留 `TypeRef` 与容器标识，公开结构不变。`Missing` 由调用方
+  补发相应 `MISSING_TYPE_*`；`Failed`（空泛型实参、非法 `void`、预算拒绝等）不补发。带点号的残片与未闭合泛型
+  返回 `Damaged`，已闭合但含非法内层容器或坏内层类型时返回 `EnclosedDamage`。实际消费的类型 token 或闭合符
+  上结算的词法错误也保留为损伤。`for` 类型非 `Ok` 时仅在物理同行跳过坏 token，可匹配同一逻辑头已可见的 `in`，
+  包括显式续行；保留祖先分隔符、真正的套件冒号和 lambda 边界。
 - **marker 槽位词汇**（MISSING 的 `nodeType`，同时是 `RecoveryLink.facet` 的候选值）：
   `variable.initializer`、`constant.value`、`parameter.default`、`return.value`、`annotation.argument`、
   `array.element`、`dictionary.key`、`dictionary.value`、`call.argument`、`subscript.index`、`grouping`、
@@ -507,26 +490,22 @@ sealed interface ParseOutcome<T> {
 
 #### 8.2.3 传播、停折与后缀链
 
-- **Pratt 停折点唯一**：循环头在「`left` 非 `Ok`」时返回该 outcome（与今天 null 停折逐点等价），
-  `infix()==null`/`lambdaEnded`/`stopOnAssign && EQUAL` 三子条件原样保留。前缀 `Missing`/`Failed` 直接
-  上浮（不进入折叠）。后缀续折在链内判定，不回到循环头——链内规则分两种：缺名点号追加
-  `MissingAttributeStep` 后**继续**（`self.b.(1)` 的 `.(1)` 与缺名点号在同一链调用内）；实参/索引受损则
-  清理、建节点、**立刻返回 `Damaged`**，不消费后续 suffix（`foo(1+).bar` 的 `.bar` 留给外层停折/sync，
-  与今天 null 上浮等价）。
-- **传播父节点**（二元/`not in`/一元/三元/赋值/await/preload）：子槽 `absorbSlot` 后建成现有节点，
-  任一子槽非 `Ok` → 整节点 `Damaged`；右端 `extentEnd()`。**赋值的 `!canAssign` 分支例外**（字典 key、
-  实参、pattern 等禁止赋值上下文）：保持今天的降级——只推「Assignment is not allowed」诊断并直接返回
-  右部 outcome，不建 `AssignmentExpression`；但右部为 `Missing` 时须改发 `Failed`（`a =` 已消费且诊断
-  已推，透传 `Missing` 会让外层宿主误补泛化消息），右部 `Ok`/`Failed`/`Damaged` 原样透传。
-- **分组**（E5 三分支）：内层 `Ok` 保持解包返回；`Damaged` 原样上浮；`Missing`/`Failed` 落成
-  `Damaged(slotMarker)`；失败两分支均不消费 `)`（vendor 同）。
-- **吸收宿主**（数组/字典/注解/语句槽位）：marker/受损子节点入槽，宿主恒健康（`Ok`/存活），
-  不向外层冒泡——`foo([1+])`、`[1+, 2] + 3` 的折叠行为与今天一致。**实参列表与下标索引不是吸收宿主**
-  （E12/E13）：损伤传播给调用/下标节点并在链内建后即返。
-- **后缀链**（E12）：缺名点号产 `MissingAttributeStep`（点号末端零宽）并标 `damaged`；Missing 末步使
-  后续 `(`/`[` 不再折到前一属性 step（`self.b.(1)` → `CallExpression(callee=AttributeExpression(self,
-  [b, Missing]))`）；实参/索引受损 → `Damaged`；调用/下标节点右端统一 `extentEnd()`（不是成功路径的
-  `previous.endByte()`——尾部 lambda 场景两者不同，见 §2.2）。
+- **Pratt 停折**：`Missing`/`Failed` 无值，直接传播。其他三态都可在已有优先级、结构、预算、lambda 与
+  赋值守卫下续折；左侧已有的 `Damaged` 不因新运算符而变成 `EnclosedDamage` 或 `Ok`。
+- **传播父节点**：未定界的操作数保持已有损伤；运算符自身缺项（如 `not in` 缺 `in`、三元缺 `else`）
+  或操作数仍不完整，返回 `Damaged`。禁止嵌入的赋值仍建 `AssignmentExpression`，保留左右子树并返回
+  `Damaged`；右槽缺失另用 `assignment.value` marker。对 `as`/`is`，坏类型使其表达式为 `Damaged`，
+  有类型片段保留 `TypeRef`，无片段用 `RecoveredInfixExpression`。
+- **分组**：由自己结算 `)`，无自身损伤且实际闭合时透明地继承内层的有值 outcome；括号不引入新 AST 宿主。
+  因此 `(1+)` 仍为 `Damaged`，`([1+])` 继承 `EnclosedDamage`；坏闭合符、内层无值，或分组入口或闭合符
+  上的词法错误均使分组返回 `Damaged`。
+- **吸收宿主**：数组、字典、调用和下标将失败子槽保留为 marker 或部分节点。自身结构完整且实际闭合时
+  返回 `EnclosedDamage`，而不是 `Ok`；真实闭合符或分隔符上结算的子槽尾部词法错误同样保留。坏闭合、缺分隔符
+  或混用字典分隔风格是本层结构错误，返回 `Damaged`。Lua 字典键仅检查
+  具有完整外形的 `Ok`/`EnclosedDamage`，因此 `[1+]` 和 `foo(1+)` 作为 Lua 键仍非法，`(1+)` 不二次报错。
+- **后缀链**：缺名点号以零宽 `MissingAttributeStep` 保留并标记外露损伤；后续 `(`/`[` 不折向前一个属性
+  step，但链可在守卫允许时继续。闭合的调用/下标吸收子损伤，如 `foo([1+]).bar` 和 `foo(1+).bar` 都续折。
+  调用与下标的范围右端包含实际消费和子节点末端，`finishChain` 取最后一个 step 的末端。
 - **super**（E11 三分支存活）：receiver 与已知名前缀保留在 AST 中供补全锚定。
 - **getNode**：路径形状失败 → `Failed`（片段由宿主槽位落成 ERROR）。
 
@@ -534,19 +513,11 @@ sealed interface ParseOutcome<T> {
 
 `parseStatement` 的表达式分支按 outcome 分派：
 
-- `Missing`：今天的 null 路径逐字不变（lambda 内置 `lambdaEnded` 不消费；非 lambda `advance()` + 报错）；
-  `result = null` 计入熔断。
-- `Failed`：复用同一条 null 路径的状态转换，只省掉泛化诊断（根因已在内部推过）——lambda 内置
-  `lambdaEnded`；非 lambda 一律按 EOF 守卫 `advance()` 一次（同步边界与今天逐 token 一致：`super. var y = 1`
-  的 `var` 必须被吃掉，不能留给 sync 早停而解析成新声明；深度预算置位时同样推进，见 §3.2 的空转论证）；
-  `result = null`，不调 `endStatement`，计入熔断。
-- `Damaged`：**仅当 `isStatementEndToken() || lambdaEnded`**（真边界 NEWLINE/SEMICOLON/EOF 或已置位的
-  lambda 虚拟边界）时存活为 `ExpressionStatement`（照调 `endStatement`、绑定 owner frame、**不计入**熔断）；
-  否则按 `Failed` 同一条丢弃路径处理（lambda 置位 / 非 lambda 一律推进一次 + sync；不补诊断、不调
-  `endStatement`，计入熔断）。
-  注意 `isStatementEnd()` 在 lambda 内因 `inLambda` 恒真，**不能**作为门控——否则 `f(func(): super. + 1)`
-  的受损语句会存活并让 `endStatement` 吃掉本不属于自己的边界；门控用真边界判定后，`+` 处仍丢弃并 sync，
-  与今天一致。
+- `Missing`：无法建立表达式语句；非 lambda 终止边界时推进并报告上下文错误，null 计入熔断。
+- `Failed`：无法建立表达式语句；原发诊断已存在，不再补发。遇 lambda 虚拟边界时不消费，否则以 EOF 为守卫
+  推进并交给同步；null 计入熔断。
+- `Ok`、`EnclosedDamage`、`Damaged`：统一保留 `ExpressionStatement` 并绑定 owner，由 `finishStatement`
+  结算语句结束或报告残余尾部；非空节点不计入熔断。
 - C1/C2/3A 存活语句返回节点，不计入熔断。熔断是**每个 suite 累计**的 `errorCount++ > 100`（第 102 次 null
   触发），健康语句**不**重置计数；阈值与 `nestingBudgetExceeded` 短路不变。
 
@@ -579,34 +550,35 @@ sealed interface ParseOutcome<T> {
 
 ### 8.4 缺闭合符诊断（2C，D8）
 
-- **位点与 code**：分组（`parseGroupingExpression`）、数组、字典、调用实参（`parseCallArguments`）、下标、
-  注解实参、preload、assert——共 8 处 closer，分别配 `parse.missing_closer.*` code。
-- **形状**：零宽诊断 `[extentEnd(), extentEnd())`（失败点），`panicMode` 照常置位；不算槽位损伤
-  （`parseCallArguments` 缺 `)` 不使列表 `Damaged`）。
+- **位点与 code**：分组、数组、字典、调用实参、下标、注解实参、preload、assert 和类型括号等使用各自的
+  `parse.missing_closer.*` / `parse.mismatched_closer.*` code。
+- **形状**：缺闭合在 `[extentEnd(), extentEnd())` 报零宽诊断；错闭合诊断覆盖真实 token。对返回 outcome 的
+  表达式与类型，这类诊断表示当前层结构损伤，不等同于已闭合的子槽损伤。
 - **归属**：诊断发出时记入**最内层打开的 owner frame**；frame 在槽位解析前 push、该槽位表达式解析完立即
   pop 暂存（先 pop 后进 suite，防止 body 诊断误绑头部 facet）、owner 节点建成时绑定（`RecoveryLink(owner,
-  facet)`）；owner 未建成（语句被丢）的 frame 直接丢弃，诊断留 code+range 走 §7 第 1 条判据 (b)。
+  facet)`）。若 owner 未保留，则只沿显式授权链查找支持该 code 的存活 owner/facet，不向任意外层构造回绑。
 - **配对的位点细则**：
   - assert 的条件/消息 frame 在各自 `parseExpression` 后 pop；assert 自身的 `)` 闭合符诊断落在另一个覆盖
     整个实参区的 `assert.arguments` frame（条件/消息 frame pop 后它仍是最内层），建成 AssertStatement 时绑定。
   - 注解实参的 frame 绑到 `AnnotationStatement` 自身（facet `annotation.arguments`）——注解解析时还没有
     被注解的声明，不能绑给后到的声明。
   - 参数默认值的 frame **延迟到签名最终接纳该参数时再绑定**：rest 参数的 variadic 重建会替换 Parameter 节点，
-    frame 随之迁移到重建后的节点；任何最终被丢弃的参数其 frame 一并丢弃（§7 第 8 条的同代身份要求 owner 必须
-    在最终 AST 中可按身份到达）。
+    frame 随之迁移到重建后的节点；最终被丢弃的参数不再作为 owner，但其 frame 保留到签名的授权路径
+    （§7 第 8 条的同代身份要求 owner 必须在最终 AST 中可按身份到达）。
   - enum 值开 `enum.value` frame，绑到建成的 `EnumMember`；match pattern 列表开 `match.pattern` frame，
     绑到建成的 `MatchSection`。
+  - `as`/`is` 中类型括号沿用当前表达式槽位归属；若没有外层 recovery frame，则在操作符处开启
+    `type.argument` 并绑定到实际保留的中缀节点。
 - **归属边界用例**（T6）：`var cb = (func(): return 1` 的缺 `)` 绑外层变量初始化器；
   `var cb = func(): return (1` 的缺 `)` 绑内层 return 值——几何位置相同的两个诊断按 owner 栈区分。
 - **owner facet 词汇**（开 frame 的位点）：`variable.initializer`、`constant.value`、`parameter.default`、
   `return.value`、`assert.condition`、`assert.message`、`assert.arguments`、`match.value`、`match.guard`、
   `match.pattern`、`if.condition`、`elif.condition`、`while.condition`、`for.iterable`、`enum.value`、
   `expression`（表达式语句）、`annotation.arguments`。
-- **可达性清扫**：`parse()` 返回前按对象身份遍历最终 AST 建立可达 Node 集合，对 owner 不可达的
-  `RecoveryLink` 清空 `recovery`（保留 code/range/message，不回绑外层 owner）——覆盖「延迟绑定后祖先
-  构造仍被丢弃」的情形（如 `func f(x, x = func(): return (1` 的重复参数被丢后，内层 return 上已绑定的
-  缺 `)` link 失效）。验收：T6/T12 统一断言每个非空 `recovery.owner` 都能从最终 AST 按身份（`assertSame`
-  语义）到达。
+- **可达性清扫**：`parse()` 返回前按对象身份遍历最终 AST 建立可达 Node 集合。`func f(x, x = func(): return (1`
+  的重复参数被丢后，分组缺 `)` 的诊断沿 lambda 套件和默认值帧回退到存活函数的 `function.signature`；
+  没有合法授权目标时才清空链接（保留 code/range/message）。验收：每个非空 `recovery.owner` 都能从最终 AST
+  按身份（`assertSame` 语义）到达。
 
 ### 8.5 C3 槽位 marker（3A，D9）
 
@@ -629,7 +601,7 @@ sealed interface ParseOutcome<T> {
 | 批次 | 内容 | 触及文件 | 验证 |
 |---|---|---|---|
 | B0 | 基础设施：`ParseOutcome`、`DiagnosticCodes`、`RecoveryLink`、`AstDiagnostic` 扩展；parser 助手（code 重载、`pushMissingCloser`、`slotMarker`、`absorbSlot`、owner frame 栈 + `parse()` 重置） | `frontend/gdscript/ParseOutcome.java`（新）、`DiagnosticCodes.java`（新）、`frontend/ast/RecoveryLink.java`（新）、`AstDiagnostic.java`、`GdScriptParser.java`（助手区） | `./gradlew classes --no-daemon --console=plain` |
-| B1 | Pratt 核心：`PrefixRule`/`InfixRule` 签名、`parseExpression`/`parsePrecedence` outcome 化、循环头停折、终端前缀与 lambda 前缀 `Ok` | `GdScriptParser.java` | 同编译单元，不单独编译 |
+| B1 | Pratt 核心：`PrefixRule`/`InfixRule` 签名、`parseExpression`/`parsePrecedence` outcome 化、循环头停折、终端前缀 `Ok` 与 lambda 前缀按头部结果返回 `Ok` 或 `Damaged` | `GdScriptParser.java` | 同编译单元，不单独编译 |
 | B2 | 传播父节点与前缀：分组/数组/字典（删 `nullPlaceholder`）/getNode/preload/await/一元/二元/`not in`/三元/cast/`is`/`?`/赋值（E3-E10、E14 的索引槽） | 同上 | 同上 |
 | B3 | 后缀链与 super：E11/E12/E13（MissingAttributeStep 障碍、`extentEnd()` 右端、实参列表 outcome） | 同上 | 同上 |
 | B4 | 吸收语句槽 + 参数顺序：S1-S4、S14（enum 值）、S12（参数顺序，与 S3 同批耦合） | 同上 | 同上 |
