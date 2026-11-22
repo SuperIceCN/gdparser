@@ -60,6 +60,8 @@ import dev.superice.gdparser.frontend.cst.CstIssueKind;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 
@@ -2119,6 +2121,236 @@ class GdScriptParserTest {
         assertFalse(good.isStatic());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"", "var prefix = 1\n", "class C:\n", "func f():\n"})
+    void statementAnnotationCrossesStandaloneDirectiveInSourceOrder(String prefix) {
+        var sequence = """
+                @warning_ignore("unused_variable")
+                @warning_ignore_start("unreachable_code")
+                var a = 1
+                @warning_ignore_restore("unreachable_code")
+                """;
+        var source = prefix + (prefix.endsWith(":\n") ? sequence.replaceAll("(?m)^(?=.)", "\t") : sequence);
+        var root = cleanAst(source).statements();
+        var statements = switch (root.getFirst()) {
+            case ClassDeclaration klass -> klass.body().statements();
+            case FunctionDeclaration fn -> fn.body().statements();
+            default -> root.subList(prefix.isEmpty() ? 0 : 1, root.size());
+        };
+        assertEquals(4, statements.size());
+        assertEquals("warning_ignore", assertInstanceOf(AnnotationStatement.class, statements.get(0)).name());
+        assertEquals("warning_ignore_start", assertInstanceOf(AnnotationStatement.class, statements.get(1)).name());
+        assertEquals("a", assertInstanceOf(VariableDeclaration.class, statements.get(2)).name());
+        assertEquals("warning_ignore_restore", assertInstanceOf(AnnotationStatement.class, statements.get(3)).name());
+    }
+
+    @Test
+    void classMemberAnnotationCrossesExportGroupsAndKeepsTriviaInSourceOrder() {
+        var source = """
+                class C:
+                    @export # export the next field
+                    @custom
+                    "documentation" # docstring trailing comment
+                    # Categories do not consume the pending @export.
+                    @export_category("Stats")
+                    @export_group("Movement")
+                    @export_subgroup("Turning") # subsection
+                    var speed = 1
+                """;
+        var klass = assertInstanceOf(ClassDeclaration.class, onlyStatement(cleanAst(source)));
+        var body = klass.body().statements();
+        assertEquals(List.of("export", "custom", "export_category", "export_group", "export_subgroup"),
+                body.stream().filter(AnnotationStatement.class::isInstance)
+                        .map(AnnotationStatement.class::cast).map(AnnotationStatement::name).toList());
+        assertEquals(List.of(
+                        "@export", "# export the next field", "@custom", "# docstring trailing comment",
+                        "# Categories do not consume the pending @export.",
+                        "@export_category(\"Stats\")", "@export_group(\"Movement\")", "@export_subgroup(\"Turning\")",
+                        "# subsection", "var speed = 1"),
+                body.stream().map(stmt -> source.substring(stmt.range().startByte(), stmt.range().endByte())).toList());
+    }
+
+    @Test
+    void annotationPublishedBeforeDirectiveStaysOutOfLambdaArgumentSuite() {
+        var source = """
+                @warning_ignore("unused_variable")
+                @warning_ignore_start("unreachable_code")
+                @custom(func():
+                    @warning_ignore("unused_variable")
+                    var inner = 1
+                )
+                var outer = 1
+                @warning_ignore_restore("unreachable_code")
+                """;
+        var root = cleanAst(source).statements();
+        assertEquals(5, root.size());
+        assertEquals("warning_ignore", assertInstanceOf(AnnotationStatement.class, root.getFirst()).name());
+        assertEquals("warning_ignore_start", assertInstanceOf(AnnotationStatement.class, root.get(1)).name());
+        var custom = assertInstanceOf(AnnotationStatement.class, root.get(2));
+        assertEquals("custom", custom.name());
+        var lambda = assertInstanceOf(LambdaExpression.class, custom.arguments().getFirst());
+        var inner = lambda.body().statements();
+        assertEquals(2, inner.size());
+        assertEquals("warning_ignore", assertInstanceOf(AnnotationStatement.class, inner.getFirst()).name());
+        assertEquals("inner", assertInstanceOf(VariableDeclaration.class, inner.getLast()).name());
+        assertEquals("outer", assertInstanceOf(VariableDeclaration.class, root.get(3)).name());
+        assertEquals("warning_ignore_restore", assertInstanceOf(AnnotationStatement.class, root.getLast()).name());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {256, 512, 1024, 2048})
+    void pendingAnnotationsAcrossLambdaArgumentsUseLinearWork(int groups) {
+        var parser = new GdScriptParser();
+        var source = "@custom(func(): pass)\n@export_group(\"Stats\")\n".repeat(groups) + "var x = 1\n";
+        var result = parser.parse(source);
+        assertEquals(List.of(), result.diagnostics());
+        var statements = result.ast().statements();
+        assertEquals(2 * groups + 1, statements.size());
+        assertEquals("x", assertInstanceOf(VariableDeclaration.class, statements.getLast()).name());
+        for (var i = 0; i < 2 * groups; i += 2) {
+            var custom = assertInstanceOf(AnnotationStatement.class, statements.get(i));
+            assertEquals("custom", custom.name());
+            var lambda = assertInstanceOf(LambdaExpression.class, custom.arguments().getFirst());
+            assertInstanceOf(PassStatement.class, lambda.body().statements().getFirst());
+            assertEquals("export_group", assertInstanceOf(AnnotationStatement.class, statements.get(i + 1)).name());
+        }
+        // Per group: 2 scope transfers, 1 pending insert, 2 trailing-comment checks,
+        // at most 2 suffix reads, 4 publication steps (2 merge reads, 1 read + 1 write to
+        // mark it published) and 5 final steps (validation, 2 merge reads, settlement, clear).
+        // The prefix exit visits and updates one entry, and the target checks its start once.
+        var limit = 16L * groups + 3;
+        var steps = parser.annotationWorkSteps();
+        assertTrue(steps > 0 && steps <= limit, () -> "annotation steps: " + steps + ", limit: " + limit);
+        assertEquals(List.of(), parser.parse("var fresh = 1\n").diagnostics());
+        assertEquals(0, parser.annotationWorkSteps());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"class C:", "class Outer:\n\textends OuterBase\n\tclass C:", "class C extends A:"})
+    void nestedClassRetainsFirstExtendsAndFollowingMember(String header) {
+        var outer = header.startsWith("class Outer:");
+        var indent = outer ? "\t\t" : "\t";
+        var inline = header.endsWith(" A:");
+        var source = header + "\n"
+                + (inline ? "" : indent + "extends A\n\n" + indent + "# between\n")
+                + indent + "extends B\n"
+                + indent + "var ok = 1\n"
+                + "var after = 2\n";
+        var result = parse(source);
+        var root = result.ast().statements();
+        assertEquals(2, root.size());
+        var owner = assertInstanceOf(ClassDeclaration.class, root.getFirst());
+        if (outer) {
+            assertEquals("OuterBase", owner.extendsTarget());
+            owner = assertInstanceOf(ClassDeclaration.class, owner.body().statements().getFirst());
+        }
+        assertEquals("C", owner.name());
+        assertEquals("A", owner.extendsTarget());
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, owner.body().statements().getLast()).name());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, root.getLast()).name());
+        assertEquals(1, result.diagnostics().size(), () -> result.diagnostics().toString());
+        var diagnostic = result.diagnostics().getFirst();
+        assertEquals(DiagnosticCodes.CLASS_DUPLICATE_EXTENDS, diagnostic.code());
+        assertSame(owner, requireNotNull(diagnostic.recovery()).owner());
+        assertEquals("class.extends", diagnostic.recovery().facet());
+        assertEquals(source.indexOf("extends B"), diagnostic.range().startByte());
+        assertEquals(source.indexOf("extends B") + "extends".length(), diagnostic.range().endByte());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+    }
+
+    @Test
+    void malformedFirstBodyExtendsOccupiesSlotEvenAtDedent() {
+        var source = """
+                class C:
+                    extends 1
+                    extends B
+                    extends C
+                var after = 1
+                """;
+        var result = parse(source);
+        var root = result.ast().statements();
+        var klass = assertInstanceOf(ClassDeclaration.class, root.getFirst());
+        assertEquals("1", klass.extendsTarget());
+        assertTrue(klass.body().statements().isEmpty());
+        assertEquals(2, root.size());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, root.getLast()).name());
+        var diagnostics = result.diagnostics();
+        assertEquals(List.of(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, DiagnosticCodes.CLASS_DUPLICATE_EXTENDS,
+                DiagnosticCodes.CLASS_DUPLICATE_EXTENDS), diagnostics.stream().map(AstDiagnostic::code).toList());
+        for (var diagnostic : diagnostics) {
+            assertSame(klass, requireNotNull(diagnostic.recovery()).owner());
+            assertEquals("class.extends", diagnostic.recovery().facet());
+            assertTrue(diagnostic.range().endByte() <= klass.range().endByte());
+        }
+        assertEquals(List.of("1", "extends", "extends"), diagnostics.stream()
+                .map(d -> source.substring(d.range().startByte(), d.range().endByte())).toList());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+    }
+
+    @Test
+    void recoveringDuplicateExtendsDoesNotConsumeTheNextAnnotatedClassItem() {
+        var source = """
+                class C:
+                    extends A
+                    extends B junk
+                    @export pass
+                    var ok = 1
+                """;
+        var result = parse(source);
+        var klass = assertInstanceOf(ClassDeclaration.class, onlyStatement(result.ast()));
+        var members = klass.body().statements();
+        assertEquals(3, members.size());
+        var export = assertInstanceOf(AnnotationStatement.class, members.getFirst());
+        assertInstanceOf(PassStatement.class, members.get(1));
+        assertEquals("ok", assertInstanceOf(VariableDeclaration.class, members.getLast()).name());
+        var diagnostics = result.diagnostics();
+        assertEquals(List.of(DiagnosticCodes.CLASS_DUPLICATE_EXTENDS, DiagnosticCodes.STATEMENT_TRAILING,
+                DiagnosticCodes.ANNOTATION_DANGLING), diagnostics.stream().map(AstDiagnostic::code).toList());
+        assertSame(klass, requireNotNull(diagnostics.getFirst().recovery()).owner());
+        assertEquals("class.extends", diagnostics.getFirst().recovery().facet());
+        assertSame(export, requireNotNull(diagnostics.getLast().recovery()).owner());
+        assertEquals("annotation.target", diagnostics.getLast().recovery().facet());
+        assertEquals(List.of("extends", "junk", "@export"), diagnostics.stream()
+                .map(d -> source.substring(d.range().startByte(), d.range().endByte())).toList());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+    }
+
+    @Test
+    void inlineClassSuperclassSectionContinuesAfterSemicolonButNotNewline() {
+        var source = "class C: extends A; extends B; pass\n";
+        var result = parse(source);
+        var klass = assertInstanceOf(ClassDeclaration.class, onlyStatement(result.ast()));
+        assertEquals("A", klass.extendsTarget());
+        assertEquals(1, klass.body().statements().size());
+        assertInstanceOf(PassStatement.class, klass.body().statements().getFirst());
+        assertEquals(1, result.diagnostics().size());
+        var duplicate = result.diagnostics().getFirst();
+        assertEquals(DiagnosticCodes.CLASS_DUPLICATE_EXTENDS, duplicate.code());
+        assertSame(klass, requireNotNull(duplicate.recovery()).owner());
+        assertEquals("class.extends", duplicate.recovery().facet());
+        assertEquals(source.indexOf("extends B"), duplicate.range().startByte());
+        assertEquals(source.indexOf("extends B") + "extends".length(), duplicate.range().endByte());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+
+        for (var terminator : List.of("\n", ";\n")) {
+            var dedentedSource = "class C: extends A" + terminator + "extends B\n";
+            var dedented = parse(dedentedSource);
+            var inline = assertInstanceOf(ClassDeclaration.class, onlyStatement(dedented.ast()));
+            assertEquals("A", inline.extendsTarget());
+            assertTrue(inline.body().statements().isEmpty());
+            // A root `extends` after a member is invalid, but is not owned by the inline class.
+            assertEquals(1, dedented.diagnostics().size());
+            var rootError = dedented.diagnostics().getFirst();
+            assertEquals(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, rootError.code());
+            var rootExtends = dedentedSource.lastIndexOf("extends");
+            assertEquals(rootExtends, rootError.range().startByte());
+            assertEquals(rootExtends + "extends".length(), rootError.range().endByte());
+            assertNull(rootError.recovery());
+            assertTrue(inline.range().endByte() <= rootExtends);
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(dedentedSource, dedented, () -> dedentedSource);
+        }
+    }
+
     @Test
     void sameLineExtendsCountsTowardDuplicateCheck() {
         var errors = errorMessages(parse("class_name C extends A\nextends B\n"));
@@ -2954,12 +3186,65 @@ class GdScriptParserTest {
         assertEquals(DiagnosticCodes.LAMBDA_BARE_STATEMENT, typed.diagnostics().getFirst().code());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"func(): pass", "(func(): pass)", "((func(): pass))", "(func named():\n\t\tpass\n\t)"})
+    void bareLambdaDiagnosticUsesTheFinalExpressionShape(String expression) {
+        var source = "func f():\n\t" + expression + "\n\tpass\n";
+        var result = parse(source);
+        var fn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(result.ast()));
+        var statements = fn.body().statements();
+        assertEquals(2, statements.size());
+        var statement = assertInstanceOf(ExpressionStatement.class, statements.getFirst());
+        var lambda = assertInstanceOf(LambdaExpression.class, statement.expression());
+        assertEquals(expression.contains("named") ? "named" : null, lambda.name());
+        assertInstanceOf(PassStatement.class, lambda.body().statements().getFirst());
+        assertInstanceOf(PassStatement.class, statements.getLast());
+        assertEquals(1, result.diagnostics().size(), () -> result.diagnostics().toString());
+        var diagnostic = result.diagnostics().getFirst();
+        assertEquals(DiagnosticCodes.LAMBDA_BARE_STATEMENT, diagnostic.code());
+        assertEquals(lambda.range(), diagnostic.range());
+        assertEquals(11 + expression.indexOf("func"), diagnostic.range().startByte());
+        assertEquals(11 + expression.indexOf("pass") + "pass".length(), diagnostic.range().endByte());
+        assertSame(statement, requireNotNull(diagnostic.recovery()).owner());
+        assertEquals("expression", diagnostic.recovery().facet());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+    }
+
+    @Test
+    void groupedLambdaUsedAsAValueIsNotABareStatement() {
+        var source = """
+                func f():
+                    (func(): pass).call()
+                    var g = (func(): pass)
+                    foo((func(): pass))
+                    return (func(): pass)
+                """;
+        var fn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(cleanAst(source)));
+        var body = fn.body().statements();
+        assertEquals(4, body.size());
+        var receiver = assertInstanceOf(AttributeExpression.class,
+                assertInstanceOf(ExpressionStatement.class, body.getFirst()).expression());
+        assertInstanceOf(LambdaExpression.class, receiver.base());
+        assertInstanceOf(AttributeCallStep.class, receiver.steps().getFirst());
+        var declaration = assertInstanceOf(VariableDeclaration.class, body.get(1));
+        assertInstanceOf(LambdaExpression.class, declaration.value());
+        var call = assertInstanceOf(CallExpression.class,
+                assertInstanceOf(ExpressionStatement.class, body.get(2)).expression());
+        assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+        assertInstanceOf(LambdaExpression.class, assertInstanceOf(ReturnStatement.class, body.getLast()).value());
+    }
+
     @Test
     void classBodyAnonymousFunctionIsRejected() {
         // Godot requires a name on class-body functions; the reference path accepts anonymous
         // ones (a registered parity divergence).
         var result = parse("func(): pass\n");
-        assertTrue(errorMessages(result).contains("Expected function name after \"func\"."));
+        var declaration = assertInstanceOf(FunctionDeclaration.class, onlyStatement(result.ast()));
+        assertEquals(List.of("Expected function name after \"func\"."), errorMessages(result));
+        var diagnostic = result.diagnostics().getFirst();
+        assertEquals(DiagnosticCodes.DECLARATION_MISSING_NAME, diagnostic.code());
+        assertSame(declaration, requireNotNull(diagnostic.recovery()).owner());
+        assertEquals("function.name", diagnostic.recovery().facet());
     }
 
     // -----------------------------------------------------------------------------------------

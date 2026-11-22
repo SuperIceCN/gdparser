@@ -62,6 +62,8 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -1613,8 +1615,8 @@ class GdScriptParserErrorRecoveryTest {
     void surfaceAssignmentTargetAndDirectCallGuards() {
         // Valid surface lvalues and direct calls stay clean.
         for (var validSource : List.of(
-                "func f():\n\tx = 1\n\t(x) = 2\n\tf().x = 3\n\tf()[0] = 4\n\tobj.arr[i] = 5\n",
-                "func f():\n\tfoo()\n\t(foo)()\n\tobj.method()\n\tf(1).call(2)\n"
+                "func f():\n\tx = 1\n\t(x) = 2\n\tf().x = 3\n\tf()[0] = 2\n\tobj.arr[i] = 5\n",
+                "func f():\n\tfoo()\n\t(foo)()\n\t(f)(1)\n\tobj.method()\n\tf(1).call(2)\n"
         )) {
             var clean = new GdScriptParser().parse(validSource);
             assertTrue(errorsOf(clean).isEmpty(), () -> validSource + " -> " + errorsOf(clean));
@@ -1663,6 +1665,188 @@ class GdScriptParserErrorRecoveryTest {
         var missingAttrCall = recoverableParse("func f():\n\tself.b.(1)\n");
         assertEquals(List.of(DiagnosticCodes.ATTRIBUTE_MISSING_NAME),
                 errorsOf(missingAttrCall).stream().map(AstDiagnostic::code).toList());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"(a ?) = 2, ?", "x as = 2, as", "(a ?)(2), ?"})
+    void recoveredInfixTargetKeepsOnlyThePrimaryDiagnostic(String expression, String operator) {
+        for (var newline : List.of("\n", "\r\n")) {
+            var source = ("func f():\n\tvar prefix = \"😀\"\n\t" + expression + "\n\tpass\n")
+                    .replace("\n", newline);
+            var result = recoverableParse(source);
+            var body = onlyFunction(result).body().statements();
+            assertEquals(3, body.size());
+            var statement = assertInstanceOf(ExpressionStatement.class, body.get(1));
+            var operands = switch (statement.expression()) {
+                case AssignmentExpression assign -> List.of(assign.left(), assign.right());
+                case CallExpression call -> List.of(call.callee(), call.arguments().getFirst());
+                default -> throw new AssertionError(statement);
+            };
+            var damaged = assertInstanceOf(RecoveredInfixExpression.class, operands.getFirst());
+            assertEquals(operator, damaged.operator());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, operands.getLast()).sourceText());
+            assertInstanceOf(PassStatement.class, body.getLast());
+            var code = operator.equals("?") ? DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN
+                    : DiagnosticCodes.MISSING_TYPE_CAST;
+            var start = source.indexOf(operator, source.indexOf(expression));
+            assertEquals(List.of(code), errorsOf(result).stream().map(AstDiagnostic::code).toList());
+            assertDamage(result, code, statement, "expression", utf8Range(source, start, start + operator.length()));
+            assertEnvelopeRecursive(result.ast(), source);
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
+    @Test
+    void publishedAnnotationsStillGetWrongTargetAndDanglingDiagnostics() {
+        for (var newline : List.of("\n", "\r\n")) {
+            var start = "@warning_ignore_start(\"unreachable_code\")";
+            for (var prefix : List.of("var prefix = 1\n", "class C:\n", "func f():\n")) {
+                var indent = prefix.endsWith(":\n") ? "\t" : "";
+                var annotation = "@warning_ignore(\"unused_variable\")";
+                var source = ("# 😀\n" + prefix + indent + annotation + "\n" + indent + start + "\n")
+                        .replace("\n", newline);
+                var result = recoverableParse(source);
+                var root = result.ast().statements();
+                var scope = switch (root.get(1)) {
+                    case ClassDeclaration klass -> klass.body().statements();
+                    case FunctionDeclaration function -> function.body().statements();
+                    default -> root.subList(2, root.size());
+                };
+                assertEquals(2, scope.size());
+                var owner = assertInstanceOf(AnnotationStatement.class, scope.getFirst());
+                assertEquals("warning_ignore", owner.name());
+                assertEquals("warning_ignore_start", assertInstanceOf(AnnotationStatement.class, scope.getLast()).name());
+                assertEquals(1, errorsOf(result).size());
+                var offset = source.indexOf(annotation);
+                assertDamage(result, DiagnosticCodes.ANNOTATION_DANGLING, owner, "annotation.target",
+                        utf8Range(source, offset, offset + annotation.length()));
+                GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+            }
+
+            for (var prefix : List.of("", "var prefix = 1\n", "class C:\n")) {
+                var indent = prefix.endsWith(":\n") ? "\t" : "";
+                var source = ("# 😀\n" + prefix + indent + "@export\n" + indent + start + "\n"
+                        + indent + "func f(): pass\n").replace("\n", newline);
+                var result = recoverableParse(source);
+                var root = result.ast().statements();
+                var scope = root.get(1) instanceof ClassDeclaration klass ? klass.body().statements()
+                        : root.subList(prefix.isEmpty() ? 1 : 2, root.size());
+                assertEquals(3, scope.size());
+                var owner = assertInstanceOf(AnnotationStatement.class, scope.getFirst());
+                assertEquals("export", owner.name());
+                assertEquals("warning_ignore_start", assertInstanceOf(AnnotationStatement.class, scope.get(1)).name());
+                assertInstanceOf(FunctionDeclaration.class, scope.getLast());
+                assertEquals(1, errorsOf(result).size());
+                var offset = source.indexOf("@export");
+                assertDamage(result, DiagnosticCodes.ANNOTATION_INVALID_TARGET, owner, "annotation.target",
+                        utf8Range(source, offset, offset + "@export".length()));
+                GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+            }
+        }
+    }
+
+    @Test
+    void onlyAnOpenScriptPrefixCanBindPendingAnnotationsToTheImplicitRoot() {
+        var warning = "@warning_ignore(\"unused_variable\")";
+        var region = """
+                @warning_ignore_start("unreachable_code")
+                @warning_ignore_restore("unreachable_code")
+                """;
+        for (var newline : List.of("\n", "\r\n")) {
+            var open = (warning + "\n" + region).replace("\n", newline);
+            assertEquals(List.of(), parse(open).diagnostics());
+            assertEquals(3, new GdScriptParserFacade().parseStrict(open).statements().size());
+            for (var fixture : List.of(
+                    Map.entry("@abstract\n@export_category(\"Stats\")\n", "@abstract"),
+                    Map.entry("@abstract\n@export_group(\"Stats\")\n", "@abstract"),
+                    Map.entry("@abstract\n@export_subgroup(\"Stats\")\n", "@abstract"),
+                    Map.entry("@export\n" + region, "@export"),
+                    Map.entry("var prefix = 1\n" + warning + "\n" + region, warning))) {
+                var source = fixture.getKey().replace("\n", newline);
+                var result = recoverableParse(source);
+                var owner = assertInstanceOf(AnnotationStatement.class,
+                        result.ast().statements().get(source.startsWith("var") ? 1 : 0));
+                var start = source.indexOf(fixture.getValue());
+                assertEquals(1, result.diagnostics().size());
+                assertDamage(result, DiagnosticCodes.ANNOTATION_DANGLING, owner, "annotation.target",
+                        utf8Range(source, start, start + fixture.getValue().length()));
+                GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+            }
+        }
+    }
+
+    @Test
+    void trailingCommentDoesNotChangeEligibilityAfterADeclarationAnnotationClosesThePrefix() {
+        var prefix = "@warning_ignore(\"unused_variable\")\n@export\n@custom";
+        for (var tail : List.of("\n", " # c\n")) {
+            var source = prefix + tail;
+            var result = recoverableParse(source);
+            assertEquals(List.of(DiagnosticCodes.ANNOTATION_DANGLING, DiagnosticCodes.ANNOTATION_DANGLING,
+                    DiagnosticCodes.ANNOTATION_DANGLING), result.diagnostics().stream().map(AstDiagnostic::code).toList());
+            for (var i = 0; i < 3; i++) {
+                var annotation = assertInstanceOf(AnnotationStatement.class, result.ast().statements().get(i));
+                var diagnostic = result.diagnostics().get(i);
+                assertSame(annotation, requireNotNull(diagnostic.recovery()).owner());
+                assertEquals("annotation.target", diagnostic.recovery().facet());
+                assertEquals(annotation.range(), diagnostic.range());
+            }
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
+    @Test
+    void invalidStandaloneDirectivesAndWrongLevelAnnotationsKeepTheirOwnDiagnostics() {
+        var ignore = "@warning_ignore(\"unused_variable\")";
+        var restore = "@warning_ignore_restore(\"missing\")";
+        var start = "@warning_ignore_start(\"unreachable_code\")";
+        var group = "@export_group(\"Stats\")";
+        for (var entry : Map.of(
+                restore + "\n\t", DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN,
+                start + " ", DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN,
+                group + "\n\t", DiagnosticCodes.ANNOTATION_INVALID_LEVEL).entrySet()) {
+            var source = "func f():\n\t" + ignore + "\n\t" + entry.getKey() + "var a = 1\n";
+            var result = recoverableParse(source);
+            var scope = onlyFunction(result).body().statements();
+            assertEquals(3, scope.size());
+            assertEquals("warning_ignore", assertInstanceOf(AnnotationStatement.class, scope.getFirst()).name());
+            var owner = assertInstanceOf(AnnotationStatement.class, scope.get(1));
+            assertEquals("a", assertInstanceOf(VariableDeclaration.class, scope.getLast()).name());
+            assertEquals(1, errorsOf(result).size());
+            var directive = entry.getKey().stripTrailing();
+            var offset = source.indexOf(directive);
+            assertDamage(result, entry.getValue(), owner, "annotation.target",
+                    utf8Range(source, offset, offset + directive.length()));
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
+    @Test
+    void annotationsStayIsolatedInPropertySuitesAcrossStandaloneDirectives() {
+        var ignore = "@warning_ignore(\"unused_variable\")";
+        var start = "@warning_ignore_start(\"unreachable_code\")";
+        var header = "var p:\n\tget:\n\t\t" + ignore + "\n\t\t" + start + "\n";
+        var nextMember = "var after = 1\n";
+        var clean = parse(header + "\t\tpass\n" + nextMember);
+        assertEquals(List.of(), errorsOf(clean));
+        var prop = assertInstanceOf(VariableDeclaration.class, clean.ast().statements().getFirst());
+        assertTrue(prop.recoveryAnnotations().isEmpty());
+        assertEquals("after", assertInstanceOf(VariableDeclaration.class, clean.ast().statements().getLast()).name());
+
+        var bad = header + "\t\t@warning_ignore_restore(\"missing\")\n" + nextMember;
+        var result = recoverableParse(bad);
+        var owner = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+        assertEquals(List.of("warning_ignore", "warning_ignore_restore"),
+                owner.recoveryAnnotations().stream().map(AnnotationStatement::name).toList());
+        var sibling = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast());
+        assertEquals("after", sibling.name());
+        assertTrue(sibling.recoveryAnnotations().isEmpty());
+        assertEquals(2, errorsOf(result).size());
+        assertDamage(result, DiagnosticCodes.ANNOTATION_DANGLING, owner, "variable.property",
+                owner.recoveryAnnotations().getFirst().range());
+        assertDamage(result, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, owner, "variable.property",
+                owner.recoveryAnnotations().getLast().range());
+        assertEnvelopeRecursive(result.ast(), bad);
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(bad, result, () -> bad);
     }
 
     // -----------------------------------------------------------------------------------------

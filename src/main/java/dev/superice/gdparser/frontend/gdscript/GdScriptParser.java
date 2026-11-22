@@ -193,11 +193,9 @@ public final class GdScriptParser {
     /// `class_name ... extends` declaration, so a duplicate top-level `extends` attributes there.
     private RecoveryTransactionTracker.@Nullable ProvisionalFrame scriptExtendsFrame;
 
-    /// Annotations parsed but not yet flushed into a statement sequence. They flush (in source
-    /// order) right before the next dispatched statement, and the flushed run that sits on the
-    /// same physical line as the statement keyword extends that statement's range, matching the
-    /// reference grammar's `annotations` span behavior.
-    private final List<PendingAnnotation> pendingAnnotations = new ArrayList<>();
+    /// Annotations still waiting for a target. A standalone directive can publish them into the
+    /// statement sequence early, but only the next target or scope exit settles their diagnostics.
+    private PendingAnnotationBuffer pendingAnnotations = new PendingAnnotationBuffer();
     /// Active `@warning_ignore_start` warning names mapped to their 1-based start line.
     private final Map<String, Integer> activeWarningIgnoreStarts = new HashMap<>();
     /// Unattached/invalid-level annotations collected inside an isolated property accessor suite
@@ -289,6 +287,7 @@ public final class GdScriptParser {
     private int circuitBreakerStackOps;
     private int circuitBreakerOracleResolutions;
     private int forIteratorTypeSyncSteps;
+    private long annotationWorkSteps;
 
     public GdScriptParser() {
     }
@@ -334,6 +333,7 @@ public final class GdScriptParser {
         classBodyRecoveryFrame = null;
         scriptExtendsFrame = null;
         pendingAnnotations.clear();
+        annotationWorkSteps = 0;
         activeWarningIgnoreStarts.clear();
         activePropertyRecoveryAnnotations = null;
         scriptExtendsUsed = false;
@@ -1299,6 +1299,11 @@ public final class GdScriptParser {
     /// Number of discarded lookahead tokens during same-line `for` type recovery in this parse.
     int forIteratorTypeSyncSteps() {
         return forIteratorTypeSyncSteps;
+    }
+
+    /// Counts pending annotation entry work and buffer transfers in the current parse.
+    long annotationWorkSteps() {
+        return annotationWorkSteps;
     }
 
     private @Nullable StructuralFrame enclosingLambdaDelimiterFrame() {
@@ -3326,26 +3331,64 @@ public final class GdScriptParser {
     /// when the next statement belongs to the same sequence, and stray trailing comments (left
     /// over by prefix statements or error paths) take their byte position here.
     private @NotNull List<Statement> drainAnnotationsAndComments(int limitByte, boolean allowScriptRoot) {
+        return drainAnnotationsAndComments(limitByte, false, allowScriptRoot);
+    }
+
+    private @NotNull List<Statement> drainAnnotationsAndComments(
+            int limitByte, boolean dangling, boolean allowScriptRoot
+    ) {
         var drained = new ArrayList<Statement>();
+        var annIndex = 0;
         while (true) {
             skipGroupingInternalComments();
-            var hasAnnotation = !pendingAnnotations.isEmpty();
+            var hasAnnotation = annIndex < pendingAnnotations.size();
             var hasComment = commentCursor < comments.size()
                     && comments.get(commentCursor).startByte() < limitByte;
             if (!hasAnnotation && !hasComment) {
                 break;
             }
             var annotationStart = hasAnnotation
-                    ? pendingAnnotations.getFirst().statement().range().startByte()
+                    ? pendingAnnotations.get(annIndex).statement().range().startByte()
                     : Integer.MAX_VALUE;
             if (hasComment && comments.get(commentCursor).startByte() < annotationStart) {
                 drained.add(materializeComment(comments.get(commentCursor++)));
             } else {
-                var pending = pendingAnnotations.removeFirst();
-                drained.add(materializePendingAnnotation(pending, false, allowScriptRoot));
+                var pending = pendingAnnotations.get(annIndex++);
+                settlePendingAnnotation(pending, dangling, allowScriptRoot);
+                if (!pending.published()) {
+                    drained.add(pending.statement());
+                }
             }
         }
+        pendingAnnotations.clear();
         return drained;
+    }
+
+    /// Publish the unplaced suffix before a standalone directive or trailing comment, without
+    /// clearing the binding state. Each annotation is placed once, even across many directives.
+    private @NotNull List<Statement> publishPendingAnnotationPrefix(int limitByte) {
+        var firstUnpublished = firstUnpublishedAnnotation(pendingAnnotations);
+        var unpublished = pendingAnnotations.subList(firstUnpublished, pendingAnnotations.size());
+        var drained = drainCommentsWithPending(unpublished, limitByte);
+        unpublished.replaceAll(PendingAnnotation::asPublished);
+        return drained;
+    }
+
+    private static int firstUnpublishedAnnotation(List<PendingAnnotation> annotations) {
+        var firstUnpublished = annotations.size();
+        while (firstUnpublished > 0 && !annotations.get(firstUnpublished - 1).published()) {
+            firstUnpublished--;
+        }
+        return firstUnpublished;
+    }
+
+    /// Nested suites must not drain the enclosing scope's annotations. Move its buffer aside
+    /// instead of copying the pending run, which can grow across standalone directives.
+    private @NotNull PendingAnnotationBuffer swapPendingAnnotations(@NotNull PendingAnnotationBuffer next) {
+        var saved = pendingAnnotations;
+        pendingAnnotations = next;
+        annotationWorkSteps++;
+        return saved;
     }
 
     private @NotNull List<Statement> drainCommentsWithPending(
@@ -3395,8 +3438,7 @@ public final class GdScriptParser {
         var drained = new ArrayList<Statement>();
         while (true) {
             skipGroupingInternalComments();
-            if (commentCursor >= comments.size() || comments.get(commentCursor).wholeLine()
-                    || comments.get(commentCursor).startByte() >= current.startByte()) {
+            if (!hasTrailingCommentBeforeCurrent()) {
                 break;
             }
             drained.add(materializeComment(comments.get(commentCursor++)));
@@ -3404,14 +3446,20 @@ public final class GdScriptParser {
         return drained;
     }
 
+    private boolean hasTrailingCommentBeforeCurrent() {
+        return commentCursor < comments.size() && !comments.get(commentCursor).wholeLine()
+                && comments.get(commentCursor).startByte() < current.startByte();
+    }
+
     /// Tail drain at a dedent boundary: whole-line comments materialize into this body only
     /// while their indentation reaches the body's indentation (merged with dangling annotations
     /// in byte order); less-indented comments stay pending for the outer sequence.
     private @NotNull List<Statement> drainTailWithAnnotations(int bodyIndent, boolean allowScriptRoot) {
         var drained = new ArrayList<Statement>();
+        var annIndex = 0;
         while (true) {
             skipGroupingInternalComments();
-            var hasAnnotation = !pendingAnnotations.isEmpty();
+            var hasAnnotation = annIndex < pendingAnnotations.size();
             var hasComment = commentCursor < comments.size()
                     && comments.get(commentCursor).startByte() < current.startByte()
                     && comments.get(commentCursor).wholeLine()
@@ -3420,15 +3468,19 @@ public final class GdScriptParser {
                 break;
             }
             var annotationStart = hasAnnotation
-                    ? pendingAnnotations.getFirst().statement().range().startByte()
+                    ? pendingAnnotations.get(annIndex).statement().range().startByte()
                     : Integer.MAX_VALUE;
             if (hasComment && comments.get(commentCursor).startByte() < annotationStart) {
                 drained.add(materializeComment(comments.get(commentCursor++)));
             } else {
-                var pending = pendingAnnotations.removeFirst();
-                drained.add(materializePendingAnnotation(pending, true, allowScriptRoot));
+                var pending = pendingAnnotations.get(annIndex++);
+                settlePendingAnnotation(pending, true, allowScriptRoot);
+                if (!pending.published()) {
+                    drained.add(pending.statement());
+                }
             }
         }
+        pendingAnnotations.clear();
         return drained;
     }
 
@@ -3931,7 +3983,7 @@ public final class GdScriptParser {
                     var kinds = knownAnnotationKinds(ann.name());
                     if (kinds != -1 && (kinds & ANN_STANDALONE) != 0) {
                         validateStandaloneDirective(parsed);
-                        statements.addAll(drainAnnotationsAndComments(ann.range().startByte(), true));
+                        statements.addAll(publishPendingAnnotationPrefix(ann.range().startByte()));
                         bindRecoveryOwner(parsed.targetFrame(), ann);
                         statements.add(ann);
                         if (!isWarningIgnoreRegionDirective(ann.name())) {
@@ -4019,6 +4071,10 @@ public final class GdScriptParser {
                             canHaveClassOrExtends = false;
                         }
                     }
+                    case EOF -> {
+                        statements.addAll(drainAnnotationsAndComments(current.startByte(), true));
+                        canHaveClassOrExtends = false;
+                    }
                     default -> canHaveClassOrExtends = false;
                 }
                 if (consumeCurrentFramePendingSync() || nestingBudgetExceeded) {
@@ -4026,6 +4082,9 @@ public final class GdScriptParser {
                 }
             }
 
+            // All non-EOF exits close the implicit root as a target. At prefix EOF the pending
+            // annotations have already been settled above.
+            pendingAnnotations.replaceAll(PendingAnnotation::withoutScriptRootEligibility);
             parseClassBody(true, true, statements, 0);
             // Safety net for anything left over at EOF (e.g. a trailing comment after the last
             // member on a newline-less last line): everything remaining belongs to the top level.
@@ -4250,7 +4309,7 @@ public final class GdScriptParser {
                                 ann, parsed.targetFrame(), false, true, false));
                     } else if (kinds != -1 && (kinds & ANN_STANDALONE) != 0) {
                         validateStandaloneDirective(parsed);
-                        statements.addAll(drainAnnotationsAndCommentsAsDangling(ann.range().startByte(), isRoot));
+                        statements.addAll(publishPendingAnnotationPrefix(ann.range().startByte()));
                         bindRecoveryOwner(parsed.targetFrame(), ann);
                         statements.add(ann);
                     } else {
@@ -4294,7 +4353,14 @@ public final class GdScriptParser {
             if (token.type() != GdTokenType.STATIC) {
                 nextIsStatic = false;
             }
-            // A comment trailing the member's own line lands right after it.
+            // Do not publish a trailing comment ahead of an earlier, still unplaced annotation.
+            if (!pendingAnnotations.isEmpty() && !pendingAnnotations.getLast().published()) {
+                skipGroupingInternalComments();
+                if (hasTrailingCommentBeforeCurrent()) {
+                    var annotationEnd = pendingAnnotations.getLast().statement().range().endByte();
+                    statements.addAll(publishPendingAnnotationPrefix(annotationEnd));
+                }
+            }
             statements.addAll(drainTrailingComments());
             if (consumeCurrentFramePendingSync() || nestingBudgetExceeded) {
                 synchronize();
@@ -4368,7 +4434,7 @@ public final class GdScriptParser {
 
     private void beginDanglingClassItem(List<Statement> statements) {
         statementStartByte = computeStatementStart(current);
-        statements.addAll(drainAnnotationsAndCommentsAsDangling(current.startByte(), false));
+        statements.addAll(drainAnnotationsAndComments(current.startByte(), true, false));
     }
 
     /// The statement starts at the keyword, unless a contiguous run of pending annotations sits
@@ -4378,8 +4444,9 @@ public final class GdScriptParser {
         var start = keyword.startByte();
         var keywordRow = keyword.startLine() - 1;
         for (var i = pendingAnnotations.size() - 1; i >= 0; i--) {
-            var annotation = pendingAnnotations.get(i).statement();
-            if (annotation.range().startPoint().row() != keywordRow) {
+            var pending = pendingAnnotations.get(i);
+            var annotation = pending.statement();
+            if (pending.published() || annotation.range().startPoint().row() != keywordRow) {
                 break;
             }
             start = annotation.range().startByte();
@@ -4393,7 +4460,10 @@ public final class GdScriptParser {
         }
         var drained = new ArrayList<AnnotationStatement>(pendingAnnotations.size());
         for (var pending : pendingAnnotations) {
-            drained.add(materializePendingAnnotation(pending, true, allowScriptRoot));
+            settlePendingAnnotation(pending, true, allowScriptRoot);
+            if (!pending.published()) {
+                drained.add(pending.statement());
+            }
         }
         pendingAnnotations.clear();
         return List.copyOf(drained);
@@ -4472,26 +4542,6 @@ public final class GdScriptParser {
         }
         var classBodyFrame = popRecoveryOwner();
 
-        RecoveryTransactionTracker.ProvisionalFrame bodyExtendsFrame = null;
-        RecoveryTransactionTracker.ProvisionalFrame extendsTrailingFrame = null;
-        if (match(GdTokenType.EXTENDS)) {
-            if (extendsFrame == null) {
-                pushRecoveryOwner("class.extends");
-            } else {
-                recoveryTracker.pushFrame("class.extends");
-            }
-            if (sawExtends) {
-                emitInCurrentFrameOrLegacy("Cannot use \"extends\" more than once in the same class.",
-                        DiagnosticCodes.CLASS_DUPLICATE_EXTENDS);
-                parseExtendsTarget();
-            } else {
-                sawExtends = true;
-                extendsTarget = parseExtendsTarget();
-            }
-            bodyExtendsFrame = popRecoveryOwner();
-            extendsTrailingFrame = finishStatementProvisional("superclass");
-        }
-
         var bodyStatements = new ArrayList<Statement>();
         var bodyIndent = multiline ? indentOf(current.startByte()) : 0;
         var bodyLayoutBaseline = multiline && !check(GdTokenType.DEDENT) && !isAtEnd()
@@ -4501,8 +4551,39 @@ public final class GdScriptParser {
                 StructuralRole.CLASS_BODY, start, bodyLayoutBaseline, multiline, false, "class body"));
         var previousClassBodyRecoveryFrame = classBodyRecoveryFrame;
         classBodyRecoveryFrame = classBodyFrame;
+        var bodyHeaderFrames = new ArrayList<RecoveryTransactionTracker.ProvisionalFrame>();
+        var bodyHeaderEnd = headerEnd;
+        var bodyLogicalLine = currentLogicalStartLine;
+        var canContinueHeader = true;
         try {
-            parseClassBody(multiline, false, bodyStatements, bodyIndent);
+            // Only the leading superclass clauses belong to the class header. The first keyword
+            // takes the slot even if its target is damaged, and later clauses only recover text.
+            while (canContinueHeader && match(GdTokenType.EXTENDS)) {
+                pushRecoveryOwner("class.extends");
+                if (sawExtends) {
+                    emitInCurrentFrameOrLegacy("Cannot use \"extends\" more than once in the same class.",
+                            DiagnosticCodes.CLASS_DUPLICATE_EXTENDS);
+                    parseExtendsTarget();
+                } else {
+                    sawExtends = true;
+                    extendsTarget = parseExtendsTarget();
+                }
+                bodyHeaderFrames.add(popRecoveryOwner());
+                bodyHeaderEnd = Math.max(bodyHeaderEnd, extentEnd());
+                var trailingFrame = finishStatementProvisional("superclass");
+                if (trailingFrame != null) {
+                    bodyHeaderFrames.add(trailingFrame);
+                    bodyHeaderEnd = Math.max(bodyHeaderEnd, extentEnd());
+                }
+                if (consumeCurrentFramePendingSync() || nestingBudgetExceeded) {
+                    synchronize();
+                }
+                canContinueHeader = multiline || previous.type() == GdTokenType.SEMICOLON
+                        && currentLogicalStartLine == bodyLogicalLine;
+            }
+            if (canContinueHeader) {
+                parseClassBody(multiline, false, bodyStatements, bodyIndent);
+            }
         } finally {
             classBodyRecoveryFrame = previousClassBodyRecoveryFrame;
             popStructuralFrame(classFrame);
@@ -4512,7 +4593,7 @@ public final class GdScriptParser {
                 : bodyStatements.getLast().range().endByte();
         var body = new Block(List.copyOf(bodyStatements), range(blockStart, blockEnd));
 
-        var end = Math.max(blockEnd, headerEnd);
+        var end = Math.max(blockEnd, bodyHeaderEnd);
         RecoveryTransactionTracker.ProvisionalFrame dedentFrame = null;
         if (multiline) {
             flushOutOfScopeDedentedErrors(bodyLayoutBaseline);
@@ -4526,15 +4607,12 @@ public final class GdScriptParser {
         if (extendsFrame != null) {
             bindRecoveryOwner(extendsFrame, classDecl);
         }
-        if (bodyExtendsFrame != null) {
-            bindRecoveryOwner(bodyExtendsFrame, classDecl);
+        for (var frame : bodyHeaderFrames) {
+            bindRecoveryOwner(frame, classDecl);
         }
         bindRecoveryOwner(classBodyFrame, classDecl);
         if (dedentFrame != null) {
             bindRecoveryOwner(dedentFrame, classDecl);
-        }
-        if (extendsTrailingFrame != null) {
-            bindRecoveryOwner(extendsTrailingFrame, classDecl);
         }
         return classDecl;
     }
@@ -5472,7 +5550,7 @@ public final class GdScriptParser {
                     return StatementProgress.ConsumedPrefix.INSTANCE;
                 }
                 var directiveValid = validateStandaloneDirective(parsed);
-                var drained = new ArrayList<>(drainAnnotationsAndCommentsAsDangling(ann.range().startByte(), false));
+                var drained = publishPendingAnnotationPrefix(ann.range().startByte());
                 if (isolatedFallbackFrame != null) {
                     if (!directiveValid && activePropertyRecoveryAnnotations != null) {
                         activePropertyRecoveryAnnotations.add(ann);
@@ -5505,9 +5583,11 @@ public final class GdScriptParser {
         }
 
         statementStartByte = computeStatementStart(current);
-        var statementAnnotations = new ArrayList<>(pendingAnnotations);
-        pendingAnnotations.clear();
-        var produced = new ArrayList<>(drainCommentsWithPending(statementAnnotations, current.startByte()));
+        var statementAnnotations = pendingAnnotations.isEmpty()
+                ? List.<PendingAnnotation>of() : swapPendingAnnotations(new PendingAnnotationBuffer());
+        var firstUnpublished = firstUnpublishedAnnotation(statementAnnotations);
+        var produced = drainCommentsWithPending(
+                statementAnnotations.subList(firstUnpublished, statementAnnotations.size()), current.startByte());
         Statement result;
         var terminatedLambda = false;
         switch (current.type()) {
@@ -5640,19 +5720,7 @@ public final class GdScriptParser {
                 advance();
                 pushRecoveryOwner("expression");
                 var lambda = parseLambdaExpression().valueOrThrow();
-                recoveryTracker.emitError(
-                        "Standalone lambdas cannot be accessed. Consider assigning it to a variable.",
-                        lambda.range(),
-                        DiagnosticCodes.LAMBDA_BARE_STATEMENT,
-                        RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
-                        null
-                );
-                var expressionFrame = popRecoveryOwner();
-                result = new ExpressionStatement(lambda, range(statementStartByte, lambda.range().endByte()));
-                bindRecoveryOwner(expressionFrame, result);
-                // Like the vendor's expression-statement path: consume the lambda-end state so
-                // the surrounding suite keeps parsing following statements.
-                finishStatement(result, "expression");
+                result = finishExpressionStatement(lambda, lambda.range().endByte(), popRecoveryOwner());
             }
             default -> {
                 // Only statement-level expressions may contain assignments (Godot's
@@ -5665,10 +5733,7 @@ public final class GdScriptParser {
                          ParseOutcome.Damaged<Expression> _ -> {
                         // Every carried node survives; finishStatement diagnoses any unparsed tail.
                         // The span includes consumed grouping delimiters omitted by the inner node.
-                        result = new ExpressionStatement(expressionOutcome.valueOrThrow(),
-                                range(statementStartByte, extentEnd()));
-                        bindRecoveryOwner(expressionFrame, result);
-                        finishStatement(result, "expression");
+                        result = finishExpressionStatement(expressionOutcome.valueOrThrow(), extentEnd(), expressionFrame);
                     }
                     case ParseOutcome.Failed<Expression> _ -> {
                         // The root cause was already reported inside; no generic message here.
@@ -5708,7 +5773,7 @@ public final class GdScriptParser {
         if (result == null) {
             if (!terminatedLambda) {
                 for (var pending : statementAnnotations) {
-                    materializePendingAnnotation(pending, true, false);
+                    settlePendingAnnotation(pending, true, false);
                 }
             }
             if (consumeCurrentFramePendingSync() || nestingBudgetExceeded) {
@@ -5719,7 +5784,7 @@ public final class GdScriptParser {
                     : new StatementProgress.Failed(List.copyOf(produced));
         }
         for (var pending : statementAnnotations) {
-            materializePendingAnnotation(pending, false, false);
+            settlePendingAnnotation(pending, false, false);
         }
         produced.add(result);
         // A comment trailing the statement's own line lands right after it.
@@ -5728,6 +5793,26 @@ public final class GdScriptParser {
             synchronize();
         }
         return new StatementProgress.Produced(List.copyOf(produced));
+    }
+
+    /// Grouping is transparent in the AST. Reject any lambda that is itself the statement's
+    /// expression, not lambdas carried inside calls, assignments or other expressions.
+    private @NotNull ExpressionStatement finishExpressionStatement(
+            @NotNull Expression expression, int end, @NotNull RecoveryTransactionTracker.ProvisionalFrame frame
+    ) {
+        if (expression instanceof LambdaExpression lambda) {
+            recoveryTracker.emitError(
+                    "Standalone lambdas cannot be accessed. Consider assigning it to a variable.",
+                    lambda.range(),
+                    DiagnosticCodes.LAMBDA_BARE_STATEMENT,
+                    RecoveryTransactionTracker.AttributionPolicy.TARGET_FRAME,
+                    frame
+            );
+        }
+        var statement = new ExpressionStatement(expression, range(statementStartByte, end));
+        bindRecoveryOwner(frame, statement);
+        finishStatement(statement, "expression");
+        return statement;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -6774,13 +6859,73 @@ public final class GdScriptParser {
     private static final int ANN_CLASS_LEVEL =
             ANN_CLASS | ANN_VARIABLE | ANN_CONSTANT | ANN_SIGNAL | ANN_FUNCTION;
 
+    /// @param published whether the flat sequence already contains this annotation; target
+    ///                  validation and final owner settlement remain pending independently
     private record PendingAnnotation(
             @NotNull AnnotationStatement statement,
             @NotNull RecoveryTransactionTracker.ProvisionalFrame targetFrame,
             boolean scriptRootEligible,
             boolean alreadyDiagnosed,
-            boolean recordPropertyRecovery
+            boolean recordPropertyRecovery,
+            boolean published
     ) {
+        PendingAnnotation(AnnotationStatement statement, RecoveryTransactionTracker.ProvisionalFrame targetFrame,
+                          boolean scriptRootEligible, boolean alreadyDiagnosed, boolean recordPropertyRecovery) {
+            this(statement, targetFrame, scriptRootEligible, alreadyDiagnosed, recordPropertyRecovery, false);
+        }
+
+        PendingAnnotation asPublished() {
+            return new PendingAnnotation(statement, targetFrame, scriptRootEligible, alreadyDiagnosed,
+                    recordPropertyRecovery, true);
+        }
+
+        PendingAnnotation asDiagnosed() {
+            return new PendingAnnotation(statement, targetFrame, scriptRootEligible, true,
+                    recordPropertyRecovery, published);
+        }
+
+        PendingAnnotation withoutScriptRootEligibility() {
+            return scriptRootEligible
+                    ? new PendingAnnotation(statement, targetFrame, false, alreadyDiagnosed, recordPropertyRecovery, published)
+                    : this;
+        }
+    }
+
+    /// Count reads at the buffer boundary so scans through sublists, iterators and even a
+    /// collection copy all account for the entries they visit. Writes count changed slots.
+    private final class PendingAnnotationBuffer extends AbstractList<PendingAnnotation> implements RandomAccess {
+        private final List<PendingAnnotation> entries = new ArrayList<>();
+
+        @Override
+        public PendingAnnotation get(int index) {
+            annotationWorkSteps++;
+            return entries.get(index);
+        }
+
+        @Override
+        public int size() {
+            return entries.size();
+        }
+
+        @Override
+        public boolean add(PendingAnnotation annotation) {
+            annotationWorkSteps++;
+            modCount++;
+            return entries.add(annotation);
+        }
+
+        @Override
+        public PendingAnnotation set(int index, PendingAnnotation annotation) {
+            annotationWorkSteps++;
+            return entries.set(index, annotation);
+        }
+
+        @Override
+        public void clear() {
+            annotationWorkSteps += entries.size();
+            modCount++;
+            entries.clear();
+        }
     }
 
     private record ParsedAnnotation(
@@ -7306,9 +7451,7 @@ public final class GdScriptParser {
                         RecoveryTransactionTracker.AttributionPolicy.TARGET_FRAME,
                         pending.targetFrame()
                 );
-                pendingAnnotations.set(i, new PendingAnnotation(
-                        ann, pending.targetFrame(), pending.scriptRootEligible(), true,
-                        pending.recordPropertyRecovery()));
+                pendingAnnotations.set(i, pending.asDiagnosed());
                 continue;
             }
             if ("abstract".equals(ann.name())) {
@@ -7320,9 +7463,7 @@ public final class GdScriptParser {
                             RecoveryTransactionTracker.AttributionPolicy.TARGET_FRAME,
                             pending.targetFrame()
                     );
-                    pendingAnnotations.set(i, new PendingAnnotation(
-                            ann, pending.targetFrame(), pending.scriptRootEligible(), true,
-                            pending.recordPropertyRecovery()));
+                    pendingAnnotations.set(i, pending.asDiagnosed());
                 } else {
                     sawAbstract = true;
                 }
@@ -7330,37 +7471,12 @@ public final class GdScriptParser {
         }
     }
 
-    private @NotNull List<Statement> drainAnnotationsAndCommentsAsDangling(
-            int limitByte,
-            boolean allowScriptRoot
-    ) {
-        var drained = new ArrayList<Statement>();
-        while (true) {
-            skipGroupingInternalComments();
-            var hasAnnotation = !pendingAnnotations.isEmpty();
-            var hasComment = commentCursor < comments.size()
-                    && comments.get(commentCursor).startByte() < limitByte;
-            if (!hasAnnotation && !hasComment) {
-                break;
-            }
-            var annotationStart = hasAnnotation
-                    ? pendingAnnotations.getFirst().statement().range().startByte()
-                    : Integer.MAX_VALUE;
-            if (hasComment && comments.get(commentCursor).startByte() < annotationStart) {
-                drained.add(materializeComment(comments.get(commentCursor++)));
-            } else {
-                var pending = pendingAnnotations.removeFirst();
-                drained.add(materializePendingAnnotation(pending, true, allowScriptRoot));
-            }
-        }
-        return drained;
-    }
-
-    private @NotNull AnnotationStatement materializePendingAnnotation(
+    private void settlePendingAnnotation(
             @NotNull PendingAnnotation pending,
             boolean dangling,
             boolean allowScriptRoot
     ) {
+        annotationWorkSteps++;
         var ann = pending.statement();
         if (allowScriptRoot && pending.scriptRootEligible()) {
             if (!pending.alreadyDiagnosed() && "abstract".equals(ann.name())) {
@@ -7377,7 +7493,7 @@ public final class GdScriptParser {
                 }
             }
             bindRecoveryOwner(pending.targetFrame(), ann);
-            return ann;
+            return;
         }
         if (dangling && !pending.alreadyDiagnosed()) {
             recoveryTracker.emitError(
@@ -7396,10 +7512,9 @@ public final class GdScriptParser {
             if ((dangling || pending.recordPropertyRecovery()) && activePropertyRecoveryAnnotations != null) {
                 activePropertyRecoveryAnnotations.add(ann);
             }
-            return ann;
+            return;
         }
         bindRecoveryOwner(pending.targetFrame(), ann);
-        return ann;
     }
 
     /// A type's public text and range, plus the internal shape needed to reject nested collections.
@@ -8104,23 +8219,19 @@ public final class GdScriptParser {
     /// `activePropertyRecoveryAnnotations` so the owning `VariableDeclaration` retains them without
     /// leaking them onto the next outer member.
     private int parseIsolatedSuite(String context) {
-        var saved = new ArrayList<>(pendingAnnotations);
+        var saved = swapPendingAnnotations(new PendingAnnotationBuffer());
         var previousIsolatedFallback = isolatedFallbackFrame;
         var previousLambdaEnded = lambdaEnded;
         lambdaEnded = false;
         if (isolatedFallbackFrame == null) {
             isolatedFallbackFrame = recoveryTracker.activeFrame();
         }
-        pendingAnnotations.clear();
         var startIndex = activePropertyRecoveryAnnotations == null ? 0 : activePropertyRecoveryAnnotations.size();
         Block suite;
         try {
             suite = parseSuite(context);
         } finally {
-            // Replace, not append: annotations left dangling inside the discarded accessor suite
-            // are retained in `activePropertyRecoveryAnnotations` rather than leaking outward.
-            pendingAnnotations.clear();
-            pendingAnnotations.addAll(saved);
+            swapPendingAnnotations(saved);
             isolatedFallbackFrame = previousIsolatedFallback;
             lambdaEnded = previousLambdaEnded;
         }
@@ -8935,16 +9046,12 @@ public final class GdScriptParser {
         // once the enclosing grouping's span is recorded at its close). Defer them for the
         // duration of the body instead of letting the body's drains consume them.
         deferCommentsBefore(start);
-        // Same isolation for annotations pending on the enclosing sequence (the body's merged
-        // drain would otherwise steal them, like the accessor-suite isolation does).
-        var enclosingAnnotations = List.copyOf(pendingAnnotations);
-        pendingAnnotations.clear();
-
         var previousLambdaFallback = lambdaBodyFallbackFrame;
         pushLambdaOwner("suite.body", parameterDefaultOwner);
         var lambdaSuiteFallback = popRecoveryOwner();
         lambdaBodyFallbackFrame = lambdaSuiteFallback;
 
+        var enclosingAnnotations = swapPendingAnnotations(new PendingAnnotationBuffer());
         Block body;
         RecoveryTransactionTracker.ProvisionalFrame bodyLayoutFrame = null;
         try {
@@ -8965,8 +9072,7 @@ public final class GdScriptParser {
             }
         } finally {
             lambdaBodyFallbackFrame = previousLambdaFallback;
-            pendingAnnotations.clear();
-            pendingAnnotations.addAll(enclosingAnnotations);
+            swapPendingAnnotations(enclosingAnnotations);
             statementStartByte = savedStatementStart;
             restoreDeferredComments();
             popStructuralFrame(lambdaFrame);
@@ -9997,7 +10103,7 @@ public final class GdScriptParser {
     /// Port of `GDScriptParser::parse_assignment` for the whole `=`/`+=`/.../`^=` family. Embedded
     /// assignments (`!canAssign`) emit `ASSIGNMENT_DISALLOWED_IN_EXPRESSION` at the operator;
     /// invalid surface targets (`1 = 2`, `f() = 2`, `obj.foo() = 2`) emit
-    /// `ASSIGNMENT_INVALID_TARGET` unless `left` is already a missing-target marker; both still
+    /// `ASSIGNMENT_INVALID_TARGET` unless `left` already carries a diagnosed recovery marker; both still
     /// parse the right-hand side through `absorbSlot("assignment.value")` and return a damaged
     /// `AssignmentExpression` so neither side is discarded.
     private @NotNull ParseOutcome<Expression> parseAssignment(@NotNull Expression left, Precedence entryPrecedence,
@@ -10041,7 +10147,7 @@ public final class GdScriptParser {
 
     private static boolean isMissingAssignmentTargetMarker(@NotNull Expression target) {
         return switch (target) {
-            case ErrorExpression _ -> true;
+            case ErrorExpression _, RecoveredInfixExpression _ -> true;
             case AttributeExpression(_, var steps, _) ->
                     !steps.isEmpty() && steps.getLast() instanceof MissingAttributeStep;
             default -> false;

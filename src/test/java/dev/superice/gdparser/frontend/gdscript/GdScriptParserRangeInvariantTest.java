@@ -8,6 +8,7 @@ import dev.superice.gdparser.frontend.ast.CallExpression;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.ClassNameStatement;
 import dev.superice.gdparser.frontend.ast.ContinueStatement;
+import dev.superice.gdparser.frontend.ast.ExpressionStatement;
 import dev.superice.gdparser.frontend.ast.ExtendsStatement;
 import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
 import dev.superice.gdparser.frontend.ast.LambdaExpression;
@@ -1321,6 +1322,93 @@ class GdScriptParserRangeInvariantTest {
                     .filter(d -> DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS.equals(d.code())).count());
             requirePositionedOwner(result, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, host, "suite.body");
         }
+    }
+
+    @Test
+    void groupedBareLambdaAndItsRecoveryKeepExactUtf8Ranges() {
+        var parser = new GdScriptParser();
+        var lambdaText = "func(): return \"😀\"";
+        for (var newline : List.of("\n", "\r\n")) {
+            for (var suffix : List.of("); pass", ") junk", "")) {
+                var source = ("func f():\n\t(" + lambdaText + suffix + "\n\tpass\n").replace("\n", newline);
+                var result = parser.parse(source);
+                var fn = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+                var body = fn.body().statements();
+                var statement = assertInstanceOf(ExpressionStatement.class, body.getFirst());
+                var lambda = assertInstanceOf(LambdaExpression.class, statement.expression());
+                var lambdaStart = source.indexOf(lambdaText);
+                assertEquals(lambda.range(), requireError(result, DiagnosticCodes.LAMBDA_BARE_STATEMENT).range());
+                assertPositionedDiagnostic(result, DiagnosticCodes.LAMBDA_BARE_STATEMENT, statement, "expression",
+                        source, lambdaStart, lambdaStart + lambdaText.length());
+                assertInstanceOf(PassStatement.class, body.getLast());
+                if (suffix.isEmpty()) {
+                    var insertion = lambdaStart + lambdaText.length();
+                    assertPositionedDiagnostic(result, DiagnosticCodes.MISSING_CLOSER_GROUPING, statement, "expression",
+                            source, insertion, insertion);
+                } else if (suffix.endsWith("junk")) {
+                    var junk = source.indexOf("junk");
+                    assertPositionedDiagnostic(result, DiagnosticCodes.STATEMENT_TRAILING, statement, "statement.trailing",
+                            source, junk, junk + "junk".length());
+                } else {
+                    assertInstanceOf(PassStatement.class, body.get(1));
+                }
+                assertEquals(suffix.startsWith(");") ? 1 : 2, result.diagnostics().size());
+                assertEquals(suffix.startsWith(");") ? 3 : 2, body.size());
+                assertEnvelope(result.ast(), () -> source);
+                assertDiagnosticInvariants(source, result, () -> source);
+            }
+        }
+        var eofSource = "func f():\r\n\t(" + lambdaText;
+        var eofResult = parser.parse(eofSource);
+        var fn = assertInstanceOf(FunctionDeclaration.class, eofResult.ast().statements().getFirst());
+        var statement = assertInstanceOf(ExpressionStatement.class, fn.body().statements().getFirst());
+        assertEquals(2, eofResult.diagnostics().size());
+        assertPositionedDiagnostic(eofResult, DiagnosticCodes.MISSING_CLOSER_GROUPING, statement, "expression",
+                eofSource, eofSource.length(), eofSource.length());
+        assertPositionedDiagnostic(eofResult, DiagnosticCodes.LAMBDA_BARE_STATEMENT, statement, "expression",
+                eofSource, eofSource.indexOf(lambdaText), eofSource.length());
+        assertEnvelope(eofResult.ast(), () -> eofSource);
+        assertDiagnosticInvariants(eofSource, eofResult, () -> eofSource);
+        assertTrue(parser.parse("func f(): pass\n").diagnostics().isEmpty());
+    }
+
+    @Test
+    void nestedDuplicateExtendsBelongsToTheInnerClassAcrossTriviaAndDedent() {
+        var parser = new GdScriptParser();
+        for (var newline : List.of("\n", "\r\n")) {
+            var source = """
+                    class Outer:
+                        extends OuterBase
+                        class Inner:
+                            extends "res://😀.gd"
+
+                            # 😀
+                            extends Rejected
+                        pass
+                    """.replace("\n", newline);
+            var result = parser.parse(source);
+            var outer = assertInstanceOf(ClassDeclaration.class, result.ast().statements().getFirst());
+            assertEquals("OuterBase", outer.extendsTarget());
+            var inner = assertInstanceOf(ClassDeclaration.class, outer.body().statements().getFirst());
+            assertEquals("\"res://😀.gd\"", inner.extendsTarget());
+            assertInstanceOf(PassStatement.class, outer.body().statements().getLast());
+            assertEquals(1, result.diagnostics().size());
+            var start = source.indexOf("extends Rejected");
+            assertPositionedDiagnostic(result, DiagnosticCodes.CLASS_DUPLICATE_EXTENDS, inner, "class.extends",
+                    source, start, start + "extends".length());
+            assertTrue(inner.range().endByte() >= requireError(result, DiagnosticCodes.CLASS_DUPLICATE_EXTENDS)
+                    .range().endByte());
+            assertEnvelope(result.ast(), () -> source);
+            assertDiagnosticInvariants(source, result, () -> source);
+        }
+    }
+
+    private static void assertPositionedDiagnostic(AstMappingResult result, String code, Node owner, String facet,
+                                                   String source, int start, int end) {
+        requirePositionedOwner(result, code, owner, facet);
+        var range = requireError(result, code).range();
+        assertEquals(source.substring(0, start).getBytes(StandardCharsets.UTF_8).length, range.startByte());
+        assertEquals(source.substring(0, end).getBytes(StandardCharsets.UTF_8).length, range.endByte());
     }
 
     private static Node requirePositionedOwner(AstMappingResult result, String code, Node owner, String facet) {
