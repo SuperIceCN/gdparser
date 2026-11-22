@@ -13,6 +13,7 @@ import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
 import dev.superice.gdparser.frontend.ast.LambdaExpression;
 import dev.superice.gdparser.frontend.ast.MatchStatement;
 import dev.superice.gdparser.frontend.ast.Node;
+import dev.superice.gdparser.frontend.ast.PassStatement;
 import dev.superice.gdparser.frontend.ast.Range;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
 import dev.superice.gdparser.frontend.ast.SignalStatement;
@@ -30,6 +31,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -37,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -47,7 +50,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// - `I5`: every pure-Java `ERROR` diagnostic carries a non-null registered `code`, a valid UTF-8
 ///   physical range consistent with `SourceTextIndex`, and either an identity-reachable owner whose
 ///   `(code, ownerType, facet)` pairing is registered, or a `null` recovery strictly within
-///   `DiagnosticCodes.allowsNullRecovery(code)`.
+///   `DiagnosticCodes.allowsNullRecovery(code)`. Explicit location fixtures enforce exact
+///   ownership even for codes that can also be emitted without an owner.
 @Timeout(value = 10, unit = TimeUnit.SECONDS)
 class GdScriptParserRangeInvariantTest {
 
@@ -1149,6 +1153,185 @@ class GdScriptParserRangeInvariantTest {
         return ast.statements().get(index);
     }
 
+    @Test
+    void orphanCloserOwnershipDependsOnItsStatementAndContainerBoundary() {
+        var parser = new GdScriptParser();
+        for (var newline : List.of("\n", "\r\n")) {
+            var standalone = (")\nvar after = 1\n").replace("\n", newline);
+            var root = parser.parse(standalone);
+            assertDiagnosticInvariants(standalone, root, () -> standalone);
+            assertNull(requireError(root, DiagnosticCodes.UNEXPECTED_CLOSER).recovery());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, root.ast().statements().getFirst()).name());
+
+            for (var beforeCloser : List.of("", "\tpass\n", "\tpass ")) {
+                var source = ("func f():\n" + beforeCloser
+                        + (beforeCloser.endsWith(" ") ? "" : "\t") + ")\n\tpass\nvar after = 1\n")
+                        .replace("\n", newline);
+                Node previousOwner = null;
+                for (var generation = 0; generation < 2; generation++) {
+                    var result = parser.parse(source);
+                    assertDiagnosticInvariants(source, result, () -> source);
+                    var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+                    var statements = function.body().statements();
+                    assertEquals(beforeCloser.isEmpty() ? 1 : 2, statements.size());
+                    assertInstanceOf(PassStatement.class, statements.getLast());
+                    assertEquals("after",
+                            assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast()).name());
+                    var sameLine = beforeCloser.endsWith(" ");
+                    var expectedOwner = sameLine ? statements.getFirst() : function;
+                    var link = requirePositionedOwner(result, DiagnosticCodes.UNEXPECTED_CLOSER, expectedOwner,
+                            sameLine ? "statement.trailing" : "suite.body");
+                    assertNotSame(previousOwner, link);
+                    previousOwner = link;
+                    var orphanByte = source.substring(0, source.lastIndexOf(')')).getBytes(StandardCharsets.UTF_8).length;
+                    var diagnostic = requireError(result, DiagnosticCodes.UNEXPECTED_CLOSER);
+                    assertEquals(orphanByte, diagnostic.range().startByte());
+                    assertEquals(orphanByte + 1, diagnostic.range().endByte());
+                    if (!beforeCloser.isEmpty()) {
+                        var pass = assertInstanceOf(PassStatement.class, statements.getFirst());
+                        assertEquals(4, pass.range().endByte() - pass.range().startByte());
+                    }
+                }
+            }
+
+            var lexical = ("var a = 1\n0x\n").replace("\n", newline);
+            var lexicalResult = parser.parse(lexical);
+            assertDiagnosticInvariants(lexical, lexicalResult, () -> lexical);
+            assertNull(requireError(lexicalResult, DiagnosticCodes.LEXICAL_ERROR).recovery());
+        }
+    }
+
+    @Test
+    void classBodyFragmentsBelongToTheClassThatParsedThem() {
+        var parser = new GdScriptParser();
+        for (var fragment : List.of(")", "static", "% ^ &", "func 1", "\"doc\" var a = 1",
+                "var 1", "const 1", "signal 1")) {
+            var source = "class Outer:\n\tclass Inner:\n\t\t" + fragment + "\n\t\tpass\n\tpass\n";
+            var result = parser.parse(source);
+            assertDiagnosticInvariants(source, result, () -> source);
+            var outer = assertInstanceOf(ClassDeclaration.class, result.ast().statements().getFirst());
+            var inner = assertInstanceOf(ClassDeclaration.class, outer.body().statements().getFirst());
+            assertEquals("Inner", inner.name());
+            assertInstanceOf(PassStatement.class, inner.body().statements().getLast());
+            assertInstanceOf(PassStatement.class, outer.body().statements().getLast());
+            var code = fragment.equals(")") ? DiagnosticCodes.UNEXPECTED_CLOSER : DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN;
+            requirePositionedOwner(result, code, inner, "class.body");
+        }
+        for (var fragment : List.of("var 1", "const 1", "signal 1")) {
+            var rootSource = fragment + "\nvar after = 1\n";
+            var root = parser.parse(rootSource);
+            assertDiagnosticInvariants(rootSource, root, () -> rootSource);
+            assertNull(requireError(root, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN).recovery());
+            var classSource = "class C:\n\t" + fragment + "\n\tpass\n";
+            var result = parser.parse(classSource);
+            assertDiagnosticInvariants(classSource, result, () -> classSource);
+            var owner = assertInstanceOf(ClassDeclaration.class, result.ast().statements().getFirst());
+            requirePositionedOwner(result, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, owner, "class.body");
+            assertInstanceOf(PassStatement.class, owner.body().statements().getLast());
+        }
+    }
+
+    @Test
+    void discardedDefaultsKeepDiagnosticsOnTheirSurvivingSignature() {
+        var parser = new GdScriptParser();
+        for (var sample : List.of(
+                Map.entry("func f(x, x = func() -> : pass)", DiagnosticCodes.MISSING_TYPE_RETURN_TYPE),
+                Map.entry("signal s(x, x = func(a:): pass)", DiagnosticCodes.MISSING_TYPE_LAMBDA_PARAMETER),
+                Map.entry("func f(x, x = func(): return =3)", DiagnosticCodes.SLOT_RETURN_VALUE),
+                Map.entry("func f(x, x = func(): assert())", DiagnosticCodes.SLOT_ASSERT_CONDITION),
+                Map.entry("func f(x, x = func(): if : pass)", DiagnosticCodes.SLOT_IF_CONDITION),
+                Map.entry("func f(x, x = func(): pass 1)", DiagnosticCodes.STATEMENT_TRAILING))) {
+            var source = sample.getKey();
+            var result = parser.parse(source);
+            assertDiagnosticInvariants(source, result, () -> source);
+            var owner = result.ast().statements().getFirst();
+            var parameters = owner instanceof SignalStatement signal
+                    ? signal.parameters() : assertInstanceOf(FunctionDeclaration.class, owner).parameters();
+            assertEquals(1, parameters.size());
+            assertEquals("x", parameters.getFirst().name());
+            assertNull(parameters.getFirst().defaultValue());
+            requirePositionedOwner(result, sample.getValue(), owner,
+                    owner instanceof SignalStatement ? "signal.parameter" : "function.signature");
+        }
+    }
+
+    @Test
+    void discardedLambdaLayoutFallsBackThroughItsOwnBodyFrame() {
+        var parser = new GdScriptParser();
+        for (var sample : List.of(
+                Map.entry("func(): 0x\n\t\treturn [1\n\t", List.of(
+                        DiagnosticCodes.LEXICAL_ERROR, DiagnosticCodes.MISSING_CLOSER_ARRAY)),
+                Map.entry("func():\n\t", List.of(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN)))) {
+            var source = "func f():\n\tvar outer = func(x, x = " + sample.getKey() + "): pass\n\tpass\n";
+            var result = parser.parse(source);
+            assertDiagnosticInvariants(source, result, () -> source);
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var variable = assertInstanceOf(VariableDeclaration.class, function.body().statements().getFirst());
+            var lambda = assertInstanceOf(LambdaExpression.class, variable.value());
+            assertEquals(1, lambda.parameters().size());
+            assertInstanceOf(PassStatement.class, lambda.body().statements().getFirst());
+            assertInstanceOf(PassStatement.class, function.body().statements().getLast());
+            for (var code : sample.getValue()) {
+                requirePositionedOwner(result, code, lambda, "function.signature");
+            }
+        }
+    }
+
+    @Test
+    void rejectedAccessorWithUnclosedHeaderKeepsItsIndentedBodyIsolated() {
+        var parser = new GdScriptParser();
+        for (var source : List.of(
+                "var p: int: get = g, set(v:\n\tvar leaked = 1\nvar after = 2\n",
+                "var p:\n\tget = g,\n\tset(v:\n\t\tvar leaked = 1\nvar after = 2\n")) {
+            var result = parser.parse(source);
+            assertDiagnosticInvariants(source, result, () -> source);
+            assertEnvelope(result.ast(), () -> source);
+            assertEquals(List.of("p", "after"), result.ast().statements().stream()
+                    .map(statement -> assertInstanceOf(VariableDeclaration.class, statement).name()).toList());
+            assertEquals(1, result.diagnostics().size());
+            requirePositionedOwner(result, DiagnosticCodes.PROPERTY_INVALID_ACCESSOR,
+                    result.ast().statements().getFirst(), "variable.property");
+            var clean = parser.parse("var p: int: get = g, set = s\nvar after = 2\n");
+            assertTrue(clean.diagnostics().isEmpty());
+            assertEquals(2, clean.ast().statements().size());
+        }
+    }
+
+    @Test
+    void suiteBreakerHasOneDiagnosticOnItsSurvivingHost() {
+        var fSource = "func f():\n\tif true:\n" + "\t\t, +\n".repeat(105) + "\tpass\nvar after = 1\n";
+        var lSource = "var l = func():\n" + "\t, +\n".repeat(105) + "var after = 1\n";
+        var parser = new GdScriptParser();
+        for (var source : List.of(fSource, lSource)) {
+            var result = parser.parse(source);
+            assertDiagnosticInvariants(source, result, () -> source);
+            assertEquals(2, result.ast().statements().size());
+            assertEquals("after",
+                    assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast()).name());
+            Node host;
+            if (result.ast().statements().getFirst() instanceof FunctionDeclaration function) {
+                assertEquals(2, function.body().statements().size());
+                assertInstanceOf(PassStatement.class, function.body().statements().getLast());
+                host = function.body().statements().getFirst();
+            } else {
+                var declaration = assertInstanceOf(VariableDeclaration.class, result.ast().statements().getFirst());
+                host = assertInstanceOf(LambdaExpression.class, declaration.value());
+            }
+            assertEquals(1, result.diagnostics().stream()
+                    .filter(d -> DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS.equals(d.code())).count());
+            requirePositionedOwner(result, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, host, "suite.body");
+        }
+    }
+
+    private static Node requirePositionedOwner(AstMappingResult result, String code, Node owner, String facet) {
+        var diagnostic = requireError(result, code);
+        var recovery = diagnostic.recovery();
+        assertNotNull(recovery, () -> "Missing position-specific recovery: " + diagnostic);
+        assertSame(owner, recovery.owner());
+        assertEquals(facet, recovery.facet());
+        return recovery.owner();
+    }
+
     private static AstDiagnostic requireError(AstMappingResult result, String code) {
         return result.diagnostics().stream()
                 .filter(d -> d.severity() == AstDiagnosticSeverity.ERROR && code.equals(d.code()))
@@ -1156,7 +1339,7 @@ class GdScriptParserRangeInvariantTest {
                 .orElseThrow(() -> new AssertionError("Missing diagnostic " + code + " in: " + result.diagnostics()));
     }
 
-    private static void assertDiagnosticInvariants(
+    static void assertDiagnosticInvariants(
             String source,
             AstMappingResult result,
             java.util.function.Supplier<String> context

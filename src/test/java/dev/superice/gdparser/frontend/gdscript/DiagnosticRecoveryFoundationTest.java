@@ -4,6 +4,7 @@ import dev.superice.gdparser.frontend.ast.AnnotationStatement;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
 import dev.superice.gdparser.frontend.ast.Block;
+import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.CommentStatement;
 import dev.superice.gdparser.frontend.ast.ElifClause;
 import dev.superice.gdparser.frontend.ast.ErrorExpression;
@@ -18,6 +19,7 @@ import dev.superice.gdparser.frontend.ast.Point;
 import dev.superice.gdparser.frontend.ast.Range;
 import dev.superice.gdparser.frontend.ast.RecoveryLink;
 import dev.superice.gdparser.frontend.ast.ReturnStatement;
+import dev.superice.gdparser.frontend.ast.SignalStatement;
 import dev.superice.gdparser.frontend.ast.SourceFile;
 import dev.superice.gdparser.frontend.ast.Statement;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
@@ -148,6 +150,45 @@ class DiagnosticRecoveryFoundationTest {
                 DiagnosticCodes.MISSING_CLOSER_GROUPING, ReturnStatement.class, "variable.initializer"));
         assertFalse(DiagnosticCodes.isValidPairing(
                 "parse.unregistered", VariableDeclaration.class, "variable.initializer"));
+    }
+
+    @Test
+    void boundaryCodesKeepClosedPairingsAndStandaloneEligibilitySeparate() {
+        assertTrue(DiagnosticCodes.allowsNullRecovery(DiagnosticCodes.UNEXPECTED_CLOSER));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.UNEXPECTED_CLOSER, PassStatement.class, "statement.trailing"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.UNEXPECTED_CLOSER, FunctionDeclaration.class, "suite.body"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.UNEXPECTED_CLOSER, ClassDeclaration.class, "class.body"));
+        assertFalse(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.UNEXPECTED_CLOSER, SourceFile.class, "class.body"));
+
+        assertTrue(DiagnosticCodes.allowsNullRecovery(DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, FunctionDeclaration.class, "suite.body"));
+        assertFalse(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, ClassDeclaration.class, "class.body"));
+        assertFalse(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, SourceFile.class, "suite.body"));
+
+        assertFalse(DiagnosticCodes.allowsNullRecovery(DiagnosticCodes.MISSING_CLOSER_GROUPING));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.MISSING_CLOSER_GROUPING, FunctionDeclaration.class, "function.signature"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.MISSING_CLOSER_GROUPING, SignalStatement.class, "signal.parameter"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.SLOT_RETURN_VALUE, FunctionDeclaration.class, "function.signature"));
+        assertTrue(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.MISSING_TYPE_LAMBDA_PARAMETER, SignalStatement.class, "signal.parameter"));
+        for (var code : List.of(DiagnosticCodes.PROPERTY_DUPLICATE_GETTER, DiagnosticCodes.CLASS_DUPLICATE_EXTENDS,
+                DiagnosticCodes.MISSING_CLOSER_ENUM, DiagnosticCodes.MISMATCHED_CLOSER_ENUM,
+                DiagnosticCodes.SLOT_ENUM_VALUE)) {
+            assertFalse(DiagnosticCodes.isValidPairing(code, FunctionDeclaration.class, "function.signature"));
+            assertFalse(DiagnosticCodes.isValidPairing(code, SignalStatement.class, "signal.parameter"));
+        }
+        assertFalse(DiagnosticCodes.isValidPairing(
+                DiagnosticCodes.FUNCTION_INVALID_STATIC_INIT, SignalStatement.class, "signal.parameter"));
     }
 
     @Test

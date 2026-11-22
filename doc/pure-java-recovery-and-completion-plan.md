@@ -556,15 +556,15 @@ sealed interface ParseOutcome<T> {
   表达式与类型，这类诊断表示当前层结构损伤，不等同于已闭合的子槽损伤。
 - **归属**：诊断发出时记入**最内层打开的 owner frame**；frame 在槽位解析前 push、该槽位表达式解析完立即
   pop 暂存（先 pop 后进 suite，防止 body 诊断误绑头部 facet）、owner 节点建成时绑定（`RecoveryLink(owner,
-  facet)`）；owner 未建成（语句被丢）的 frame 直接丢弃，诊断留 code+range 走 §7 第 1 条判据 (b)。
+  facet)`）。若 owner 未保留，则只沿显式授权链查找支持该 code 的存活 owner/facet，不向任意外层构造回绑。
 - **配对的位点细则**：
   - assert 的条件/消息 frame 在各自 `parseExpression` 后 pop；assert 自身的 `)` 闭合符诊断落在另一个覆盖
     整个实参区的 `assert.arguments` frame（条件/消息 frame pop 后它仍是最内层），建成 AssertStatement 时绑定。
   - 注解实参的 frame 绑到 `AnnotationStatement` 自身（facet `annotation.arguments`）——注解解析时还没有
     被注解的声明，不能绑给后到的声明。
   - 参数默认值的 frame **延迟到签名最终接纳该参数时再绑定**：rest 参数的 variadic 重建会替换 Parameter 节点，
-    frame 随之迁移到重建后的节点；任何最终被丢弃的参数其 frame 一并丢弃（§7 第 8 条的同代身份要求 owner 必须
-    在最终 AST 中可按身份到达）。
+    frame 随之迁移到重建后的节点；最终被丢弃的参数不再作为 owner，但其 frame 保留到签名的授权路径
+    （§7 第 8 条的同代身份要求 owner 必须在最终 AST 中可按身份到达）。
   - enum 值开 `enum.value` frame，绑到建成的 `EnumMember`；match pattern 列表开 `match.pattern` frame，
     绑到建成的 `MatchSection`。
   - `as`/`is` 中类型括号沿用当前表达式槽位归属；若没有外层 recovery frame，则在操作符处开启
@@ -575,11 +575,10 @@ sealed interface ParseOutcome<T> {
   `return.value`、`assert.condition`、`assert.message`、`assert.arguments`、`match.value`、`match.guard`、
   `match.pattern`、`if.condition`、`elif.condition`、`while.condition`、`for.iterable`、`enum.value`、
   `expression`（表达式语句）、`annotation.arguments`。
-- **可达性清扫**：`parse()` 返回前按对象身份遍历最终 AST 建立可达 Node 集合，对 owner 不可达的
-  `RecoveryLink` 清空 `recovery`（保留 code/range/message，不回绑外层 owner）——覆盖「延迟绑定后祖先
-  构造仍被丢弃」的情形（如 `func f(x, x = func(): return (1` 的重复参数被丢后，内层 return 上已绑定的
-  缺 `)` link 失效）。验收：T6/T12 统一断言每个非空 `recovery.owner` 都能从最终 AST 按身份（`assertSame`
-  语义）到达。
+- **可达性清扫**：`parse()` 返回前按对象身份遍历最终 AST 建立可达 Node 集合。`func f(x, x = func(): return (1`
+  的重复参数被丢后，分组缺 `)` 的诊断沿 lambda 套件和默认值帧回退到存活函数的 `function.signature`；
+  没有合法授权目标时才清空链接（保留 code/range/message）。验收：每个非空 `recovery.owner` 都能从最终 AST
+  按身份（`assertSame` 语义）到达。
 
 ### 8.5 C3 槽位 marker（3A，D9）
 

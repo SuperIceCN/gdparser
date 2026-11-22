@@ -9,6 +9,7 @@ enum StructuralRole {
     SUITE,
     MATCH_BODY,
     LAMBDA,
+    PROPERTY_ACCESSORS,
     GROUPING,
     ARRAY,
     DICTIONARY,
@@ -65,7 +66,7 @@ final class StructuralFrame {
     boolean ownsComma() {
         return switch (role) {
             case ARRAY, DICTIONARY, CALL, PARAMETER_LIST, ANNOTATION, ASSERT, PRELOAD,
-                 MATCH_ARRAY_PATTERN, MATCH_DICTIONARY_PATTERN, ENUM -> true;
+                 MATCH_ARRAY_PATTERN, MATCH_DICTIONARY_PATTERN, ENUM, PROPERTY_ACCESSORS -> true;
             case TYPE_BRACKET -> allowsTypeComma && separatorPhase == SeparatorPhase.EXPECT_SEPARATOR_OR_CLOSER;
             case CLASS_BODY, SUITE, MATCH_BODY, LAMBDA, GROUPING, SUBSCRIPT -> false;
         };

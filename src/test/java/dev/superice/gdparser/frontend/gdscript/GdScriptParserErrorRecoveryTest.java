@@ -986,6 +986,11 @@ class GdScriptParserErrorRecoveryTest {
             var pass = assertInstanceOf(PassStatement.class, sibling.body().statements().getFirst());
             var passStart = source.indexOf(": pass") + 2;
             assertEquals(utf8Range(source, passStart, passStart + "pass".length()), pass.range());
+            var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
+            var match = assertInstanceOf(MatchStatement.class, function.body().statements().getFirst());
+            var orphan = findErrorByCode(result, DiagnosticCodes.UNEXPECTED_CLOSER);
+            assertSame(match, requireNotNull(orphan.recovery()).owner());
+            assertEquals("match.section", orphan.recovery().facet());
             assertEquals(List.of("f", "after"), topLevelMemberNames(result));
         }
     }
@@ -2026,22 +2031,19 @@ class GdScriptParserErrorRecoveryTest {
         }
     }
 
-    /// Every bound recovery link must point at an owner reachable from the final AST
-    /// (identity semantics): the end-of-parse sweep unlinks owners of discarded constructs.
     @Test
-    void recoveryLinkOfDiscardedOwnerIsSwept() {
-        // The grouping's missing-`)` diagnostic is first bound to the inner return statement;
-        // the enclosing duplicate parameter `x` is then dropped from the signature, making the
-        // return (inside the lambda default) unreachable — the sweep must clear the link while
-        // keeping code, range and message.
+    void closerFromDiscardedDefaultAttributionFallsBackToSurvivingSignature() {
         var source = "func f(x, x = func(): return (1";
         var result = recoverableParse(source);
         var function = assertInstanceOf(FunctionDeclaration.class, result.ast().statements().getFirst());
         assertEquals(1, function.parameters().size());
+        assertEquals("x", function.parameters().getFirst().name());
+        assertNull(function.parameters().getFirst().defaultValue());
         var closer = errorsOf(result).stream()
                 .filter(d -> "parse.missing_closer.grouping".equals(d.code()))
                 .findFirst().orElseThrow();
-        assertNull(closer.recovery());
+        assertSame(function, requireNotNull(closer.recovery()).owner());
+        assertEquals("function.signature", closer.recovery().facet());
         assertEquals("Expected closing \")\" after grouping expression.", closer.message());
         assertEquals(source.length(), closer.range().startByte());
         assertEquals(source.length(), closer.range().endByte());
@@ -5455,14 +5457,21 @@ class GdScriptParserErrorRecoveryTest {
 
     @Test
     void circuitBreakerLocalBracketStackOperationsStayLinear() {
-        var n = 2_000;
-        var source = "func f():\n" + "\tvar\n".repeat(102) + "\t" + "(".repeat(n) + "1" + "]".repeat(n) + "\nvar after = 1\n";
         var parser = new GdScriptParser();
-        var result = parser.parse(source);
-        assertEquals(2, result.ast().statements().size(), () -> result.ast().statements().toString());
-        assertEquals("after", assertInstanceOf(VariableDeclaration.class, result.ast().statements().get(1)).name());
-        assertTrue(parser.circuitBreakerStackOps() <= 4 * n,
-                () -> "Expected linear circuit-breaker stack ops <= " + (4 * n) + " but got " + parser.circuitBreakerStackOps());
+        for (var n : List.of(256, 512, 1024, 2048)) {
+            var source = "func f():\n" + "\tvar\n".repeat(102) + "\t" + "(".repeat(n) + "1" + "]".repeat(n)
+                    + "\nvar after = 1\n";
+            var result = parser.parse(source);
+            assertEquals(2, result.ast().statements().size(), () -> result.ast().statements().toString());
+            assertEquals("after", assertInstanceOf(VariableDeclaration.class, result.ast().statements().getLast()).name());
+            assertTrue(parser.circuitBreakerStackOps() <= 4 * n,
+                    () -> "Expected at most four stack operations per opener/closer pair, got " + parser.circuitBreakerStackOps());
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            var breaker = findErrorByCode(result, DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS);
+            assertSame(result.ast().statements().getFirst(), requireNotNull(breaker.recovery()).owner());
+            assertEquals("suite.body", breaker.recovery().facet());
+            assertTrue(parser.parse("func f():\n\tpass\n").diagnostics().isEmpty());
+        }
     }
 
     @Test

@@ -43,6 +43,7 @@ import org.jetbrains.annotations.Nullable;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -403,7 +404,8 @@ public final class DiagnosticCodes {
                 MISSING_CLOSER_PARAMETER_LIST, MISMATCHED_CLOSER_PARAMETER_LIST);
         registerPairings(pairings, Set.of("match.pattern", "match.section", "variable.property"),
                 MISSING_CLOSER_MATCH_ARRAY_PATTERN, MISMATCHED_CLOSER_MATCH_ARRAY_PATTERN);
-        registerPairings(pairings, Set.of("match.pattern", "match.dictionary_pattern", "match.section", "variable.property"),
+        registerPairings(pairings, Set.of("match.pattern", "match.dictionary_pattern", "match.section",
+                        "variable.property"),
                 MISSING_CLOSER_MATCH_DICTIONARY_PATTERN, MISMATCHED_CLOSER_MATCH_DICTIONARY_PATTERN);
         registerPairings(pairings, Set.of("enum.body"),
                 MISSING_CLOSER_ENUM, MISMATCHED_CLOSER_ENUM);
@@ -449,6 +451,30 @@ public final class DiagnosticCodes {
         pairings.put(DECLARATION_MISSING_NAME, Set.of(
                 "declaration.name", "function.name", "enum.body", "function.signature", "signal.parameter", "variable.property"));
 
+        // A discarded parameter default can contain a lambda header or suite. Permit fallback
+        // to the surviving signature for diagnostics specific to these contexts, but not for
+        // class members or constructs only admitted at class scope.
+        for (var code : List.of(
+                MISSING_CLOSER_ASSERT, MISMATCHED_CLOSER_ASSERT,
+                MISSING_CLOSER_ANNOTATION, MISMATCHED_CLOSER_ANNOTATION,
+                MISSING_CLOSER_MATCH_ARRAY_PATTERN, MISMATCHED_CLOSER_MATCH_ARRAY_PATTERN,
+                MISSING_CLOSER_MATCH_DICTIONARY_PATTERN, MISMATCHED_CLOSER_MATCH_DICTIONARY_PATTERN,
+                SLOT_VARIABLE_INITIALIZER, SLOT_CONSTANT_VALUE, SLOT_RETURN_VALUE, SLOT_IF_CONDITION,
+                SLOT_ELIF_CONDITION, SLOT_WHILE_CONDITION, SLOT_FOR_ITERABLE, SLOT_ASSERT_CONDITION,
+                SLOT_ASSERT_MESSAGE, SLOT_MATCH_VALUE, SLOT_MATCH_GUARD, SLOT_MATCH_PATTERN,
+                SLOT_DICTIONARY_PATTERN_KEY, SLOT_ANNOTATION_ARGUMENT,
+                MISSING_TYPE_VARIABLE, MISSING_TYPE_CONSTANT, MISSING_TYPE_LAMBDA_PARAMETER,
+                MISSING_TYPE_RETURN_TYPE, MISSING_TYPE_FOR_ITERATOR,
+                STATEMENT_TRAILING, MISSING_SEPARATOR_MATCH_COLON, MISSING_SEPARATOR_SUITE_COLON,
+                MISSING_SEPARATOR_FOR_IN, FOR_MISSING_ITERATOR, FOR_MISSING_IN,
+                MATCH_BIND_MISSING_NAME, MATCH_REST_MISPLACED, MATCH_REST_NOT_LAST, LAMBDA_BARE_STATEMENT,
+                ANNOTATION_DANGLING, ANNOTATION_INVALID_LEVEL, ANNOTATION_INVALID_TARGET)) {
+            var facetsWithSignature = new HashSet<>(pairings.get(code));
+            facetsWithSignature.add("function.signature");
+            facetsWithSignature.add("signal.parameter");
+            pairings.put(code, Set.copyOf(facetsWithSignature));
+        }
+
         // Standalone-allowed codes may also be attributed to any valid construct facet when claimed
         // inside that construct (e.g. a lexical error claimed by an open statement frame).
         var allFacets = Set.copyOf(FACET_ALLOWED_OWNERS.keySet());
@@ -458,7 +484,7 @@ public final class DiagnosticCodes {
                 SYNTAX_UNEXPECTED_TOKEN,
                 NESTING_DEPTH_EXCEEDED
         );
-        pairings.put(STATEMENT_TOO_MANY_ERRORS, Set.of());
+        pairings.put(STATEMENT_TOO_MANY_ERRORS, Set.of("suite.body"));
 
         CODE_ALLOWED_FACETS = Map.copyOf(pairings);
         REGISTERED_CODES = Collections.unmodifiableSet(new HashSet<>(CODE_ALLOWED_FACETS.keySet()));

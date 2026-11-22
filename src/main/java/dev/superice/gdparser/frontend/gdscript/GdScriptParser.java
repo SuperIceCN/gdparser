@@ -187,6 +187,8 @@ public final class GdScriptParser {
     /// inner expression statements inherit the immediate surviving suite owner instead of
     /// dropping diagnostics as unowned.
     private RecoveryTransactionTracker.@Nullable ProvisionalFrame suiteBodyFallbackFrame;
+    /// Recovery owner for member-level errors with no declaration node, or `null` at script root.
+    private RecoveryTransactionTracker.@Nullable ProvisionalFrame classBodyRecoveryFrame;
     /// Active provisional `"class.extends"` frame for the first script-level `extends` or
     /// `class_name ... extends` declaration, so a duplicate top-level `extends` attributes there.
     private RecoveryTransactionTracker.@Nullable ProvisionalFrame scriptExtendsFrame;
@@ -329,6 +331,7 @@ public final class GdScriptParser {
         isolatedFallbackFrame = null;
         lambdaBodyFallbackFrame = null;
         suiteBodyFallbackFrame = null;
+        classBodyRecoveryFrame = null;
         scriptExtendsFrame = null;
         pendingAnnotations.clear();
         activeWarningIgnoreStarts.clear();
@@ -1061,6 +1064,24 @@ public final class GdScriptParser {
         return current.type() == GdTokenType.DEDENT;
     }
 
+    private boolean isAtInlinePropertySuiteEnd() {
+        if (!check(GdTokenType.COMMA) || isolatedFallbackFrame == null
+                || previous.type() == GdTokenType.NEWLINE || previous.type() == GdTokenType.DEDENT) {
+            return false;
+        }
+        var frames = structuralStack.descendingIterator();
+        while (frames.hasNext()) {
+            var frame = frames.next();
+            if (frame.role == StructuralRole.PROPERTY_ACCESSORS) {
+                return true;
+            }
+            if (frame.isBracketed() || frame.effectiveMultiline) {
+                break;
+            }
+        }
+        return false;
+    }
+
     private static final class LocalDelimiterEntry {
         final @NotNull GdTokenType openerType;
         final int startByte;
@@ -1226,14 +1247,25 @@ public final class GdScriptParser {
         return poisonedBracketOpenerLookups;
     }
 
-    private void emitUnexpectedCloser(@NotNull GdToken token) {
+    private void emitAtRecoveryTarget(
+            @NotNull String message, @NotNull GdToken token, @NotNull String code,
+            RecoveryTransactionTracker.@Nullable ProvisionalFrame target
+    ) {
         recoveryTracker.emitError(
-                "Unexpected closing \"%s\".".formatted(token.type().displayName()),
+                message,
                 tokenRange(token),
-                DiagnosticCodes.UNEXPECTED_CLOSER,
-                RecoveryTransactionTracker.AttributionPolicy.STANDALONE,
-                null
+                code,
+                target == null ? RecoveryTransactionTracker.AttributionPolicy.STANDALONE
+                        : RecoveryTransactionTracker.AttributionPolicy.TARGET_FRAME,
+                target
         );
+    }
+
+    private void emitUnexpectedCloser(
+            @NotNull GdToken token, RecoveryTransactionTracker.@Nullable ProvisionalFrame target
+    ) {
+        emitAtRecoveryTarget("Unexpected closing \"%s\".".formatted(token.type().displayName()),
+                token, DiagnosticCodes.UNEXPECTED_CLOSER, target);
     }
 
     int bracketOracleScanCount() {
@@ -3027,6 +3059,12 @@ public final class GdScriptParser {
     ///    at a non-closer boundary) without consuming lookahead, replaying suppressed layout if
     ///    multiline suppression just ended.
     private boolean consumeCloser(@NotNull StructuralFrame frame, boolean suppressMissingOnNonCloser) {
+        return consumeCloser(frame, suppressMissingOnNonCloser, true);
+    }
+
+    private boolean consumeCloser(
+            @NotNull StructuralFrame frame, boolean suppressMissingOnNonCloser, boolean replayLayoutOnNonCloser
+    ) {
         if (frame.settled) {
             return false;
         }
@@ -3082,7 +3120,9 @@ public final class GdScriptParser {
         popStructuralFrame(frame);
         if (frame.ownsMultilineFrame) {
             popMultiline(frame.recordCommentSpan, extentEnd());
-            replayLayoutIfExitedMultiline();
+            if (replayLayoutOnNonCloser) {
+                replayLayoutIfExitedMultiline();
+            }
         }
         if (!suppressMissingOnNonCloser) {
             var point = extentEnd();
@@ -3197,9 +3237,9 @@ public final class GdScriptParser {
         }
     }
 
-    /// Opens a parameter slot owner anchored to its enclosing signature/signal frame so dropped
-    /// duplicate parameters still attribute supported diagnostics to the outer declaration.
-    private void pushParameterSlotOwner(
+    /// Opens a signature slot with an explicit fallback to its enclosing signature or signal
+    /// frame, so supported diagnostics survive dropping a duplicate parameter or its default.
+    private void pushSignatureSlotOwner(
             @NotNull String facet,
             RecoveryTransactionTracker.@Nullable ProvisionalFrame signatureFrame
     ) {
@@ -3687,11 +3727,12 @@ public final class GdScriptParser {
     /// boundary (layout token or enclosing delimiter/comma), so same-line trailing garbage inside
     /// an inline lambda still routes through `finishStatementProvisional` as `STATEMENT_TRAILING`.
     private boolean isStatementEnd() {
-        return lambdaEnded || (inLambda && isVirtualLambdaBoundary()) || isStatementEndToken();
+        return lambdaEnded || (inLambda && isVirtualLambdaBoundary())
+                || isAtInlinePropertySuiteEnd() || isStatementEndToken();
     }
 
     /// Consumes trailing statement terminators (`NEWLINE`/`SEMICOLON`) or inline-lambda boundaries,
-    /// binds any `STATEMENT_TRAILING` diagnostic over the consumed trailing garbage fragment to the
+    /// binds same-line trailing diagnostics over the consumed garbage fragment to the
     /// already-constructed `owner`, and marks `pendingSync` when unexpected trailing tokens were found.
     private void finishStatement(@NotNull Statement owner, @NotNull String context) {
         var trailingFrame = finishStatementProvisional(context);
@@ -3719,12 +3760,15 @@ public final class GdScriptParser {
     private @Nullable RecoveryTransactionTracker.ProvisionalFrame finishStatementProvisional(@NotNull String context) {
         RecoveryTransactionTracker.ProvisionalFrame trailingFrame = null;
         var found = false;
+        var crossedStatementEnd = previous.type() == GdTokenType.NEWLINE
+                || previous.type() == GdTokenType.DEDENT || previous.type() == GdTokenType.SEMICOLON;
         while ((isStatementEnd() || (isCloserToken(current.type()) && !hasMatchingAncestorCloser(current.type())))
                 && !isAtEnd()) {
             if (isStatementEndToken()) {
                 if (hasCurrentLogicalLineLexicalErrors()) {
                     trailingFrame = claimTrailingLexicalBatch(trailingFrame);
                 }
+                crossedStatementEnd = true;
                 advance();
                 found = true;
             } else if (isCloserToken(current.type()) && !hasMatchingAncestorCloser(current.type())) {
@@ -3740,11 +3784,28 @@ public final class GdScriptParser {
                     }
                     break;
                 }
+                // After a statement terminator, the next orphan belongs to the enclosing sequence.
+                if (crossedStatementEnd) {
+                    lambdaEnded = false;
+                    found = true;
+                    break;
+                }
                 if (hasCurrentLogicalLineLexicalErrors()) {
                     trailingFrame = claimTrailingLexicalBatch(trailingFrame);
                 }
+                if (trailingFrame == null) {
+                    pushRecoveryOwner("statement.trailing");
+                    trailingFrame = popRecoveryOwner();
+                }
                 advance();
-                emitUnexpectedCloser(previous);
+                emitUnexpectedCloser(previous, trailingFrame);
+            } else if (isAtInlinePropertySuiteEnd()) {
+                if (hasCurrentLogicalLineLexicalErrors()) {
+                    trailingFrame = claimTrailingLexicalBatch(trailingFrame);
+                }
+                lambdaEnded = false;
+                found = true;
+                break;
             } else if (lambdaEnded) {
                 if (hasCurrentLogicalLineLexicalErrors()) {
                     trailingFrame = claimTrailingLexicalBatch(trailingFrame);
@@ -4086,7 +4147,7 @@ public final class GdScriptParser {
         if (check(GdTokenType.LITERAL) && current.literalKind() == GdLiteralKind.STRING) {
             advance();
             if (!match(GdTokenType.NEWLINE)) {
-                pushError("Expected newline after comment string.", DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN);
+                emitClassBodyError("Expected newline after comment string.");
             }
             return false;
         }
@@ -4172,8 +4233,7 @@ public final class GdScriptParser {
                     // which mislabels the recovered sibling — a recovery-only refinement).
                     nextIsStatic = check(GdTokenType.FUNC) || check(GdTokenType.VAR);
                     if (!nextIsStatic) {
-                        pushError("Expected \"func\" or \"var\" after \"static\".",
-                                DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN);
+                        emitClassBodyError("Expected \"func\" or \"var\" after \"static\".");
                         markCurrentFramePendingSync();
                     }
                 }
@@ -4208,8 +4268,7 @@ public final class GdScriptParser {
                 case INDENT -> {
                     if (multiline) {
                         advance();
-                        pushError("Unexpected %s in class body.".formatted(debugName(previous)),
-                                DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN);
+                        emitClassBodyError("Unexpected %s in class body.".formatted(debugName(previous)));
                         unexpectedIndentDepth++;
                     } else {
                         reportUnexpectedClassBodyToken();
@@ -4258,7 +4317,7 @@ public final class GdScriptParser {
     private void reportUnexpectedClassBodyToken() {
         advance();
         if (isCloserToken(previous.type())) {
-            emitUnexpectedCloser(previous);
+            emitUnexpectedCloser(previous, classBodyRecoveryFrame);
             markCurrentFramePendingSync();
             return;
         }
@@ -4282,8 +4341,12 @@ public final class GdScriptParser {
                     "The \"mastersync\" keyword was removed in Godot 4. Use the \"@rpc\" annotation with \"any_peer\" and \"call_local\", and perform a check inside the function instead.";
             default -> "Unexpected %s in class body.".formatted(debugName(previous));
         };
-        pushError(message, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN);
+        emitClassBodyError(message);
         markCurrentFramePendingSync();
+    }
+
+    private void emitClassBodyError(String message) {
+        emitAtRecoveryTarget(message, previous, DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, classBodyRecoveryFrame);
     }
 
     /// Computes the statement start (unless a `static` prefix already did so for this member),
@@ -4436,9 +4499,12 @@ public final class GdScriptParser {
                 : 0;
         var classFrame = pushStructuralFrame(StructuralFrame.nonBracketed(
                 StructuralRole.CLASS_BODY, start, bodyLayoutBaseline, multiline, false, "class body"));
+        var previousClassBodyRecoveryFrame = classBodyRecoveryFrame;
+        classBodyRecoveryFrame = classBodyFrame;
         try {
             parseClassBody(multiline, false, bodyStatements, bodyIndent);
         } finally {
+            classBodyRecoveryFrame = previousClassBodyRecoveryFrame;
             popStructuralFrame(classFrame);
         }
         var blockEnd = bodyStatements.isEmpty()
@@ -4484,13 +4550,10 @@ public final class GdScriptParser {
     private RecoveryTransactionTracker.@NotNull ProvisionalFrame emitSuiteLayoutError(
             RecoveryTransactionTracker.@Nullable ProvisionalFrame existing,
             @NotNull String message,
-            @NotNull GdToken origin
+            @NotNull GdToken origin,
+            boolean forLambda
     ) {
-        var frame = existing;
-        if (frame == null) {
-            pushRecoveryOwner("suite.body");
-            frame = popRecoveryOwner();
-        }
+        var frame = existing != null ? existing : newSuiteLayoutFrame(forLambda);
         recoveryTracker.emitError(
                 message,
                 tokenRange(origin),
@@ -4499,6 +4562,16 @@ public final class GdScriptParser {
                 frame
         );
         return frame;
+    }
+
+    private RecoveryTransactionTracker.@NotNull ProvisionalFrame newSuiteLayoutFrame(boolean forLambda) {
+        if (isolatedFallbackFrame == null && forLambda && lambdaBodyFallbackFrame != null) {
+            // The lambda's body frame carries the fallback to its parameter default, if any.
+            recoveryTracker.pushChildFrame("suite.body", lambdaBodyFallbackFrame, "suite.body");
+        } else {
+            pushRecoveryOwner("suite.body");
+        }
+        return popRecoveryOwner();
     }
 
     /// Port of `GDScriptParser::parse_suite`: multi-line (NEWLINE + INDENT … DEDENT) or single-line
@@ -4546,8 +4619,7 @@ public final class GdScriptParser {
             if (isolatedFallbackFrame != null) {
                 headerTarget = isolatedFallbackFrame;
             } else {
-                pushRecoveryOwner("suite.body");
-                layoutFrame = popRecoveryOwner();
+                layoutFrame = newSuiteLayoutFrame(forLambda);
                 headerTarget = layoutFrame;
             }
             var claimedSpan = claimSameLogicalLineHeaderLexicalErrors(headerTarget);
@@ -4569,7 +4641,8 @@ public final class GdScriptParser {
                 layoutFrame = emitSuiteLayoutError(
                         layoutFrame,
                         "Expected indented block after %s.".formatted(context),
-                        previous
+                        previous,
+                        forLambda
                 );
                 return new SuiteResult(new Block(List.of(), range(blockStart, blockStart)), layoutFrame);
             }
@@ -4596,8 +4669,7 @@ public final class GdScriptParser {
                 suiteBodyFallbackFrame = layoutFrame != null ? layoutFrame : lambdaBodyFallbackFrame;
             } else {
                 if (layoutFrame == null) {
-                    pushRecoveryOwner("suite.body");
-                    layoutFrame = popRecoveryOwner();
+                    layoutFrame = newSuiteLayoutFrame(forLambda);
                 }
                 suiteBodyFallbackFrame = layoutFrame;
             }
@@ -4609,6 +4681,7 @@ public final class GdScriptParser {
         var unexpectedIndentDepth = 0;
         var trippedCircuitBreaker = false;
         var consumedPrefixOnLine = false;
+        var endedAtPropertyComma = false;
         try {
             suiteLoop:
             do {
@@ -4629,17 +4702,13 @@ public final class GdScriptParser {
                     layoutFrame = emitSuiteLayoutError(
                             layoutFrame,
                             "Expected statement, found \"%s\" instead.".formatted(previous.type().displayName()),
-                            previous
+                            previous,
+                            forLambda
                     );
                     unexpectedIndentDepth++;
                     if (errorCount++ > 100) {
-                        recoveryTracker.emitError(
-                                "Too many statement errors.",
-                                tokenRange(previous),
-                                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS,
-                                RecoveryTransactionTracker.AttributionPolicy.STANDALONE,
-                                null
-                        );
+                        emitAtRecoveryTarget("Too many statement errors.", previous,
+                                DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, suiteBodyFallbackFrame);
                         trippedCircuitBreaker = true;
                         break;
                     }
@@ -4653,17 +4722,16 @@ public final class GdScriptParser {
                     case StatementProgress.Failed(var prefixStatements) -> {
                         statements.addAll(prefixStatements);
                         if (errorCount++ > 100) {
-                            recoveryTracker.emitError(
-                                    "Too many statement errors.",
-                                    tokenRange(previous),
-                                    DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS,
-                                    RecoveryTransactionTracker.AttributionPolicy.STANDALONE,
-                                    null
-                            );
+                            emitAtRecoveryTarget("Too many statement errors.", previous,
+                                    DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS, suiteBodyFallbackFrame);
                             trippedCircuitBreaker = true;
                             break suiteLoop;
                         }
                     }
+                }
+                if (isAtInlinePropertySuiteEnd()) {
+                    endedAtPropertyComma = true;
+                    break;
                 }
             } while ((multiline || consumedPrefixOnLine || previous.type() == GdTokenType.SEMICOLON)
                     && (!check(GdTokenType.DEDENT) || unexpectedIndentDepth > 0)
@@ -5178,19 +5246,21 @@ public final class GdScriptParser {
                     layoutFrame = emitSuiteLayoutError(
                             layoutFrame,
                             "Missing unindent at the end of %s.".formatted(context),
-                            previous
+                            previous,
+                            forLambda
                     );
                 }
             } else {
                 flushOutOfScopeDedentedErrors(suiteLayoutBaseline);
                 match(GdTokenType.DEDENT);
             }
-        } else if (previous.type() == GdTokenType.SEMICOLON) {
+        } else if (!endedAtPropertyComma && previous.type() == GdTokenType.SEMICOLON) {
             if (!match(GdTokenType.NEWLINE)) {
                 layoutFrame = emitSuiteLayoutError(
                         layoutFrame,
                         "Expected newline after \";\" at the end of %s.".formatted(context),
-                        previous
+                        previous,
+                        forLambda
                 );
             }
         }
@@ -5216,6 +5286,9 @@ public final class GdScriptParser {
     /// soft-failing `advance()`) so the following `synchronize()` keeps its usual boundary. No
     /// `endStatement` call and no additional diagnostic.
     private void discardFailedStatement() {
+        if (isAtInlinePropertySuiteEnd()) {
+            return;
+        }
         if (inLambda) {
             if (isVirtualLambdaBoundary()) {
                 lambdaEnded = true;
@@ -5252,6 +5325,7 @@ public final class GdScriptParser {
     private boolean isGenuineReturnStatementEnd() {
         return !hasCurrentLogicalLineLexicalErrors()
                 && (isStatementEndToken()
+                        || isAtInlinePropertySuiteEnd()
                         || check(GdTokenType.DEDENT)
                         || lambdaEnded
                         || (inLambda && isVirtualLambdaBoundary()));
@@ -5613,7 +5687,9 @@ public final class GdScriptParser {
                             }
                             if (isCloserToken(previous.type())
                                     && (!inLambda || !hasMatchingAncestorCloser(previous.type()))) {
-                                emitUnexpectedCloser(previous);
+                                emitUnexpectedCloser(previous, isolatedFallbackFrame != null
+                                        ? isolatedFallbackFrame
+                                        : suiteBodyFallbackFrame);
                             } else {
                                 emitInCurrentFrameOrLegacy(
                                         "Expected statement, found \"%s\" instead."
@@ -6114,6 +6190,16 @@ public final class GdScriptParser {
                 // The reference path drops comments at the match branch level (a col-0 comment
                 // between branches even breaks its grammar — a registered parity divergence).
                 discardPendingComments();
+                if (isCloserToken(current.type())) {
+                    if (hasMatchingAncestorCloser(current.type())) {
+                        break;
+                    }
+                    // A branch suite leaves the next line's orphan to this match body.
+                    advance();
+                    emitUnexpectedCloser(previous, matchLayoutFrame);
+                    match(GdTokenType.NEWLINE);
+                    continue;
+                }
                 if (check(GdTokenType.PASS)) {
                     if (hasUnsettledLexicalBatch(currentPrecedingErrors)) {
                         var count = currentPrecedingErrors.entryCount();
@@ -6212,7 +6298,8 @@ public final class GdScriptParser {
                 activePropertyRecoveryAnnotations.add(dangling);
             }
         }
-        if (!match(GdTokenType.DEDENT)) {
+        if (!match(GdTokenType.DEDENT)
+                && !(isCloserToken(current.type()) && hasMatchingAncestorCloser(current.type()))) {
             matchLayoutFrame = emitMatchLayoutError(
                     matchLayoutFrame,
                     "Expected an indented block after \"match\" statement.",
@@ -7667,6 +7754,8 @@ public final class GdScriptParser {
             var end = previous.endByte();
             var firstItem = true;
             var prevConsumedComma = false;
+            var previousRejectedBlock = false;
+            var endedByRejectedSuite = false;
             while (true) {
                 if (!firstItem) {
                     if (!needIndent) {
@@ -7704,6 +7793,7 @@ public final class GdScriptParser {
                             break;
                         }
                         if (Boolean.TRUE.equals(lockedReferenceForm)
+                                && !previousRejectedBlock
                                 && !hadSeparator
                                 && check(GdTokenType.IDENTIFIER)
                                 && (current.source().equals("get") || current.source().equals("set"))
@@ -7720,6 +7810,7 @@ public final class GdScriptParser {
                     }
                 }
                 firstItem = false;
+                previousRejectedBlock = false;
 
                 if (needIndent && (check(GdTokenType.DEDENT) || isAtEnd())) {
                     break;
@@ -7757,53 +7848,40 @@ public final class GdScriptParser {
 
                 var functionName = previous.source();
                 var itemIsReferenceForm = check(GdTokenType.EQUAL);
-                if (functionName.equals("set")) {
-                    if (setterUsed) {
-                        recoveryTracker.emitError(
-                                "Properties can only have one setter.",
-                                tokenRange(previous),
-                                DiagnosticCodes.PROPERTY_DUPLICATE_SETTER,
-                                RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
-                                null
-                        );
+                var setter = functionName.equals("set");
+                if (setter || functionName.equals("get")) {
+                    var duplicate = setter ? setterUsed : getterUsed;
+                    var wrongStyle = lockedReferenceForm != null && lockedReferenceForm != itemIsReferenceForm;
+                    if (duplicate || wrongStyle) {
+                        // Diagnose the rejected item at its keyword; parsing it as the locked form
+                        // would add misleading header errors. Still drain its own nested suite.
+                        if (duplicate) {
+                            emitInCurrentFrameOrLegacy(
+                                    setter ? "Properties can only have one setter." : "Properties can only have one getter.",
+                                    setter ? DiagnosticCodes.PROPERTY_DUPLICATE_SETTER : DiagnosticCodes.PROPERTY_DUPLICATE_GETTER);
+                        } else {
+                            var expected = itemIsReferenceForm ? (setter ? "\"(\"" : "\":\" or \"(\"") : "\"=\"";
+                            emitInCurrentFrameOrLegacy("Expected %s after \"%s\".".formatted(expected, functionName),
+                                    DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
+                        }
+                        var drained = drainUnexpectedPropertyAccessor(needIndent, true, !itemIsReferenceForm);
+                        end = Math.max(end, drained.endByte());
+                        previousRejectedBlock = !itemIsReferenceForm;
+                        // Unless the suite yielded a comma, its parser already ended this inline property.
+                        if (!needIndent && drained.parsedSuite()
+                                && !(check(GdTokenType.COMMA) && previous.type() != GdTokenType.NEWLINE
+                                        && previous.type() != GdTokenType.DEDENT)) {
+                            endedByRejectedSuite = true;
+                            break;
+                        }
                     } else {
-                        setterUsed = true;
-                    }
-                    if (Boolean.TRUE.equals(lockedReferenceForm) && !itemIsReferenceForm) {
-                        emitInCurrentFrameOrLegacy("Expected \"=\" after \"set\"",
-                                DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
-                    }
-                    var parseAsReference = lockedReferenceForm != null
-                            ? (lockedReferenceForm && itemIsReferenceForm)
-                            : itemIsReferenceForm;
-                    var outcome = parsePropertyAccessor(true, parseAsReference);
-                    end = Math.max(end, outcome.endByte());
-                    if (lockedReferenceForm == null && outcome.completeHeader()) {
-                        lockedReferenceForm = itemIsReferenceForm;
-                    }
-                } else if (functionName.equals("get")) {
-                    if (getterUsed) {
-                        recoveryTracker.emitError(
-                                "Properties can only have one getter.",
-                                tokenRange(previous),
-                                DiagnosticCodes.PROPERTY_DUPLICATE_GETTER,
-                                RecoveryTransactionTracker.AttributionPolicy.CURRENT_FRAME,
-                                null
-                        );
-                    } else {
-                        getterUsed = true;
-                    }
-                    if (Boolean.TRUE.equals(lockedReferenceForm) && !itemIsReferenceForm) {
-                        emitInCurrentFrameOrLegacy("Expected \"=\" after \"get\"",
-                                DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
-                    }
-                    var parseAsReference = lockedReferenceForm != null
-                            ? (lockedReferenceForm && itemIsReferenceForm)
-                            : itemIsReferenceForm;
-                    var outcome = parsePropertyAccessor(false, parseAsReference);
-                    end = Math.max(end, outcome.endByte());
-                    if (lockedReferenceForm == null && outcome.completeHeader()) {
-                        lockedReferenceForm = itemIsReferenceForm;
+                        setterUsed |= setter;
+                        getterUsed |= !setter;
+                        var outcome = parsePropertyAccessor(setter, itemIsReferenceForm);
+                        end = Math.max(end, outcome.endByte());
+                        if (lockedReferenceForm == null && outcome.completeHeader()) {
+                            lockedReferenceForm = itemIsReferenceForm;
+                        }
                     }
                 } else {
                     recoveryTracker.emitError(
@@ -7830,7 +7908,7 @@ public final class GdScriptParser {
             }
 
             RecoveryTransactionTracker.ProvisionalFrame trailingFrame = null;
-            if (!needIndent && singleLineReferenceList) {
+            if (!needIndent && singleLineReferenceList && !endedByRejectedSuite) {
                 trailingFrame = finishStatementProvisional("property declaration");
             }
             if (needIndent) {
@@ -7851,9 +7929,18 @@ public final class GdScriptParser {
 
     /// Drains one unexpected property accessor entry locally: stays on the current logical line
     /// (breaking at `NEWLINE`/`DEDENT` once `localIndents == 0` regardless of unclosed brackets),
-    /// always consumes at least a stalling `;`, and balances an unexpected nested suite via
-    /// `parseIsolatedSuite` only when `NEWLINE + INDENT` immediately follows in block mode.
+    /// always consumes at least a stalling `;`. A rejected block accessor can have an isolated
+    /// suite even in an inline property list and even when its header delimiters are unbalanced.
     private int drainUnexpectedPropertyAccessor(boolean allowNestedSuite, boolean stopAtComma) {
+        return drainUnexpectedPropertyAccessor(allowNestedSuite, stopAtComma, false).endByte();
+    }
+
+    private record DrainedPropertyAccessor(int endByte, boolean parsedSuite) {
+    }
+
+    private @NotNull DrainedPropertyAccessor drainUnexpectedPropertyAccessor(
+            boolean allowNestedSuite, boolean stopAtComma, boolean rejectedBlock
+    ) {
         var end = previous.endByte();
         var consumedAny = false;
         var localIndents = 0;
@@ -7865,6 +7952,15 @@ public final class GdScriptParser {
                 break;
             }
             if (localIndents == 0 && localParens == 0 && localBrackets == 0 && localBraces == 0) {
+                if (rejectedBlock && match(GdTokenType.COLON)) {
+                    end = Math.max(end, previous.endByte());
+                    if (!check(GdTokenType.NEWLINE) && !check(GdTokenType.DEDENT)
+                            && !check(GdTokenType.COMMA) && !isAtEnd()) {
+                        return new DrainedPropertyAccessor(
+                                Math.max(end, parseRejectedInlineAccessorSuite()), true);
+                    }
+                    break;
+                }
                 if (check(GdTokenType.SEMICOLON) || (stopAtComma && check(GdTokenType.COMMA))) {
                     break;
                 }
@@ -7910,14 +8006,27 @@ public final class GdScriptParser {
             advance();
             end = Math.max(end, previous.endByte());
         }
-        if (allowNestedSuite && check(GdTokenType.NEWLINE)) {
+        if ((allowNestedSuite || rejectedBlock) && check(GdTokenType.NEWLINE)) {
             if (peekAfterCurrent() == GdTokenType.INDENT) {
-                end = Math.max(end, parseIsolatedSuite("invalid property accessor"));
-            } else {
+                return new DrainedPropertyAccessor(Math.max(end, parseIsolatedSuite("invalid property accessor")), true);
+            }
+            if (allowNestedSuite) {
                 advance();
             }
         }
-        return end;
+        return new DrainedPropertyAccessor(end, false);
+    }
+
+    private int parseRejectedInlineAccessorSuite() {
+        // Only the surrounding accessor list owns top-level commas; well-formed nested
+        // expressions keep consuming their own separator tokens.
+        var frame = pushStructuralFrame(StructuralFrame.nonBracketed(
+                StructuralRole.PROPERTY_ACCESSORS, current.startByte(), 0, false, false, "property accessor list"));
+        try {
+            return parseIsolatedSuite("invalid property accessor");
+        } finally {
+            popStructuralFrame(frame);
+        }
     }
 
     private record PropertyAccessorOutcome(int endByte, boolean completeHeader) {
@@ -7937,11 +8046,6 @@ public final class GdScriptParser {
             return new PropertyAccessorOutcome(previous.endByte(), hasEqual && hasIdent);
         }
         if (setter) {
-            if (check(GdTokenType.EQUAL)) {
-                emitInCurrentFrameOrLegacy("Expected \"(\" after \"set\".",
-                        DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
-                return new PropertyAccessorOutcome(drainUnexpectedPropertyAccessor(true, false), false);
-            }
             StructuralFrame setterParamFrame = null;
             var hasOpen = match(GdTokenType.PARENTHESIS_OPEN);
             if (hasOpen) {
@@ -7968,11 +8072,6 @@ public final class GdScriptParser {
                     DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
             var suiteEnd = parseIsolatedSuite("setter declaration");
             return new PropertyAccessorOutcome(suiteEnd, hasOpen && hasParamName && hasClose && hasColon);
-        }
-        if (check(GdTokenType.EQUAL)) {
-            emitInCurrentFrameOrLegacy("Expected \":\" or \"(\" after \"get\".",
-                    DiagnosticCodes.PROPERTY_INVALID_ACCESSOR);
-            return new PropertyAccessorOutcome(drainUnexpectedPropertyAccessor(true, false), false);
         }
         boolean completeHeader;
         if (match(GdTokenType.PARENTHESIS_OPEN)) {
@@ -8007,6 +8106,8 @@ public final class GdScriptParser {
     private int parseIsolatedSuite(String context) {
         var saved = new ArrayList<>(pendingAnnotations);
         var previousIsolatedFallback = isolatedFallbackFrame;
+        var previousLambdaEnded = lambdaEnded;
+        lambdaEnded = false;
         if (isolatedFallbackFrame == null) {
             isolatedFallbackFrame = recoveryTracker.activeFrame();
         }
@@ -8021,6 +8122,7 @@ public final class GdScriptParser {
             pendingAnnotations.clear();
             pendingAnnotations.addAll(saved);
             isolatedFallbackFrame = previousIsolatedFallback;
+            lambdaEnded = previousLambdaEnded;
         }
         var end = suite.range().endByte();
         if (activePropertyRecoveryAnnotations != null) {
@@ -8060,7 +8162,7 @@ public final class GdScriptParser {
                 if (check(GdTokenType.EQUAL)) {
                     type = inferredTypeRef(colonToken);
                 } else {
-                    pushParameterSlotOwner(typeFacet, signatureFrame);
+                    pushSignatureSlotOwner(typeFacet, signatureFrame);
                     type = absorbType(parseTypeInternal(false), colonToken, "Expected type after \":\".", missingTypeCode);
                     typeFrame = popRecoveryOwner();
                 }
@@ -8111,6 +8213,10 @@ public final class GdScriptParser {
         }
         var first = sourceBytes[pos];
         if (first == ')' || first == ']' || first == '}') {
+            return false;
+        }
+        if (first == '-' && pos + 1 < sourceBytes.length && sourceBytes[pos + 1] == '>') {
+            // A return arrow is part of the signature, not the first statement of a suite.
             return false;
         }
         if (lineIndentOf(pos) <= paramListFrame.indentBaseline) {
@@ -8263,7 +8369,7 @@ public final class GdScriptParser {
         RecoveryTransactionTracker.ProvisionalFrame defaultFrame = null;
         if (match(GdTokenType.EQUAL)) {
             var defaultStart = current.startByte();
-            pushParameterSlotOwner("parameter.default", signatureFrame);
+            pushSignatureSlotOwner("parameter.default", signatureFrame);
             var defaultOutcome = parseExpression(false);
             defaultValue = absorbSlot(defaultOutcome, defaultStart, "parameter.default",
                     "Expected expression for parameter default value after \"=\".");
@@ -8507,8 +8613,7 @@ public final class GdScriptParser {
             nameFrame = popRecoveryOwner();
             name = "";
         } else {
-            emitInCurrentFrameOrLegacy("Expected function name after \"func\".",
-                    DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN);
+            emitClassBodyError("Expected function name after \"func\".");
             return null;
         }
 
@@ -8710,7 +8815,9 @@ public final class GdScriptParser {
                 claimInScopeMultilineLexicalErrorsWithoutSlot();
             }
 
-            consumeCloser(paramListFrame);
+            // The trusted arrow's line is still a continuation of this header. Don't replay its
+            // suppressed indent as suite layout; the real suite starts at the later colon.
+            consumeCloser(paramListFrame, false, !isAtTrustedRecoveredReturnArrow(paramListFrame));
         }
 
         TypeRef returnType = null;
@@ -8718,7 +8825,7 @@ public final class GdScriptParser {
         var hasReturnTypeDamage = false;
         if (match(GdTokenType.FORWARD_ARROW)) {
             var arrowToken = previous;
-            pushRecoveryOwner("function.return_type");
+            pushSignatureSlotOwner("function.return_type", recoveryTracker.activeFrame());
             var returnTypeOutcome = parseTypeInternal(true);
             hasReturnTypeDamage = !(returnTypeOutcome instanceof ParseOutcome.Ok<ParsedType>);
             returnType = absorbType(returnTypeOutcome, arrowToken,
@@ -8733,6 +8840,14 @@ public final class GdScriptParser {
                         DiagnosticCodes.MISSING_SEPARATOR_SUITE_COLON)
                 : match(GdTokenType.COLON);
         return new FunctionSignature(List.copyOf(parameters), returnType, returnTypeFrame, hasReturnTypeDamage, hasBody);
+    }
+
+    private boolean isAtTrustedRecoveredReturnArrow(@NotNull StructuralFrame paramListFrame) {
+        return check(GdTokenType.FORWARD_ARROW)
+                && current.startLine() > requirePreviousToken().endLine()
+                && isLineStartToken(current)
+                && lineIndentOf(current.startByte()) > paramListFrame.indentBaseline
+                && isParameterListUnclosed(paramListFrame);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -8753,6 +8868,9 @@ public final class GdScriptParser {
     /// A lambda isolates its suite from enclosing multiline mode and restores it after the body.
     private @NotNull ParseOutcome<Expression> parseLambdaExpression() {
         var start = previous.startByte(); // the consumed `func` keyword
+        var activeOwner = recoveryTracker.activeFrame();
+        var parameterDefaultOwner = activeOwner != null && "parameter.default".equals(activeOwner.facet())
+                ? activeOwner : null;
         String name = null;
         var hasHeaderDamage = false;
         if (check(GdTokenType.IDENTIFIER)) {
@@ -8768,7 +8886,7 @@ public final class GdScriptParser {
         if (multilineContext) {
             tokenizer.pushExpressionIndentedBlock();
         }
-        pushRecoveryOwner("function.signature");
+        pushLambdaOwner("function.signature", parameterDefaultOwner);
         StructuralFrame paramListFrame = null;
         pushMultiline(); // for the parameters
         if (match(GdTokenType.PARENTHESIS_OPEN)) {
@@ -8823,7 +8941,7 @@ public final class GdScriptParser {
         pendingAnnotations.clear();
 
         var previousLambdaFallback = lambdaBodyFallbackFrame;
-        pushRecoveryOwner("suite.body");
+        pushLambdaOwner("suite.body", parameterDefaultOwner);
         var lambdaSuiteFallback = popRecoveryOwner();
         lambdaBodyFallbackFrame = lambdaSuiteFallback;
 
@@ -8914,6 +9032,18 @@ public final class GdScriptParser {
             bindRecoveryOwner(bodyLayoutFrame, lambdaNode);
         }
         return ParseOutcome.structured(lambdaNode, !hasHeaderDamage, false);
+    }
+
+    /// A lambda in a parameter default can be discarded along with that parameter. Allow its
+    /// header and body diagnostics to follow the default's signature fallback in that case.
+    private void pushLambdaOwner(
+            @NotNull String facet, RecoveryTransactionTracker.@Nullable ProvisionalFrame parameterDefaultOwner
+    ) {
+        if (parameterDefaultOwner != null) {
+            recoveryTracker.pushChildFrame(facet, parameterDefaultOwner, parameterDefaultOwner.facet());
+        } else {
+            pushRecoveryOwner(facet);
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -9310,6 +9440,7 @@ public final class GdScriptParser {
                 }
                 var keyExtentStart = current.startByte();
                 var keyStartLine = current.startLine();
+                var beforeKey = previous;
                 var diagBefore = recoveryTracker.diagnosticCount();
                 hasChildDamage |= hasCurrentSlotLexicalErrors();
                 dictionaryFrame.parsingDictionaryKey = true;
@@ -9331,6 +9462,11 @@ public final class GdScriptParser {
                 }
                 var key = absorbSlot(keyOutcome, keyExtentStart, "dictionary.key",
                         "Expected expression as dictionary key.");
+                // A lambda may consume following layout; a lexical-only key might have no
+                // consumed token. In both cases the node supplies the physical content edge.
+                var keyEndLine = previous != beforeKey && !isLayoutOrEmptyPrevious()
+                        ? previous.endLine()
+                        : Math.max(keyStartLine, key.range().endPoint().row() + 1);
                 hasChildDamage |= !(keyOutcome instanceof ParseOutcome.Ok<Expression>);
 
                 // State 2: Separator. Lock style only when a real `:` or `=` arrives.
@@ -9390,7 +9526,7 @@ public final class GdScriptParser {
 
                 // State 3: Value. A written `:` or `=` parses unrestricted (including cross-line
                 // values); without a separator, stop at boundaries, cross-line breaks (relative to
-                // the key's start line), or a clear next `key:`/`key=` start with a zero-width
+                // the key's physical end line), or a clear next `key:`/`key=` start with a zero-width
                 // MISSING value and parse only an unambiguous same-line value start.
                 ParseOutcome<Expression> valueOutcome;
                 Expression value;
@@ -9406,7 +9542,7 @@ public final class GdScriptParser {
                             && !check(GdTokenType.BRACE_CLOSE)
                             && !(isCloserToken(current.type()) && hasMatchingAncestorCloser(current.type()))
                             && !isAtUnclosedMultilineStop()
-                            && (current.startLine() == keyStartLine || currentFollowedContinuation)
+                            && (current.startLine() == keyEndLine || currentFollowedContinuation)
                             && isExpressionStarter();
                     // Check for a trailing `key:`/`key=` only after boundary/escape checks pass so
                     // `peekAfterCurrent()` never clears `tokenizer.suppressedNewline` before replay.
@@ -10377,6 +10513,8 @@ public final class GdScriptParser {
                     RecoveryTransactionTracker.AttributionPolicy.TARGET_FRAME,
                     lambdaBodyFallbackFrame
             );
+        } else if (classBodyRecoveryFrame != null && DiagnosticCodes.allowsNullRecovery(code)) {
+            emitAtRecoveryTarget(message, previous, code, classBodyRecoveryFrame);
         } else {
             pushError(message, code);
         }
