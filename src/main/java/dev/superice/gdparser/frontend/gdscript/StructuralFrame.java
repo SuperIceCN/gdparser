@@ -58,7 +58,18 @@ final class StructuralFrame {
     boolean lexicalDamageBeforeListSeparator;
     boolean pendingSync;
     boolean settled;
+    /// Original rejection line for an unpaired frame left open by depth recovery, or zero.
+    int depthPoisonLine;
     byte unclosedParamListCache = -1;
+
+    boolean ownsComma() {
+        return switch (role) {
+            case ARRAY, DICTIONARY, CALL, PARAMETER_LIST, ANNOTATION, ASSERT, PRELOAD,
+                 MATCH_ARRAY_PATTERN, MATCH_DICTIONARY_PATTERN, ENUM -> true;
+            case TYPE_BRACKET -> allowsTypeComma && separatorPhase == SeparatorPhase.EXPECT_SEPARATOR_OR_CLOSER;
+            case CLASS_BODY, SUITE, MATCH_BODY, LAMBDA, GROUPING, SUBSCRIPT -> false;
+        };
+    }
 
     private StructuralFrame(
             @NotNull StructuralRole role,

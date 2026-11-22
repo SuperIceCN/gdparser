@@ -1684,7 +1684,7 @@ public final class GdTokenizer {
 
     // --- Character classification (port of core/string/char_utils.h) ---------------------
 
-    private static boolean isDigit(int c) {
+    static boolean isDigit(int c) {
         return c >= '0' && c <= '9';
     }
 
@@ -1706,6 +1706,42 @@ public final class GdTokenizer {
             case 2 -> isBinaryDigit(c);
             default -> isDigit(c);
         };
+    }
+
+    /// Skips a number with the same token boundaries as `number()`, without reporting errors.
+    static int numberLiteralEnd(int[] chars, int start) {
+        var len = chars.length;
+        var pos = start + 1; // The tokenizer has already consumed the first digit or period.
+        var leadingPeriod = chars[start] == '.';
+        if (chars[start] == '0' && pos < len) {
+            var base = switch (chars[pos]) {
+                case 'x', 'X' -> 16;
+                case 'b', 'B' -> 2;
+                default -> 10;
+            };
+            if (base != 10) {
+                return skipNumberDigits(chars, pos + 1, base);
+            }
+        }
+        pos = skipNumberDigits(chars, pos, 10);
+        if (!leadingPeriod && pos < len && chars[pos] == '.' && (pos + 1 == len || chars[pos + 1] != '.')) {
+            pos = skipNumberDigits(chars, pos + 1, 10);
+        }
+        if (pos < len && (chars[pos] == 'e' || chars[pos] == 'E')) {
+            pos++;
+            if (pos < len && (chars[pos] == '+' || chars[pos] == '-')) {
+                pos++;
+            }
+            pos = skipNumberDigits(chars, pos, 10);
+        }
+        return pos;
+    }
+
+    private static int skipNumberDigits(int[] chars, int pos, int base) {
+        while (pos < chars.length && (digitCheck(base, chars[pos]) || isUnderscore(chars[pos]))) {
+            pos++;
+        }
+        return pos;
     }
 
     /// Returns the end byte offset of an error-only `0x`/`0X`/`0b`/`0B` prefix (including

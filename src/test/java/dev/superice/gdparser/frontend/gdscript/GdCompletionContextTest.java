@@ -1213,6 +1213,8 @@ class GdCompletionContextTest {
                 plain("var x: Array[\n\tArray[ | int]", TYPE_POSITION, ""),
                 plain("g(func() -> Array[\n    Inner, oth|er)", IDENTIFIER, "other"),
                 plain("g(func() -> Dictionary[\n    String, oth|er)", IDENTIFIER, "other"),
+                plain("var x = g(func() -> Dictionary[String, Ar|ray[i])", IDENTIFIER, "Array"),
+                plain("var x = g(func() -> Dictionary[String, oth|er)", IDENTIFIER, "other"),
                 plain("g(func() -> Dictionary[\n    String, In|ner])", TYPE_POSITION, "Inner"),
                 plain("var x: Dictionary[\n\tString, In|ner", TYPE_POSITION, "Inner"),
                 plain("var x: Dictionary[\n\tString, int, oth|er]", IDENTIFIER, "other"),

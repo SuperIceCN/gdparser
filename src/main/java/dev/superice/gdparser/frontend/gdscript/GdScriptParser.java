@@ -244,6 +244,9 @@ public final class GdScriptParser {
     /// constructs retain the UTF-8 byte envelope over the damaged lexical token.
     private int claimedLexicalEndByte = -1;
     private int localDelimiterOracleResolutions;
+    private int poisonedBracketScanSteps;
+    private int poisonedBracketStackOps;
+    private int poisonedBracketOpenerLookups;
     /// Shared budget for every input-driven recursion entry (expressions via `parsePrecedence`,
     /// suites, match patterns, nested classes). Godot has no explicit limit — its C++ stack
     /// tolerates far deeper inputs — but on the JVM a pathological input such as 4096 nested
@@ -348,6 +351,9 @@ public final class GdScriptParser {
         trailingLambdaEndByte = -1;
         claimedLexicalEndByte = -1;
         localDelimiterOracleResolutions = 0;
+        poisonedBracketScanSteps = 0;
+        poisonedBracketStackOps = 0;
+        poisonedBracketOpenerLookups = 0;
         nestingDepth = 0;
         nestingBudgetExceeded = false;
         poisonedLineIndent = 0;
@@ -1006,31 +1012,17 @@ public final class GdScriptParser {
                 }
                 continue;
             }
-            switch (frame.role) {
-                case CLASS_BODY -> {
-                    return false;
-                }
-                case SUITE, MATCH_BODY -> {
-                    // An indented control-flow suite or match body owns its block boundaries; only
-                    // a lambda's own direct body suite may still terminate at an enclosing comma.
-                    if (frame.effectiveMultiline
-                            && (!it.hasNext() || it.next().role != StructuralRole.LAMBDA)) {
-                        return false;
-                    }
-                }
-                case LAMBDA, GROUPING, SUBSCRIPT -> {
-                    // Inline lambda boundary, grouping, and subscript do not own commas; continue
-                    // to the enclosing container.
-                }
-                case TYPE_BRACKET -> {
-                    if (frame.allowsTypeComma && frame.separatorPhase == SeparatorPhase.EXPECT_SEPARATOR_OR_CLOSER) {
-                        return true;
-                    }
-                }
-                case ARRAY, DICTIONARY, CALL, PARAMETER_LIST, ANNOTATION, ASSERT, PRELOAD,
-                     MATCH_ARRAY_PATTERN, MATCH_DICTIONARY_PATTERN, ENUM -> {
-                    return true;
-                }
+            if (frame.ownsComma()) {
+                return true;
+            }
+            if (frame.role == StructuralRole.CLASS_BODY) {
+                return false;
+            }
+            // Indented suites own their boundaries, except for a lambda's direct body suite.
+            if ((frame.role == StructuralRole.SUITE || frame.role == StructuralRole.MATCH_BODY)
+                    && frame.effectiveMultiline
+                    && (!it.hasNext() || it.next().role != StructuralRole.LAMBDA)) {
+                return false;
             }
         }
         return false;
@@ -1072,20 +1064,49 @@ public final class GdScriptParser {
     private static final class LocalDelimiterEntry {
         final @NotNull GdTokenType openerType;
         final int startByte;
+        final boolean lambdaParameters;
         int maxVerifiedCloserByte = -1;
 
-        LocalDelimiterEntry(@NotNull GdTokenType openerType, int startByte) {
+        LocalDelimiterEntry(@NotNull GdTokenType openerType, int startByte, boolean lambdaParameters) {
             this.openerType = openerType;
             this.startByte = startByte;
+            this.lambdaParameters = lambdaParameters;
         }
     }
 
+    /// Tracks delimiters read by recovery rather than by the structural parser. Per-kind
+    /// counts make misses constant time; a match pops through the nearest same-kind opener.
     private final class LocalDelimiterStack {
         private final ArrayList<LocalDelimiterEntry> stack = new ArrayList<>();
+        private final boolean stopShieldAtSemicolon;
+        private final boolean stopShieldAtNewline;
+        private final int closerByteLimit;
+        private final int minAllowedNonCommaIndent;
+        private final int minAllowedAnyIndent;
         private int resolvedPrefix;
         private int parens;
         private int brackets;
         private int braces;
+        private int lambdaParameterLists;
+        private int stackOps;
+        private int openerLookups;
+
+        LocalDelimiterStack() {
+            this(false, false);
+        }
+
+        LocalDelimiterStack(boolean stopShieldAtSemicolon, boolean stopShieldAtNewline) {
+            this(stopShieldAtSemicolon, stopShieldAtNewline, Integer.MAX_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE);
+        }
+
+        LocalDelimiterStack(boolean stopShieldAtSemicolon, boolean stopShieldAtNewline, int closerByteLimit,
+                            int minAllowedNonCommaIndent, int minAllowedAnyIndent) {
+            this.stopShieldAtSemicolon = stopShieldAtSemicolon;
+            this.stopShieldAtNewline = stopShieldAtNewline;
+            this.closerByteLimit = closerByteLimit;
+            this.minAllowedNonCommaIndent = minAllowedNonCommaIndent;
+            this.minAllowedAnyIndent = minAllowedAnyIndent;
+        }
 
         boolean isEmpty() {
             return stack.isEmpty();
@@ -1093,14 +1114,19 @@ public final class GdScriptParser {
 
         boolean hasMatchingOpener(@NotNull GdTokenType closerType) {
             return switch (closerType) {
-                case PARENTHESIS_CLOSE -> parens > 0;
-                case BRACKET_CLOSE -> brackets > 0;
-                case BRACE_CLOSE -> braces > 0;
+                case PARENTHESIS_CLOSE -> checkOpenerCount(parens);
+                case BRACKET_CLOSE -> checkOpenerCount(brackets);
+                case BRACE_CLOSE -> checkOpenerCount(braces);
                 default -> false;
             };
         }
 
-        boolean hasVerifiedCommaShield(int commaByte) {
+        private boolean checkOpenerCount(int count) {
+            openerLookups++;
+            return count > 0;
+        }
+
+        boolean hasVerifiedCloserAfter(int separatorByte) {
             if (stack.isEmpty()) {
                 return false;
             }
@@ -1113,59 +1139,91 @@ public final class GdScriptParser {
                         && fact.openerByte() == entry.startByte
                         && fact.openerType() == entry.openerType
                         && fact.status() == BracketBalanceOracle.OpenerStatus.MATCHED
+                        && !(stopShieldAtSemicolon && fact.crossesSemicolon())
+                        && !(stopShieldAtNewline && fact.crossesNewline())
+                        && fact.pairedCloserByte() < closerByteLimit
+                        && fact.minNonCommaLineIndent() >= minAllowedNonCommaIndent
+                        && fact.minAnyLineIndent() >= minAllowedAnyIndent
                         ? fact.pairedCloserByte()
                         : -1;
                 entry.maxVerifiedCloserByte = Math.max(prevMax, verifiedCloserByte);
                 resolvedPrefix++;
             }
-            return stack.getLast().maxVerifiedCloserByte > commaByte;
+            return stack.getLast().maxVerifiedCloserByte > separatorByte;
         }
 
-        void consume(@NotNull GdToken token) {
-            switch (token.type()) {
-                case PARENTHESIS_OPEN -> {
-                    stack.add(new LocalDelimiterEntry(GdTokenType.PARENTHESIS_OPEN, token.startByte()));
-                    parens++;
-                }
-                case BRACKET_OPEN -> {
-                    stack.add(new LocalDelimiterEntry(GdTokenType.BRACKET_OPEN, token.startByte()));
-                    brackets++;
-                }
-                case BRACE_OPEN -> {
-                    stack.add(new LocalDelimiterEntry(GdTokenType.BRACE_OPEN, token.startByte()));
-                    braces++;
+        @Nullable LocalDelimiterEntry consume(@NotNull GdToken token) {
+            return switch (token.type()) {
+                case PARENTHESIS_OPEN, BRACKET_OPEN, BRACE_OPEN -> {
+                    pushOpener(token, false);
+                    yield null;
                 }
                 case PARENTHESIS_CLOSE -> popToOpener(GdTokenType.PARENTHESIS_OPEN);
                 case BRACKET_CLOSE -> popToOpener(GdTokenType.BRACKET_OPEN);
                 case BRACE_CLOSE -> popToOpener(GdTokenType.BRACE_OPEN);
-                default -> {
-                }
-            }
+                default -> null;
+            };
         }
 
-        private void popToOpener(@NotNull GdTokenType targetOpener) {
-            if (!hasMatchingOpener(matchingCloserFor(targetOpener))) {
-                return;
+        private void pushOpener(@NotNull GdToken token, boolean lambdaParameters) {
+            switch (token.type()) {
+                case PARENTHESIS_OPEN -> parens++;
+                case BRACKET_OPEN -> brackets++;
+                case BRACE_OPEN -> braces++;
+                default -> throw new IllegalArgumentException("Not an opening delimiter: " + token.type());
             }
-            while (!stack.isEmpty()) {
-                var popped = stack.removeLast();
-                switch (popped.openerType) {
-                    case PARENTHESIS_OPEN -> parens--;
-                    case BRACKET_OPEN -> brackets--;
-                    case BRACE_OPEN -> braces--;
-                    default -> {
-                    }
-                }
-                if (popped.openerType == targetOpener) {
-                    break;
-                }
+            if (lambdaParameters) {
+                lambdaParameterLists++;
+            }
+            stack.add(new LocalDelimiterEntry(token.type(), token.startByte(), lambdaParameters));
+            stackOps++;
+        }
+
+        LocalDelimiterEntry popInnermost() {
+            var popped = stack.removeLast();
+            if (popped.lambdaParameters) {
+                lambdaParameterLists--;
+            }
+            switch (popped.openerType) {
+                case PARENTHESIS_OPEN -> parens--;
+                case BRACKET_OPEN -> brackets--;
+                case BRACE_OPEN -> braces--;
+                default -> throw new IllegalStateException("Not an opening delimiter: " + popped.openerType);
             }
             resolvedPrefix = Math.min(resolvedPrefix, stack.size());
+            stackOps++;
+            return popped;
+        }
+
+        private @Nullable LocalDelimiterEntry popToOpener(@NotNull GdTokenType targetOpener) {
+            if (!hasMatchingOpener(matchingCloserFor(targetOpener))) {
+                return null;
+            }
+            while (!stack.isEmpty()) {
+                openerLookups++;
+                var entry = popInnermost();
+                if (entry.openerType == targetOpener) {
+                    return entry;
+                }
+            }
+            return null;
         }
     }
 
     int localDelimiterOracleResolutions() {
         return localDelimiterOracleResolutions;
+    }
+
+    int poisonedBracketScanSteps() {
+        return poisonedBracketScanSteps;
+    }
+
+    int poisonedBracketStackOps() {
+        return poisonedBracketStackOps;
+    }
+
+    int poisonedBracketOpenerLookups() {
+        return poisonedBracketOpenerLookups;
     }
 
     private void emitUnexpectedCloser(@NotNull GdToken token) {
@@ -2710,21 +2768,42 @@ public final class GdScriptParser {
         return pos;
     }
 
+    private record PoisonedBracketFrame(StructuralFrame frame, @Nullable BracketBalanceOracle.OpenerFact fact) {
+        boolean isUnmatched() {
+            return fact == null || fact.status() != BracketBalanceOracle.OpenerStatus.MATCHED;
+        }
+    }
+
+    private enum LocalLambdaHeader {
+        NONE, FUNC, NAME, AFTER_PARAMETERS, RETURN_TYPE
+    }
+
     /// Settles a contiguous chain of open bracketed frames iteratively in one forward scan after
-    /// the nesting budget has been tripped, keeping nested unpushed openers balanced against
-    /// matching closers, stopping only at an ancestor-owned closer below the chain or a real outer
-    /// layout/declaration boundary, and reconciling any suppressed multiline layout on exit.
+    /// the nesting budget has been tripped. Closers first match unpushed openers, then real
+    /// frames; without either match, a wrong closer replaces only the innermost opener.
+    /// A matched inner frame can resume while unpaired outer frames retain depth recovery.
     private boolean unwindPoisonedBracketChain(@NotNull StructuralFrame targetFrame) {
-        var chain = new ArrayDeque<StructuralFrame>();
+        var chain = new ArrayDeque<PoisonedBracketFrame>();
+        var chainCloserCounts = new int[openCloserCounts.length];
+        var oracle = bracketOracle();
+        var resumingDepthRecovery = targetFrame.depthPoisonLine != 0;
+        var rejectionLine = resumingDepthRecovery ? targetFrame.depthPoisonLine : current.startLine();
         var it = structuralStack.descendingIterator();
         while (it.hasNext()) {
             var frame = it.next();
             if (!frame.isBracketed()) {
                 break;
             }
-            chain.addLast(frame);
+            poisonedBracketOpenerLookups++;
+            var entry = new PoisonedBracketFrame(frame, oracle.factFor(frame.openerStartByte));
+            chain.addLast(entry);
+            chainCloserCounts[closerIndex(frame.expectedCloser)]++;
+            if (entry.isUnmatched() && frame.depthPoisonLine == 0) {
+                frame.depthPoisonLine = rejectionLine;
+            }
+            poisonedBracketStackOps++;
         }
-        if (chain.isEmpty() || chain.getFirst() != targetFrame) {
+        if (chain.isEmpty() || chain.getFirst().frame() != targetFrame) {
             popStructuralFrame(targetFrame);
             if (targetFrame.ownsMultilineFrame) {
                 popMultiline(targetFrame.recordCommentSpan, extentEnd());
@@ -2733,101 +2812,96 @@ public final class GdScriptParser {
             return false;
         }
 
-        // `chain` is a local ArrayDeque (null elements are rejected on insert) and the early
-        // return above guarantees `chain` is non-empty, so `getLast()` cannot be null and fails
-        // fast if that invariant is ever violated.
-        var outermost = chain.getLast();
-        var outermostFact = bracketOracle().factFor(outermost.openerStartByte);
+        var outermost = chain.getLast().frame();
+        var outermostFact = chain.getLast().fact();
         var outermostIsMissing = outermostFact == null
                 || outermostFact.status() == BracketBalanceOracle.OpenerStatus.MISSING;
         var suiteBaseline = enclosingSuiteBaseline(outermost);
-        var rejectionLine = current.startLine();
-        var unpushedClosers = new ArrayDeque<GdTokenType>();
+        var arrayPatternMayYieldColon = outermostIsMissing && outermost.role == StructuralRole.MATCH_ARRAY_PATTERN;
+        // A resumed key has already returned; the unclosed pattern cannot take another slot.
+        var dictPatternMayYieldColon = outermostIsMissing && outermost.role == StructuralRole.MATCH_DICTIONARY_PATTERN
+                && resumingDepthRecovery && outermost == targetFrame;
+        var mayYieldColon = arrayPatternMayYieldColon || dictPatternMayYieldColon;
+        // The prefix before the colon has already passed the line checks below. The
+        // opener's cached minima let the same checks bound the rest of its span.
+        var unpushed = mayYieldColon && outermostFact != null
+                ? new LocalDelimiterStack(false, false, outermostFact.effectiveRecoveryEnd(),
+                        outermost.indentBaseline + 1, suiteBaseline)
+                : new LocalDelimiterStack(false, mayYieldColon);
+        var lambdaHeader = LocalLambdaHeader.NONE;
+        NodePathState localNodePath = null;
+        var previousWasMemberName = false;
+        var returnTypeBracketBase = 0;
         var targetClosedCleanly = false;
+        var resumeAfterTargetClose = false;
+        var resumeParsing = false;
 
         while (!chain.isEmpty() && !isAtEnd()) {
+            poisonedBracketScanSteps++;
             var type = current.type();
-            if (type == GdTokenType.PARENTHESIS_OPEN
-                    || type == GdTokenType.BRACKET_OPEN
-                    || type == GdTokenType.BRACE_OPEN) {
-                unpushedClosers.addLast(matchingCloserFor(type));
-                advance();
-                continue;
+            var headEntry = chain.getFirst();
+            var head = headEntry.frame();
+            var canResume = head != targetFrame && unpushed.isEmpty() && !headEntry.isUnmatched()
+                    && current.startByte() <= headEntry.fact().pairedCloserByte();
+            // An exact target close ends recovery before the next expression suffix.
+            if (canResume && (resumeAfterTargetClose
+                    || (type == head.expectedCloser && current.startByte() == headEntry.fact().pairedCloserByte()))) {
+                resumeParsing = true;
+                break;
             }
-            if (isCloserToken(type)) {
-                if (!unpushedClosers.isEmpty()) {
-                    var expectedUnpushed = unpushedClosers.getLast();
-                    if (expectedUnpushed == type) {
-                        unpushedClosers.removeLast();
-                        advance();
-                        continue;
-                    }
-                    if (unpushedClosers.contains(type)) {
-                        while (!unpushedClosers.isEmpty() && unpushedClosers.getLast() != type) {
-                            unpushedClosers.removeLast();
-                        }
-                        if (!unpushedClosers.isEmpty()) {
-                            unpushedClosers.removeLast();
-                        }
-                        advance();
-                        continue;
-                    }
-                    unpushedClosers.clear();
+            resumeAfterTargetClose = false;
+            var lambdaParameters = type == GdTokenType.PARENTHESIS_OPEN
+                    && (lambdaHeader == LocalLambdaHeader.FUNC || lambdaHeader == LocalLambdaHeader.NAME);
+            // Unlike a plain grouping, a lambda signature owns its parameter and body colons.
+            var lambdaColon = type == GdTokenType.COLON && (unpushed.lambdaParameterLists != 0
+                    || lambdaHeader == LocalLambdaHeader.AFTER_PARAMETERS || lambdaHeader == LocalLambdaHeader.RETURN_TYPE);
+            if (mayYieldColon) {
+                if (lambdaHeader == LocalLambdaHeader.AFTER_PARAMETERS && type == GdTokenType.FORWARD_ARROW) {
+                    returnTypeBracketBase = unpushed.brackets;
                 }
-
-                // `chain` is still guaranteed non-empty here: the loop header checked
-                // `!chain.isEmpty()`, `chain` is method-local and untouched by the opener and
-                // `unpushedClosers` branches above, and every removal path below `continue`s back
-                // to the loop header. Use `getFirst()` to express non-nullability and fail fast.
-                var top = chain.getFirst();
-                if (top.expectedCloser == type) {
-                    chain.removeFirst();
-                    popStructuralFrame(top);
-                    if (top.ownsMultilineFrame) {
-                        popMultiline(top.recordCommentSpan, current.startByte());
+                localNodePath = advanceLocalNodePath(localNodePath, previousWasMemberName);
+                previousWasMemberName = previous.type() == GdTokenType.PERIOD && isNodeName(current);
+                lambdaHeader = advanceLocalLambdaHeader(lambdaHeader, unpushed.brackets > returnTypeBracketBase,
+                        localNodePath == NodePathState.NODE_NAME);
+            }
+            var closerIdx = closerIndex(type);
+            if (closerIdx >= 0) {
+                if (unpushed.hasMatchingOpener(type)) {
+                    var closed = unpushed.consume(current);
+                    if (closed != null && closed.lambdaParameters) {
+                        lambdaHeader = LocalLambdaHeader.AFTER_PARAMETERS;
                     }
-                    if (top == targetFrame) {
-                        targetClosedCleanly = true;
+                } else if (hasPoisonedIndexedCloser(chainCloserCounts, closerIdx)) {
+                    // This exact closer belongs to a real frame in the chain. Abandon only
+                    // openers above that frame; none of them can claim the closer.
+                    while (!unpushed.isEmpty()) {
+                        unpushed.popInnermost();
                     }
-                    advance();
-                    continue;
-                }
-
-                StructuralFrame matchedInChain = null;
-                for (var candidate : chain) {
-                    if (candidate.expectedCloser == type) {
-                        matchedInChain = candidate;
-                        break;
-                    }
-                }
-                if (matchedInChain != null) {
-                    while (!chain.isEmpty()) {
-                        var abandoned = chain.removeFirst();
-                        popStructuralFrame(abandoned);
-                        if (abandoned.ownsMultilineFrame) {
-                            popMultiline(abandoned.recordCommentSpan,
-                                    abandoned == matchedInChain ? current.startByte() : extentEnd());
-                        }
-                        if (abandoned == matchedInChain) {
-                            if (abandoned == targetFrame) {
+                    while (true) {
+                        var entry = chain.removeFirst();
+                        var frame = entry.frame();
+                        chainCloserCounts[closerIndex(frame.expectedCloser)]--;
+                        poisonedBracketOpenerLookups++;
+                        var exact = frame.expectedCloser == type;
+                        popPoisonedFrame(frame, exact ? current.startByte() : extentEnd());
+                        if (exact) {
+                            if (frame == targetFrame) {
                                 targetClosedCleanly = true;
+                                resumeAfterTargetClose = true;
                             }
                             break;
                         }
                     }
-                    advance();
-                    continue;
-                }
-
-                if (hasMatchingAncestorCloser(type)) {
+                } else if (hasPoisonedIndexedCloser(openCloserCounts, closerIdx)) {
                     // Closer belongs to an enclosing healthy frame below the poisoned chain.
                     break;
-                }
-
-                chain.removeFirst();
-                popStructuralFrame(top);
-                if (top.ownsMultilineFrame) {
-                    popMultiline(top.recordCommentSpan, current.startByte());
+                } else if (!unpushed.isEmpty()) {
+                    unpushed.popInnermost();
+                } else {
+                    var entry = chain.removeFirst();
+                    var frame = entry.frame();
+                    chainCloserCounts[closerIndex(frame.expectedCloser)]--;
+                    popPoisonedFrame(frame, current.startByte());
                 }
                 advance();
                 continue;
@@ -2853,19 +2927,94 @@ public final class GdScriptParser {
                     break;
                 }
             }
+            if (type == GdTokenType.PARENTHESIS_OPEN
+                    || type == GdTokenType.BRACKET_OPEN
+                    || type == GdTokenType.BRACE_OPEN) {
+                unpushed.pushOpener(current, lambdaParameters);
+                advance();
+                continue;
+            }
+            if (canResume && type == GdTokenType.COMMA && head.ownsComma()) {
+                resumeParsing = true;
+                break;
+            }
+            // Leave the branch colon to its match section unless a local construct still owns it.
+            if (type == GdTokenType.COLON && !lambdaColon && mayYieldColon
+                    && !unpushed.hasMatchingOpener(GdTokenType.BRACE_CLOSE)
+                    && (dictPatternMayYieldColon
+                        || !hasPoisonedIndexedCloser(chainCloserCounts, closerIndex(GdTokenType.BRACE_CLOSE)))
+                    && !unpushed.hasVerifiedCloserAfter(current.startByte())) {
+                break;
+            }
             advance();
         }
 
-        while (!chain.isEmpty()) {
-            var remaining = chain.removeFirst();
-            popStructuralFrame(remaining);
-            if (remaining.ownsMultilineFrame) {
-                popMultiline(remaining.recordCommentSpan, extentEnd());
+        if (!resumeParsing) {
+            while (!chain.isEmpty()) {
+                popPoisonedFrame(chain.removeFirst().frame(), extentEnd());
             }
+            replayLayoutIfExitedMultiline();
         }
-        replayLayoutIfExitedMultiline();
+        poisonedBracketStackOps += unpushed.stackOps;
+        poisonedBracketOpenerLookups += unpushed.openerLookups;
         nestingBudgetExceeded = false;
         return targetClosedCleanly;
+    }
+
+    private LocalLambdaHeader advanceLocalLambdaHeader(
+            LocalLambdaHeader header, boolean insideReturnTypeBrackets, boolean inNodeName) {
+        var type = current.type();
+        if (type == GdTokenType.FUNC && !inNodeName && previous.type() != GdTokenType.PERIOD) {
+            return LocalLambdaHeader.FUNC;
+        }
+        return switch (header) {
+            case FUNC -> isIdentifier(current) ? LocalLambdaHeader.NAME : LocalLambdaHeader.NONE;
+            case AFTER_PARAMETERS -> type == GdTokenType.FORWARD_ARROW
+                    ? LocalLambdaHeader.RETURN_TYPE : LocalLambdaHeader.NONE;
+            case RETURN_TYPE -> switch (type) {
+                case VOID, PERIOD, BRACKET_OPEN -> LocalLambdaHeader.RETURN_TYPE;
+                case BRACKET_CLOSE, COMMA -> insideReturnTypeBrackets
+                        ? LocalLambdaHeader.RETURN_TYPE : LocalLambdaHeader.NONE;
+                default -> isIdentifier(current) ? LocalLambdaHeader.RETURN_TYPE : LocalLambdaHeader.NONE;
+            };
+            case NONE, NAME -> LocalLambdaHeader.NONE;
+        };
+    }
+
+    /// Recognizes path segments without parsing an expression. Outside a path, slash is binary,
+    /// and percent starts a path only where the preceding token did not finish an operand.
+    private @Nullable NodePathState advanceLocalNodePath(@Nullable NodePathState path, boolean previousWasMemberName) {
+        return switch (current.type()) {
+            case DOLLAR -> NodePathState.START;
+            case PERCENT -> (path == NodePathState.START || path == NodePathState.SLASH
+                    || (path == null && !previousWasMemberName && !canEndLocalOperand(previous)))
+                    ? NodePathState.PERCENT : null;
+            case SLASH -> path == NodePathState.START || path == NodePathState.NODE_NAME ? NodePathState.SLASH : null;
+            default -> path != null && path != NodePathState.NODE_NAME
+                    && (isNodeName(current)
+                        || (current.type() == GdTokenType.LITERAL && current.literalKind() == GdLiteralKind.STRING))
+                    ? NodePathState.NODE_NAME : null;
+        };
+    }
+
+    private static boolean canEndLocalOperand(GdToken token) {
+        return isIdentifier(token) || switch (token.type()) {
+            case LITERAL, SELF, SUPER, PARENTHESIS_CLOSE, BRACKET_CLOSE, BRACE_CLOSE -> true;
+            default -> false;
+        };
+    }
+
+    private boolean hasPoisonedIndexedCloser(int[] counts, int index) {
+        poisonedBracketOpenerLookups++;
+        return counts[index] > 0;
+    }
+
+    private void popPoisonedFrame(@NotNull StructuralFrame frame, int multilineEndByte) {
+        poisonedBracketStackOps++;
+        popStructuralFrame(frame);
+        if (frame.ownsMultilineFrame) {
+            popMultiline(frame.recordCommentSpan, multilineEndByte);
+        }
     }
 
     /// Unified 4-way closer settlement for all delimiter-enclosed constructs:
@@ -2881,7 +3030,7 @@ public final class GdScriptParser {
         if (frame.settled) {
             return false;
         }
-        if (nestingBudgetExceeded) {
+        if (nestingBudgetExceeded || frame.depthPoisonLine != 0) {
             return unwindPoisonedBracketChain(frame);
         }
         if (current.type() == frame.expectedCloser) {
@@ -2971,7 +3120,7 @@ public final class GdScriptParser {
     /// An exact closer settles both lexical batches unfiltered. Look ahead only while that token
     /// still belongs to this frame; a token left for an ancestor or sibling cannot taint it.
     private boolean hasLexicalDamageOnExactCloser(@NotNull StructuralFrame frame) {
-        return !frame.settled && !nestingBudgetExceeded && current.type() == frame.expectedCloser
+        return canContinueBracketedList(frame) && current.type() == frame.expectedCloser
                 && hasLexicalDamageOnAdvance(false);
     }
 
@@ -3256,7 +3405,8 @@ public final class GdScriptParser {
     }
 
     /// Port of `GDScriptParser::synchronize`: same sync token set (`if` deliberately excluded
-    /// because it can appear inside expressions); stops before the sync token without consuming.
+    /// because it can appear inside expressions). Only a local exact match takes a closer
+    /// away from an ancestor. A comma stays local only inside a verified local pair.
     /// While a depth rejection is being unwound (nestingBudgetExceeded), the scan instead
     /// consumes the aborted construct's whole layout region: every deeper-indented line plus its
     /// INDENT/DEDENT tokens (balance-counted — a DEDENT beyond that balance belongs to a parsed
@@ -3267,9 +3417,11 @@ public final class GdScriptParser {
             structuralStack.peekLast().pendingSync = false;
         }
         var garbageIndents = 0;
-        var localParens = 0;
-        var localBrackets = 0;
-        var localBraces = 0;
+        // Use only exact pairs reachable before this scan's statement boundaries.
+        var localDelimiters = new LocalDelimiterStack(true, !tokenizer.isMultilineMode());
+        // The structural stack does not change during this scan; cache each ancestor walk.
+        Boolean enclosingCommaOwner = null;
+        Boolean deferReplacementCloser = null;
         while (!isAtEnd()) {
             if (nestingBudgetExceeded) {
                 if (current.type() == GdTokenType.INDENT) {
@@ -3303,25 +3455,42 @@ public final class GdScriptParser {
                     && (previous.type() == GdTokenType.NEWLINE || previous.type() == GdTokenType.SEMICOLON)) {
                 break;
             }
-            if (garbageIndents == 0 && localParens == 0 && localBrackets == 0 && localBraces == 0) {
+            var type = current.type();
+            if (garbageIndents == 0 && type == GdTokenType.COMMA) {
+                if (enclosingCommaOwner == null) {
+                    enclosingCommaOwner = hasCommaOwningAncestor();
+                }
+                if (enclosingCommaOwner && !localDelimiters.hasVerifiedCloserAfter(current.startByte())) {
+                    lambdaEnded |= inLambda;
+                    break;
+                }
+            }
+            if (isCloserToken(type) && !localDelimiters.hasMatchingOpener(type)) {
+                if (hasMatchingAncestorCloser(type)) {
+                    lambdaEnded |= inLambda;
+                    break;
+                }
+                if (!localDelimiters.isEmpty()) {
+                    // No exact owner: this closer replaces one local opener, not the chain.
+                    localDelimiters.popInnermost();
+                    advance();
+                    continue;
+                }
+                if (garbageIndents == 0 && inLambda) {
+                    if (deferReplacementCloser == null) {
+                        deferReplacementCloser = canDeferReplacementCloserToEnclosingDelimiter();
+                    }
+                    if (deferReplacementCloser) {
+                        lambdaEnded = true;
+                        break;
+                    }
+                }
+            }
+            if (garbageIndents == 0 && localDelimiters.isEmpty()) {
                 if (current.type() == GdTokenType.DEDENT) {
                     break;
                 }
-                if (current.type() == GdTokenType.COMMA && hasCommaOwningAncestor()) {
-                    if (inLambda) {
-                        lambdaEnded = true;
-                    }
-                    break;
-                }
-                if (isCloserToken(current.type())
-                        && (hasMatchingAncestorCloser(current.type())
-                                || (inLambda && canDeferReplacementCloserToEnclosingDelimiter()))) {
-                    if (inLambda) {
-                        lambdaEnded = true;
-                    }
-                    break;
-                }
-                switch (current.type()) {
+                switch (type) {
                     case CLASS, FUNC, STATIC, VAR, CONST, SIGNAL, ENUM, FOR, WHILE, MATCH, RETURN, ANNOTATION -> {
                         // Stop before the sync token without consuming it.
                         return;
@@ -3330,33 +3499,14 @@ public final class GdScriptParser {
                     }
                 }
             }
-            switch (current.type()) {
+            switch (type) {
                 case INDENT -> garbageIndents++;
                 case DEDENT -> {
                     if (garbageIndents > 0) {
                         garbageIndents--;
                     }
                 }
-                case PARENTHESIS_OPEN -> localParens++;
-                case PARENTHESIS_CLOSE -> {
-                    if (localParens > 0) {
-                        localParens--;
-                    }
-                }
-                case BRACKET_OPEN -> localBrackets++;
-                case BRACKET_CLOSE -> {
-                    if (localBrackets > 0) {
-                        localBrackets--;
-                    }
-                }
-                case BRACE_OPEN -> localBraces++;
-                case BRACE_CLOSE -> {
-                    if (localBraces > 0) {
-                        localBraces--;
-                    }
-                }
-                default -> {
-                }
+                default -> localDelimiters.consume(current);
             }
             advance();
         }
@@ -3650,7 +3800,7 @@ public final class GdScriptParser {
                     }
                     if (current.type() == GdTokenType.COMMA
                             && hasCommaOwningAncestor()
-                            && !localDelimiters.hasVerifiedCommaShield(current.startByte())) {
+                            && !localDelimiters.hasVerifiedCloserAfter(current.startByte())) {
                         if (inLambda) {
                             lambdaEnded = true;
                         }
@@ -5131,7 +5281,7 @@ public final class GdScriptParser {
             }
             if (current.type() == GdTokenType.COMMA
                     && hasCommaOwningAncestor()
-                    && !localDelimiters.hasVerifiedCommaShield(current.startByte())) {
+                    && !localDelimiters.hasVerifiedCloserAfter(current.startByte())) {
                 break;
             }
             if (isCloserToken(current.type())
@@ -5801,8 +5951,7 @@ public final class GdScriptParser {
 
         Expression message = null;
         RecoveryTransactionTracker.ProvisionalFrame messageFrame = null;
-        if ((assertFrame == null || !assertFrame.settled)
-                && !nestingBudgetExceeded
+        if (canContinueBracketedList(assertFrame)
                 && !isAtUnclosedMultilineStop()
                 && match(GdTokenType.COMMA)
                 && (!check(GdTokenType.PARENTHESIS_CLOSE) || hasCurrentSlotLexicalErrors())
@@ -5813,8 +5962,7 @@ public final class GdScriptParser {
             message = absorbSlot(messageOutcome, messageStart, "assert.message",
                     "Expected error message for assert after \",\".");
             messageFrame = popRecoveryOwner();
-            if ((assertFrame == null || !assertFrame.settled)
-                    && !nestingBudgetExceeded
+            if (canContinueBracketedList(assertFrame)
                     && !isAtUnclosedMultilineStop()) {
                 match(GdTokenType.COMMA);
             }
@@ -6326,7 +6474,7 @@ public final class GdScriptParser {
         GdToken firstRestToken = null;
         var reportedRestNotLast = false;
         do {
-            if (arrayPatternFrame.settled || nestingBudgetExceeded
+            if (!canContinueBracketedList(arrayPatternFrame)
                     || isAtEnd()
                     || (check(GdTokenType.BRACKET_CLOSE) && !hasCurrentSlotLexicalErrors())) {
                 break;
@@ -6416,7 +6564,7 @@ public final class GdScriptParser {
         GdToken firstRestToken = null;
         var reportedRestNotLast = false;
         do {
-            if (dictPatternFrame.settled || nestingBudgetExceeded
+            if (!canContinueBracketedList(dictPatternFrame)
                     || (check(GdTokenType.BRACE_CLOSE) && !hasCurrentSlotLexicalErrors())
                     || isAtEnd()) {
                 break;
@@ -6457,7 +6605,12 @@ public final class GdScriptParser {
             } else {
                 var keyStart = current.startByte();
                 var keyOutcome = parseExpression(false);
-                if (dictPatternFrame.settled || nestingBudgetExceeded) {
+                if (!canContinueBracketedList(dictPatternFrame)) {
+                    var key = depthRecoveredDictionaryKey(dictPatternFrame, keyOutcome);
+                    if (key != null) {
+                        entries.add(new DictEntry(key, null,
+                                range(Math.min(keyStart, key.range().startByte()), key.range().endByte())));
+                    }
                     break;
                 }
                 var key = absorbSlot(keyOutcome, keyStart, "dictionary_pattern.key",
@@ -6474,9 +6627,6 @@ public final class GdScriptParser {
                 }
                 if (match(GdTokenType.COLON)) {
                     var sub = parseMatchPattern();
-                    if (dictPatternFrame.settled || nestingBudgetExceeded) {
-                        break;
-                    }
                     if (sub != null) {
                         Expression entryValue;
                         if (sub.rest()) {
@@ -6496,7 +6646,8 @@ public final class GdScriptParser {
                         }
                         entries.add(new DictEntry(key, entryValue,
                                 range(Math.min(keyStart, key.range().startByte()),
-                                        Math.max(extentEnd(), entryValue.range().endByte()))));
+                                        Math.max(Math.max(extentEnd(), key.range().endByte()),
+                                                entryValue.range().endByte()))));
                     }
                 } else {
                     entries.add(new DictEntry(key, null,
@@ -6597,7 +6748,7 @@ public final class GdScriptParser {
             );
             recoveryTracker.pushChildFrame("annotation.arguments", targetFramePeek, "annotation.target");
             do {
-                if (annotationFrame.settled || nestingBudgetExceeded
+                if (!canContinueBracketedList(annotationFrame)
                         || (check(GdTokenType.PARENTHESIS_CLOSE) && !hasCurrentSlotLexicalErrors())) {
                     // Allow for trailing comma at closer.
                     break;
@@ -6612,8 +6763,7 @@ public final class GdScriptParser {
                 var argumentOutcome = parseExpression(false);
                 arguments.add(absorbSlot(argumentOutcome, argumentStart, "annotation.argument",
                         "Expected expression as the annotation argument."));
-            } while (!annotationFrame.settled
-                    && !nestingBudgetExceeded
+            } while (canContinueBracketedList(annotationFrame)
                     && !isAtUnclosedMultilineStop()
                     && match(GdTokenType.COMMA));
 
@@ -7244,7 +7394,7 @@ public final class GdScriptParser {
                 var element = parseTypeInternal(false);
                 switch (element) {
                     case ParseOutcome.Missing<ParsedType> _ -> {
-                        if (!typeBracketFrame.settled) {
+                        if (canContinueBracketedList(typeBracketFrame)) {
                             emitInCurrentFrameOrLegacy(
                                     "Expected type for collection after \"%s\".".formatted(argCount == 0 ? "[" : ","),
                                     DiagnosticCodes.MISSING_TYPE_GENERIC_ARGUMENT
@@ -7256,7 +7406,7 @@ public final class GdScriptParser {
                     case ParseOutcome.Ok<ParsedType> _, ParseOutcome.EnclosedDamage<ParsedType> _,
                          ParseOutcome.Damaged<ParsedType> _ -> {
                         hasChildDamage |= !(element instanceof ParseOutcome.Ok<ParsedType>);
-                        if (element.valueOrThrow().isContainer()) {
+                        if (canContinueBracketedList(typeBracketFrame) && element.valueOrThrow().isContainer()) {
                             emitInCurrentFrameOrLegacy("Nested typed collections are not supported.",
                                     DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN);
                             hasChildDamage = true;
@@ -7267,7 +7417,7 @@ public final class GdScriptParser {
                     break;
                 }
                 argCount++;
-                if (typeBracketFrame.settled || nestingBudgetExceeded
+                if (!canContinueBracketedList(typeBracketFrame)
                         || !typeBracketFrame.allowsTypeComma || argCount >= 2) {
                     typeBracketFrame.separatorPhase = SeparatorPhase.NONE;
                     break;
@@ -8172,7 +8322,7 @@ public final class GdScriptParser {
             );
             var declaredNames = new HashSet<String>();
             do {
-                if (paramListFrame.settled || nestingBudgetExceeded || check(GdTokenType.PARENTHESIS_CLOSE)) {
+                if (!canContinueBracketedList(paramListFrame) || check(GdTokenType.PARENTHESIS_CLOSE)) {
                     break;
                 }
                 if (isAtUnclosedMultilineStop() || isAtEnd() || check(GdTokenType.DEDENT)) {
@@ -8271,7 +8421,7 @@ public final class GdScriptParser {
                     DiagnosticCodes.MISMATCHED_CLOSER_ENUM
             );
             do {
-                if (enumFrame.settled || nestingBudgetExceeded || check(GdTokenType.BRACE_CLOSE)) {
+                if (!canContinueBracketedList(enumFrame) || check(GdTokenType.BRACE_CLOSE)) {
                     break;
                 }
                 if (isAtUnclosedMultilineStop() || isAtEnd() || check(GdTokenType.DEDENT)) {
@@ -8302,8 +8452,7 @@ public final class GdScriptParser {
                     }
                     members.add(member);
                 }
-            } while (!enumFrame.settled
-                    && !nestingBudgetExceeded
+            } while (canContinueBracketedList(enumFrame)
                     && !isAtUnclosedMultilineStop()
                     && !isAtEnd()
                     && !check(GdTokenType.DEDENT)
@@ -8466,7 +8615,7 @@ public final class GdScriptParser {
                 var defaultUsed = false;
                 var restUsed = false;
                 do {
-                    if (paramListFrame.settled || nestingBudgetExceeded || check(GdTokenType.PARENTHESIS_CLOSE)) {
+                    if (!canContinueBracketedList(paramListFrame) || check(GdTokenType.PARENTHESIS_CLOSE)) {
                         break;
                     }
                     if (isAtUnclosedMultilineStop() || isAtEnd() || check(GdTokenType.DEDENT)) {
@@ -8945,8 +9094,7 @@ public final class GdScriptParser {
             var left = withExpressionLexicalDamage(rule.prefix().parse(), damagedPrefix);
 
             while (precedence.ordinal() <= ruleFor(current.type()).precedence().ordinal()) {
-                if (nestingBudgetExceeded
-                        || (entryFrame != null && entryFrame.settled)
+                if (!canContinueBracketedList(entryFrame)
                         || isAtUnclosedMultilineStop()) {
                     return left;
                 }
@@ -9076,7 +9224,7 @@ public final class GdScriptParser {
         var hasChildDamage = false;
         if (!check(GdTokenType.BRACKET_CLOSE) || hasCurrentSlotLexicalErrors()) {
             do {
-                if (arrayFrame.settled || nestingBudgetExceeded
+                if (!canContinueBracketedList(arrayFrame)
                         || (check(GdTokenType.BRACKET_CLOSE) && !hasCurrentSlotLexicalErrors())) {
                     // Allow for trailing comma at closer.
                     break;
@@ -9140,7 +9288,7 @@ public final class GdScriptParser {
         var hasChildDamage = false;
         if (!check(GdTokenType.BRACE_CLOSE) || hasCurrentSlotLexicalErrors()) {
             do {
-                if (dictionaryFrame.settled || nestingBudgetExceeded
+                if (!canContinueBracketedList(dictionaryFrame)
                         || (check(GdTokenType.BRACE_CLOSE) && !hasCurrentSlotLexicalErrors())) {
                     // Allow for trailing comma at closer.
                     break;
@@ -9171,7 +9319,14 @@ public final class GdScriptParser {
                 } finally {
                     dictionaryFrame.parsingDictionaryKey = false;
                 }
-                if (dictionaryFrame.settled || nestingBudgetExceeded) {
+                if (!canContinueBracketedList(dictionaryFrame)) {
+                    var key = depthRecoveredDictionaryKey(dictionaryFrame, keyOutcome);
+                    if (key != null) {
+                        var end = key.range().endByte();
+                        var value = new ErrorExpression(CstIssueKind.MISSING, "dictionary.value", "", range(end, end));
+                        entries.add(new DictEntry(key, value, range(Math.min(keyExtentStart, key.range().startByte()), end)));
+                        hasChildDamage = true;
+                    }
                     break;
                 }
                 var key = absorbSlot(keyOutcome, keyExtentStart, "dictionary.key",
@@ -9428,7 +9583,7 @@ public final class GdScriptParser {
         var hadLexicalErrors = hasCurrentSlotLexicalErrors();
         var pathOutcome = parseExpression(false);
         var path = absorbSlot(pathOutcome, pathStart, "preload.path", "Expected resource path after \"(\".");
-        if (!preloadFrame.settled && !nestingBudgetExceeded && !isAtUnclosedMultilineStop()
+        if (canContinueBracketedList(preloadFrame) && !isAtUnclosedMultilineStop()
                 && check(GdTokenType.COMMA)) {
             hadLexicalErrors |= advanceExpressionToken(); // Allow trailing comma.
         }
@@ -9922,8 +10077,7 @@ public final class GdScriptParser {
 
             // Continue the chain on the next suffix token, honoring the same precedence cutoff
             // and boundary/budget guards as `parsePrecedence`.
-            if (nestingBudgetExceeded
-                    || (entryFrame != null && entryFrame.settled)
+            if (!canContinueBracketedList(entryFrame)
                     || lambdaEnded
                     || isAtUnclosedMultilineStop()) {
                 var node = finishChain(result, chainBase, steps, extentStart);
@@ -9996,7 +10150,7 @@ public final class GdScriptParser {
         var arguments = new ArrayList<Expression>();
         var hasChildDamage = false;
         do {
-            if (callFrame.settled || nestingBudgetExceeded
+            if (!canContinueBracketedList(callFrame)
                     || (check(GdTokenType.PARENTHESIS_CLOSE) && !hasCurrentSlotLexicalErrors())) {
                 // Allow for trailing comma at closer.
                 break;
@@ -10049,6 +10203,19 @@ public final class GdScriptParser {
         return current.type() == GdTokenType.PERIOD_PERIOD || isExpressionStarter();
     }
 
+    private boolean canContinueBracketedList(@Nullable StructuralFrame frame) {
+        return !nestingBudgetExceeded && (frame == null || (!frame.settled && frame.depthPoisonLine == 0));
+    }
+
+    private static @Nullable Expression depthRecoveredDictionaryKey(
+            StructuralFrame frame, ParseOutcome<Expression> keyOutcome) {
+        if (frame.settled || frame.depthPoisonLine == 0
+                || keyOutcome instanceof ParseOutcome.Failed<?> || keyOutcome instanceof ParseOutcome.Missing<?>) {
+            return null;
+        }
+        return keyOutcome.valueOrThrow();
+    }
+
     /// Bounded list-advancement step shared by comma-delimited containers and parameter lists:
     /// yields on closer/outer boundaries, consumes true commas, inserts at most one zero-width
     /// `MISSING_SEPARATOR_COMMA` when the previous item advanced and the next token is a trusted
@@ -10062,7 +10229,7 @@ public final class GdScriptParser {
             boolean itemEmittedDiagnostic,
             @NotNull BooleanSupplier isTrustedNextItemStarter
     ) {
-        if (frame.settled || nestingBudgetExceeded || isAtEnd()) {
+        if (!canContinueBracketedList(frame) || isAtEnd()) {
             return false;
         }
         if (current.type() == frame.expectedCloser
@@ -10076,7 +10243,7 @@ public final class GdScriptParser {
         if (check(GdTokenType.COMMA)) {
             frame.lexicalDamageBeforeListSeparator |= hasLexicalDamageOnAdvance(true);
             advance();
-            return !frame.settled && !nestingBudgetExceeded;
+            return canContinueBracketedList(frame);
         }
         // Let `consumeCloser` handle any remaining unowned closer (single-layer mismatch).
         if (isCloserToken(current.type())) {
@@ -10123,7 +10290,7 @@ public final class GdScriptParser {
         var localParens = 0;
         var localBrackets = 0;
         var localBraces = 0;
-        while (!isAtEnd() && !nestingBudgetExceeded && !frame.settled) {
+        while (!isAtEnd() && canContinueBracketedList(frame)) {
             if (current.type() == GdTokenType.DEDENT
                     || current.type() == GdTokenType.NEWLINE
                     || isAtUnclosedMultilineStop()
@@ -10148,7 +10315,7 @@ public final class GdScriptParser {
                 }
             }
             if (localParens == 0 && localBrackets == 0 && localBraces == 0 && match(GdTokenType.COMMA)) {
-                return !frame.settled && !nestingBudgetExceeded;
+                return canContinueBracketedList(frame);
             }
             switch (current.type()) {
                 case PARENTHESIS_OPEN -> localParens++;

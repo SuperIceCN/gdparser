@@ -126,6 +126,8 @@ class GdScriptParserRangeInvariantTest {
             "func f():\n\tfoo(1+)(2)\n",
             "func f():\n\ta[1+][2]\n",
             "func f():\n\tfoo(1+, func(): pass)\n",
+            "func f():\n\tfoo(1+, func(): = [1)\n\tpass\nvar after = 1\n",
+            "func f():\r\n\tfoo(\"😀\", 1+, func(): = [1, 2)\r\n\tpass\r\nvar after = 1\r\n",
             "var x = func(a = 1+): pass + 2\n",
             "func f():\n\tsuper(1+)+2\n",
             "func f():\n\tvar x = ()\n",
@@ -174,6 +176,26 @@ class GdScriptParserRangeInvariantTest {
             "var x = g(func():\n\tvar cb = func(): pass]\n\treturn 1\n)\n",
             "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "\n\t1\n\t\t" + "]".repeat(260)
                     + ": pass\n\t\t_:\n\t\t\tpass\n\tvar local_after = 1\nvar after = 2\n",
+            "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "1}" + "]".repeat(259)
+                    + ": pass\n\t\t_: pass\n\tvar local_after = 1\nvar after = 2\n",
+            "var x = h(g(func(): return " + "[".repeat(260) + "1}), 2)\nvar after = 1\n",
+            "var x = " + "[".repeat(260) + "1}",
+            "var x = g(func(): = [1, 2\nvar after = 1\n]\n",
+            "var x = g(func(): = [1, \\\r\n\t# ; ]\r\n\t2], 3)\r\nvar after = 1\r\n",
+            "var x = h(g((" + "[".repeat(260) + "1}), 2), 3)\nvar after = 1\n",
+            "var x = " + "[".repeat(260) + "1" + "]".repeat(10) + "\nvar after = 1\n",
+            "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "1}" + "]".repeat(10)
+                    + ": pass\n\t\t_: pass\n\tvar local_after = 1\nvar after = 2\n",
+            "var x = " + "[".repeat(254) + "g([1].value, 2)" + "]".repeat(254) + "\nvar after = 1\n",
+            "var x = " + "[".repeat(253) + "g(a[(1)].value, 2)" + "]".repeat(253) + "\nvar after = 1\n",
+            "var x = " + "[".repeat(254) + "g([1].value, 2)" + "]".repeat(253) + "\nvar after = 1\n",
+            "var x = { g((" + "[".repeat(260) + "1]), 2)\nvar after = 1\n",
+            "func f():\n\tmatch x:\n\t\t{ g((" + "[".repeat(260) + "1]), 2): pass\n\t\t_: pass\n",
+            "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "(func(a: int) -> int: pass)" + "]".repeat(5)
+                    + ": return 7\n\t\t_: pass\n",
+            "func f():\n\tmatch x:\n\t\t{ \"key\": g((" + "[".repeat(260) + "1]), 2): return 7\n\t\t_: pass\n",
+            "func f():\n\tmatch x:\n\t\t" + "[".repeat(260) + "$a/func(): return 7\n\t\t_: pass\n",
+            "var x = " + "[".repeat(253) + "h([[1] + 2 } = 4, 9)" + "]".repeat(253) + "\nvar after = 1\n",
             "func f():\n\tvar x = (a.\\\n\t\t# note\n\t\tmatch\n\tvar y = 2\n",
             // Recovery corpus covering folded damaged expressions, dictionary literals,
             // comma-delimited lists/patterns, property blocks, and header/suite recovery.
