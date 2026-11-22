@@ -220,6 +220,7 @@ final class RecoveryTransactionTracker {
     private final Set<ProvisionalFrame> ownedFrames = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<LexicalBatch> ownedBatches = Collections.newSetFromMap(new IdentityHashMap<>());
     private final List<LexicalBatch> openBatches = new ArrayList<>();
+    private long fallbackResolutionSteps;
 
     @NotNull ProvisionalFrame pushFrame(@NotNull String facet) {
         Objects.requireNonNull(facet, "facet must not be null");
@@ -312,6 +313,16 @@ final class RecoveryTransactionTracker {
     }
 
     void reset() {
+        fallbackResolutionSteps = 0;
+        clearState();
+    }
+
+    /// Fallback frame visits and cache writes from the most recent finalization.
+    long fallbackResolutionSteps() {
+        return fallbackResolutionSteps;
+    }
+
+    private void clearState() {
         entries.clear();
         frameStack.clear();
         for (var batch : openBatches) {
@@ -601,6 +612,7 @@ final class RecoveryTransactionTracker {
     /// per-parse state so no provisional AST references are retained.
     @NotNull List<AstDiagnostic> finalizeDiagnostics(@NotNull SourceFile ast) {
         Objects.requireNonNull(ast, "ast must not be null");
+        fallbackResolutionSteps = 0;
         try {
             flushAllLexicalBatchesAsStandalone();
 
@@ -642,7 +654,7 @@ final class RecoveryTransactionTracker {
             }
             return List.copyOf(result);
         } finally {
-            reset();
+            clearState();
         }
     }
 
@@ -682,7 +694,7 @@ final class RecoveryTransactionTracker {
                 : null;
     }
 
-    private static @NotNull ResolvedTarget resolveFrameTarget(
+    private @NotNull ResolvedTarget resolveFrameTarget(
             @NotNull ProvisionalFrame frame,
             @NotNull String code,
             @NotNull Set<Node> reachable,
@@ -695,7 +707,7 @@ final class RecoveryTransactionTracker {
         return resolveFallbackOf(frame, code, reachable, fallbackCache);
     }
 
-    private static @NotNull ResolvedTarget resolveFallbackOf(
+    private @NotNull ResolvedTarget resolveFallbackOf(
             @NotNull ProvisionalFrame startFrame,
             @NotNull String code,
             @NotNull Set<Node> reachable,
@@ -708,6 +720,7 @@ final class RecoveryTransactionTracker {
         // `ownedFrames`, forming an acyclic finite chain that always exits via cache hit, root
         // (`parent == null`), or a surviving compatible ancestor.
         while (true) {
+            fallbackResolutionSteps++;
             var byCode = fallbackCache.get(curr);
             if (byCode != null) {
                 var cached = byCode.get(code);
@@ -734,6 +747,7 @@ final class RecoveryTransactionTracker {
             curr = parent;
         }
         for (var node : path) {
+            fallbackResolutionSteps++;
             fallbackCache.computeIfAbsent(node, _ -> new HashMap<>()).put(code, result);
         }
         return result;

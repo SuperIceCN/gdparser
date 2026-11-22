@@ -19,8 +19,10 @@ final class CompletionContextAnalyzer {
     private final SourceTextIndex index;
     private final int offset;
     private final List<Node> path;
+    private long backwardScanSteps;
+    private long hardStopScanSteps;
 
-    private CompletionContextAnalyzer(CompletionTokenStream stream, SourceFile ast, long byteOffset) {
+    CompletionContextAnalyzer(CompletionTokenStream stream, SourceFile ast, long byteOffset) {
         this.stream = stream;
         entries = stream.entries();
         index = stream.index();
@@ -32,7 +34,9 @@ final class CompletionContextAnalyzer {
         return new CompletionContextAnalyzer(new CompletionTokenStream(source), ast, byteOffset).analyze();
     }
 
-    private CompletionContext analyze() {
+    CompletionContext analyze() {
+        backwardScanSteps = 0;
+        hardStopScanSteps = 0;
         if (isInTriviaOrString()) {
             return context(CompletionContext.Kind.UNKNOWN, zeroRange());
         }
@@ -74,6 +78,16 @@ final class CompletionContextAnalyzer {
             return context(CompletionContext.Kind.CALL_ARGUMENT, zeroRange());
         }
         return context(CompletionContext.Kind.UNKNOWN, zeroRange());
+    }
+
+    /// Iterations in the token receiver walk and its nested delimiter and node-path lookbehind.
+    long backwardScanSteps() {
+        return backwardScanSteps;
+    }
+
+    /// Hard boundaries passed when stepping over exact delimiter pairs.
+    long hardStopScanSteps() {
+        return hardStopScanSteps;
     }
 
     private boolean isInTriviaOrString() {
@@ -193,6 +207,7 @@ final class CompletionContextAnalyzer {
 
     private int primaryStart(int position, int hardStop) {
         while (position >= 0) {
+            backwardScanSteps++;
             var token = token(position);
             if (token.type() == GdTokenType.PARENTHESIS_CLOSE
                     || token.type() == GdTokenType.BRACKET_CLOSE
@@ -208,6 +223,8 @@ final class CompletionContextAnalyzer {
             // Exact pairs are atomic; lookbehind outside the pair uses the opener's boundary.
             // The walk only moves left, so each boundary is passed at most once.
             while (hardStop >= 0 && stream.hardStopByte(hardStop) > token(position).startByte()) {
+                backwardScanSteps++;
+                hardStopScanSteps++;
                 hardStop--;
             }
             var boundary = hardStop >= 0 ? stream.hardStopByte(hardStop) : -1;
@@ -238,6 +255,7 @@ final class CompletionContextAnalyzer {
         var left = position;
         var standalone = position;
         while (canStepLeft(left, boundary)) {
+            backwardScanSteps++;
             if (token(left - 1).type() == GdTokenType.PERCENT) {
                 left--;
                 var prefix = isExpressionPrefix(left, boundary);
@@ -283,6 +301,7 @@ final class CompletionContextAnalyzer {
         var invert = false;
         outer:
         while (canStepLeft(position, boundary)) {
+            backwardScanSteps++;
             var previous = token(position - 1);
             if (CompletionTokenStream.isIdentifier(previous) || previous.type() == GdTokenType.LITERAL
                     || previous.type() == GdTokenType.SELF || previous.type() == GdTokenType.SUPER) {
@@ -307,6 +326,7 @@ final class CompletionContextAnalyzer {
             }
             var left = position - 1;
             while (canStepLeft(left, boundary)) {
+                backwardScanSteps++;
                 if (token(left - 1).type() == GdTokenType.PERCENT) {
                     left--;
                     if (!canStepLeft(left, boundary)) {

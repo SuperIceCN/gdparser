@@ -2,6 +2,7 @@ package dev.superice.gdparser.frontend.gdscript;
 
 import dev.superice.gdparser.frontend.ast.AttributeExpression;
 import dev.superice.gdparser.frontend.ast.ExtendsStatement;
+import dev.superice.gdparser.frontend.ast.FunctionDeclaration;
 import dev.superice.gdparser.frontend.ast.IdentifierExpression;
 import dev.superice.gdparser.frontend.ast.Node;
 import dev.superice.gdparser.frontend.ast.Point;
@@ -34,9 +35,11 @@ import static dev.superice.gdparser.frontend.gdscript.CompletionContext.Kind.UNK
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -56,6 +59,13 @@ class GdCompletionContextTest {
     @Test
     void legacy01MemberPrefix() {
         assertCase(member("func f():\n\tnode.pa|", "pa", "node"));
+    }
+
+    @Test
+    void completionFindsMemberInsideLambdaAndOuterVariableAfterItsCloser() {
+        var source = GdTokenizerTest.MULTILINE_LAMBDA;
+        assertCase(member(source.replace("node.part", "node.pa|rt"), "part", "node"));
+        assertCase(plain(source.replace("return x", "return x|"), IDENTIFIER, "x"));
     }
 
     @Test
@@ -395,6 +405,7 @@ class GdCompletionContextTest {
                 member("func f(x):\n\tvar y = x as Array[int][0].na|me", "name", "x as Array[int][0]"),
                 plain("extends \"res://base.gd\".In|ner", TYPE_POSITION, "Inner"),
                 plain("extends \"res://base.gd\".Outer.In|ner", TYPE_POSITION, "Inner"),
+                plain("class Nested:\n\textends Outer.In|ner\n\tpass", TYPE_POSITION, "Inner"),
                 plain("extends |\"res://base.gd\"", TYPE_POSITION, ""),
                 plain("extends \"res://ba|se.gd\".Inner", UNKNOWN, ""),
                 plain("func f(x: Dictionary[String, Outer.In|ner]): pass", TYPE_POSITION, "Inner"),
@@ -410,9 +421,11 @@ class GdCompletionContextTest {
         var source = withoutCursor(testCase.completion());
         var result = FACADE.parse(source);
         assertEquals(testCase.diagnosticCodes(), result.diagnostics().stream().map(d -> d.code()).toList(), source);
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
         var context = assertCase(testCase.completion(), false);
-        assertTokenCase(testCase.completion());
+        var tokenContext = assertCase(testCase.completion(), true);
         assertExactReplacementAtName(testCase.completion(), source, context);
+        assertExactReplacementAtName(testCase.completion(), source, tokenContext);
         var bytes = source.getBytes(StandardCharsets.UTF_8);
         var nodes = new ArrayDeque<Node>();
         nodes.add(result.ast());
@@ -692,8 +705,10 @@ class GdCompletionContextTest {
     @ParameterizedTest
     @MethodSource("recoveredDelimiterCases")
     void recoveredDelimiterBoundariesWorkWithAndWithoutAst(Case testCase) {
-        assertCase(testCase);
-        assertTokenCase(testCase);
+        var source = withoutCursor(testCase);
+        assertExactReplacementAtName(testCase, source, assertCase(testCase, false));
+        assertExactReplacementAtName(testCase, source, assertCase(testCase, true));
+        assertTrue(new CompletionTokenStream(source).oracleScanCount() <= 1, source);
     }
 
     static Stream<Case> recoveredDelimiterCases() {
@@ -711,7 +726,7 @@ class GdCompletionContextTest {
                 plain("var x = g(func():\n\tvar y = 1\n\treturn |)", CALL_ARGUMENT, ""),
                 plain("var x = g(func():\n\tvar y = 1\n\treturn |", CALL_ARGUMENT, ""),
                 plain("target(1\nvar x = \"unterminated|", UNKNOWN, "")
-        );
+        ).flatMap(GdCompletionContextTest::withCrlfAndEmoji);
     }
 
     @Test
@@ -1101,6 +1116,41 @@ class GdCompletionContextTest {
     }
 
     @Test
+    void receiverWalkIsLinearAcrossPairedCallsAndHardBoundaries() {
+        var parser = new GdScriptParser();
+        for (var n : List.of(256, 512, 1024, 2048)) {
+            var prefix = "func f():\n\tvar bad = target([1\n\tpass\n".repeat(n);
+            var receiver = "target" + "(\n\t[1\n\tvar y = 1\n)".repeat(n);
+            var source = prefix + receiver + ".na";
+            var offset = source.getBytes(StandardCharsets.UTF_8).length;
+            var stream = new CompletionTokenStream(source);
+            var analyzer = new CompletionContextAnalyzer(stream, emptyAst(), offset);
+            var context = analyzer.analyze();
+            assertEquals(MEMBER_ACCESS, context.kind());
+            assertRange(receiver, context.receiverRange(), source.getBytes(StandardCharsets.UTF_8), "receiver");
+            assertEquals(prefix.getBytes(StandardCharsets.UTF_8).length, context.receiverRange().startByte());
+            assertEquals(offset - ".na".length(), context.receiverRange().endByte());
+            assertEquals(offset - 2, context.replaceableRange().startByte());
+            assertEquals(offset, context.replaceableRange().endByte());
+            var steps = analyzer.backwardScanSteps();
+            var hardStops = analyzer.hardStopScanSteps();
+            // Each paired call contributes one receiver iteration and contains an abandoned array.
+            // Its three newlines and any layout or boundary at the declaration are visited at most once.
+            var limit = 8L * n + 8;
+            assertTrue(hardStops >= n, () -> "expected at least " + n + " internal hard stops, got " + hardStops);
+            assertTrue(steps >= 2L * n && steps <= limit,
+                    () -> "receiver steps: " + steps + ", expected " + 2L * n + " to " + limit);
+            assertTrue(stream.oracleScanCount() <= 1);
+            assertEquals(context, analyzer.analyze());
+            assertEquals(steps, analyzer.backwardScanSteps());
+            assertEquals(hardStops, analyzer.hardStopScanSteps());
+            parser.parse(source);
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            assertTrue(parser.parse("var ok = 1\n").diagnostics().isEmpty());
+        }
+    }
+
+    @Test
     @Timeout(15)
     void allCompletionPrefixesKeepUtf8RangesAndReceiverInvariants() {
         for (var sample : List.of(
@@ -1158,6 +1208,60 @@ class GdCompletionContextTest {
             assertEquals(TYPE_POSITION, FACADE.parseCompletionContext(source,
                     source.getBytes(StandardCharsets.UTF_8).length).kind(), source);
         }
+    }
+
+    @ParameterizedTest
+    @MethodSource("hardNewlineWithRealTypeCloserCases")
+    void hardNewlineWithRealCloserCompletesOnlyWhenTheLineIsATypeFragment(Case testCase) {
+        var source = withoutCursor(testCase);
+        var result = FACADE.parse(source);
+        var missingClosers = result.diagnostics().stream()
+                .filter(diagnostic -> DiagnosticCodes.MISSING_CLOSER_TYPE_BRACKET.equals(diagnostic.code()))
+                .toList();
+        assertEquals(1, missingClosers.size(), source);
+        var closer = missingClosers.getFirst();
+        var anchor = source.indexOf('[') + 1;
+        assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, anchor, anchor), closer.range(), source);
+        var recovery = closer.recovery();
+        assertNotNull(recovery, source);
+        var host = result.ast().statements().get(source.startsWith("#") ? 1 : 0);
+        if (source.contains("func f()")) {
+            assertSame(assertInstanceOf(FunctionDeclaration.class, host), recovery.owner(), source);
+            assertEquals("function.return_type", recovery.facet(), source);
+        } else {
+            assertSame(assertInstanceOf(VariableDeclaration.class, host), recovery.owner(), source);
+            assertEquals("variable.type", recovery.facet(), source);
+        }
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        assertThrows(IllegalStateException.class, () -> FACADE.parseStrict(source), source);
+        assertExactReplacementAtName(testCase, source, assertCase(testCase, false));
+        assertExactReplacementAtName(testCase, source, assertCase(testCase, true));
+    }
+
+    static Stream<Case> hardNewlineWithRealTypeCloserCases() {
+        return Stream.of(
+                plain("var x: Array[\n\tIn|ner]", TYPE_POSITION, "Inner"),
+                plain("func f() -> Array[\n\tIn|ner]", TYPE_POSITION, "Inner"),
+                plain("func f() -> Array[\n\tIn|ner]: pass", IDENTIFIER, "Inner"),
+                plain("var 数: Array[\n\t内|部]", TYPE_POSITION, "内部")
+        ).flatMap(GdCompletionContextTest::withCrlfAndEmoji);
+    }
+
+    @ParameterizedTest
+    @MethodSource("callArgumentAndSuperFallbackCases")
+    void tokenFallbackIdentifiesOrdinaryCallsAndSuperMemberAccess(Case testCase) {
+        assertCase(testCase);
+        assertTokenCase(testCase);
+    }
+
+    static Stream<Case> callArgumentAndSuperFallbackCases() {
+        return Stream.of(
+                plain("x = target(|)", CALL_ARGUMENT, ""),
+                plain("var x = target(|)", CALL_ARGUMENT, ""),
+                plain("func f(x = target(|)): pass", CALL_ARGUMENT, ""),
+                member("func f():\n\tsuper.|", "", "super"),
+                member("func f():\n\tsuper.ba|", "ba", "super")
+        ).flatMap(GdCompletionContextTest::withCrlfAndEmoji);
     }
 
     static Stream<Case> trustedTypeContinuationCases() {

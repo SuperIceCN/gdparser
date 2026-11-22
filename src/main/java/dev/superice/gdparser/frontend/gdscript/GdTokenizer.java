@@ -104,6 +104,7 @@ public final class GdTokenizer {
     private int position;
     private int line = 1;
     private int column = 1;
+    private long scanSteps;
 
     // Current multi-char token window (Godot's `_start`/`start_line`/`start_column`).
     private int tokenStart;
@@ -198,6 +199,7 @@ public final class GdTokenizer {
         this.chars = codePoints;
         this.byteOffsets = offsets;
         position = 0;
+        scanSteps = 0;
         line = 1;
         column = 1;
         tokenStart = 0;
@@ -357,6 +359,11 @@ public final class GdTokenizer {
 
     boolean hasBalancedPersistentState() {
         return indentStackStack.isEmpty() && suppressedNewline == null;
+    }
+
+    boolean hasBalancedDelimiterState() {
+        return parenStack.isEmpty() && openParenIndices.isEmpty()
+                && openBracketIndices.isEmpty() && openBraceIndices.isEmpty();
     }
 
     /// Reconciles suppressed multiline layout against `indentStack` once multiline suppression
@@ -567,6 +574,7 @@ public final class GdTokenizer {
             clearSuppressedOnNextScan = false;
         }
         while (true) {
+            scanSteps++;
             if (hasError()) {
                 return popError();
             }
@@ -1575,6 +1583,7 @@ public final class GdTokenizer {
     ///      and emits an ERROR naming every unclosed opener skipped along the way.
     ///   4. No ancestor: pops only the mismatched top and emits an ERROR naming it.
     private GdToken handleCloser(int closerChar, int expectedOpener, GdTokenType tokenType) {
+        scanSteps++;
         if (emitRawClosers) {
             return makeToken(tokenType);
         }
@@ -1591,6 +1600,7 @@ public final class GdTokenizer {
             var matchIndex = expectedStack.getLast();
             var skipped = new StringBuilder();
             for (var i = matchIndex + 1; i < parenStack.size(); i++) {
+                scanSteps++;
                 if (!skipped.isEmpty()) {
                     skipped.append(", ");
                 }
@@ -1616,6 +1626,7 @@ public final class GdTokenizer {
     /// Port of `_peek(offset)`: code point at `position + offset`, or 0 out of bounds.
     /// Negative offsets look backwards; `peek(-1)` is the most recently consumed char.
     private int peek(int offset) {
+        scanSteps++;
         var index = position + offset;
         return index >= 0 && index < chars.length ? chars[index] : 0;
     }
@@ -1649,6 +1660,7 @@ public final class GdTokenizer {
         if (emitRawClosers) {
             return;
         }
+        scanSteps++;
         var index = parenStack.size();
         parenStack.add(paren);
         var stack = openerIndexStack(paren);
@@ -1658,12 +1670,18 @@ public final class GdTokenizer {
     }
 
     private int popTopParen() {
+        scanSteps++;
         var top = parenStack.removeLast();
         var stack = openerIndexStack(top);
         if (stack != null) {
             stack.removeLast();
         }
         return top;
+    }
+
+    /// Scan-dispatch iterations, code-point lookups, and standalone delimiter operations.
+    long scanSteps() {
+        return scanSteps;
     }
 
     private boolean hasError() {

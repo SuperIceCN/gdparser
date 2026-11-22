@@ -107,6 +107,20 @@ class SourceTextIndexTest {
     }
 
     @Test
+    void longCrlfSourceWithStrayCrKeepsPhysicalUtf8Ranges() {
+        var source = "func f():\r\n\tvar 名 = \"\"\"😀\r\n界\"\"\"\r\n\tvar " + "界".repeat(4096) + " = 7\r§";
+        var index = SourceTextIndex.of(source);
+        var literal = source.indexOf('7');
+        var error = source.indexOf('§');
+        assertEquals(4, index.lineCount());
+        assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, literal, error + 1),
+                index.rangeOf(source.substring(0, literal).getBytes(StandardCharsets.UTF_8).length,
+                        source.getBytes(StandardCharsets.UTF_8).length));
+        assertEquals(new Point(3, 12_296), index.pointAt(index.utf8Length() - 4));
+        assertEquals(new Point(3, 12_300), index.pointAt(index.utf8Length()));
+    }
+
+    @Test
     void rangeOfCombinesBothEndpoints() {
         var index = SourceTextIndex.of("ab\ncd");
 

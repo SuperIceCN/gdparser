@@ -250,7 +250,7 @@
 | `R5.1` 词法与解析、坐标 | 从 §2.6 对应行列出的 `T`、`F`、`P`、`E` 测试扩展真实公开/托管入口；坐标用独立字节和 code point 计算。 | 完成 `L-01/02/03/27a/27b` 与原 3/5a 矩阵；LF/CRLF+emoji、EOF、错闭合与健康配对。 |
 | `R5.2` AST、严格入口与诊断 | 从 §2.6 对应行的各行为测试及 §3 合成过滤测试扩展；清理反义命名，serde/walker 测真实返回树。 | 完成 `L-04/06/11/14/15/17/19/21/22/25a/25b/25c/30b/30d` 行为矩阵。查精确 marker、诊断和兄弟；用 `I5` 位置门禁验身份。 |
 | `R5.3` 补全入口和独立回退 | 扩展 §2.6 的 `C` 行为测试和 §2.7 的双入口对照；生产锚点是 `GdScriptParserFacade.java:52–55` 与 `CompletionContextAnalyzer.java:175–191`。不改变旧五分类或重建 Pratt。 | 完成原 5c、`L-28.1/.2/.3` 矩阵；硬换行已有 `]` strict 拒绝、普通和默认值内 `target(\|)` 的两个入口、CRLF+emoji 错闭合分类及健康/恢复数据流。 |
-| `R5.4` 复杂度与边界 | 扩展 §2.6 线性测试及 `V:1132–1141` 的归属断言。沿用内部可观察计数，不用墙钟或 token 数代替步数，避免改变生产行为以配合测试。 | 按 §4.1 做四档递增、三栈收口与重入，覆盖连续错配、深层 `match`、长行、短行、逐截断及诊断回退。 |
+| `R5.4` 复杂度与边界 | 扩展 §2.6 线性测试及 `GdScriptParserRangeInvariantTest` 的归属断言。沿用内部可观察计数，不用墙钟或 token 数代替步数，避免改变生产行为以配合测试。 | 按 §4.1 做四档递增、三栈收口与重入，覆盖连续错配、深层 `match`、长行、短行、逐截断及诊断回退。 |
 
 **出口：** `GdTokenizerTest`、`GdScriptParserFacadeTest`、`GdScriptParserTest`、`GdScriptParserErrorRecoveryTest`、`GdScriptParserRangeInvariantTest`、`GdParserParityTest`、`GdParityReferenceTest`、`GdCompletionContextTest`、`CstToAstMapperTest`、`AstSexprSerdeTest`、`NodeChildrenTest`、`ASTWalkerTest`、`SourceTextIndexTest` 与旧 `infra.treesitter.CompletionContextTest`。§2.6 所有项有可定位的行为断言；执行 §4.1 定向、复杂度、审阅、diff 和发布前 `clean build`。
 
@@ -276,7 +276,7 @@
 | `R2` 结构边界与熔断配平 | `R2.1`–`R2.3` | 已完成（双审 APPROVE，1628 定向通过） |
 | `R3` 诊断归属与块边界 | `R3.1`–`R3.5` | 已完成（双审 APPROVE，1684 定向通过） |
 | `R4` 语法守门与语言对齐 | `R4.1`–`R4.4` | 已完成（双审 APPROVE，639 定向通过） |
-| `R5` 行为、坐标与线性门禁 | `R5.1`–`R5.4` | 待实施 |
+| `R5` 行为、坐标与线性门禁 | `R5.1`–`R5.4` | 已完成（双审 APPROVE，全量 2072 通过） |
 | `R6` GDCC 独立联调 | `R6.1`–`R6.3` | 待实施（跨仓，需独立授权） |
 
 `R1` 实施摘要：表达式与类型按五态传播（新增 `EnclosedDamage`），透明分组保留内层状态，Pratt/特化前缀/lambda 头部词法与结构损伤完整保真；`as`/`is` 保留坏类型前缀且为独立类型诊断兜底建立 `type.argument` 归属；`for` 在非 `Ok` 类型后于同行同步 `in`（含显式 `\` 续行）。公开 AST 与 serde 不变；同步更新三份设计文档。定向 5 类 505 项全过（0 失败/错误/跳过），`review-expert-b` 与 `review-expert-c` 双 `APPROVE`。
@@ -286,3 +286,5 @@
 `R3` 实施摘要：孤立 closer 按语句尾、套件、类体或真正无宿主的位置归属；分号结束前语句，`match` 不消费归祖先的 closer。丢弃参数默认值中的 lambda 签名与套件诊断沿授权链回退到存活签名，套件熔断归属存活宿主，类体残片归属最近存活类。位置门禁验证同代 owner 身份与 facet，清零全部基线 `I5` 违规。属性坏访问器只报一个主诊断，即使头部未闭也隔离缩进体；同行体保留独立诊断、隔离 lambda 结束标志，并把外层逗号交还属性列表。字典按键的物理结束行接回值，受损签名只为可信的跨行 `->` 保留续行。公开 AST 不变；LF、CRLF、UTF-8 与四档熔断验证通过，定向 7 类共 1684 项（0 失败/错误/跳过），`review-expert-b` 与 `review-expert-c` 双 `APPROVE`。
 
 `R4` 实施摘要：独立指令不消费待绑定注解，扁平 AST 保持源序；隐式根类资格只在脚本前缀开放时保留，注解在 lambda 和属性套件中以常数时间交换缓冲区隔离，并在缓冲区边界自动计量读写/拷贝/结算工作量。嵌套类体首连续 `extends` 按关键字占槽，首条优先，后续每条在所属类的 `class.extends` 报专用诊断；同行分号可继续父类段，硬换行结束内联类，父类段同步不会吞掉后续成员。损伤左值保留节点与右值，只抑制派生目标错；裸 lambda 按最终表达式形态诊断。公开 AST 不变；LF、CRLF、emoji 字节范围、`I5` 与四档线性验证（`16*N+3` 上界）通过，定向 6 类共 639 项（0 失败/错误/跳过），`review-expert-b` 与 `review-expert-c` 双 `APPROVE`。
+
+`R5` 实施摘要：补齐公开/托管分词、严格与容错解析、真实 AST 遍历与序列化，以及 facade/空 AST 补全的行为矩阵；更正六处反义测试名。以独立物理坐标校验 UTF-8 半开范围，区分零宽 `MISSING` 节点、漏逗号插入位和锚定已消费 token 的诊断；恢复用例验证同代身份、facet 与后续结构。新增包私有只读工作量观测，在 256 / 512 / 1024 / 2048 四档检查扫描、配平、回扫和记忆化回退，含单次 Oracle、三栈收口和重入。按双审意见补齐了补全回扫真正越过内部硬边界、恢复容器类型和严格入口拒绝原因的断言，移除了测试测量日志。公开 API、诊断码与生产解析/补全行为不变。初次定向 16 类 1957 项、双审修订后定向重跑 4 类 1452 项、最终 `clean build` 全量 26 类 2072 项通过，均为 0 失败、0 错误、0 跳过，`review-expert-b` 与 `review-expert-c` 双 `APPROVE`。

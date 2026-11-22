@@ -3,6 +3,7 @@ package dev.superice.gdparser.frontend.gdscript;
 import dev.superice.gdparser.frontend.ast.AnnotationStatement;
 import dev.superice.gdparser.frontend.ast.AstDiagnostic;
 import dev.superice.gdparser.frontend.ast.AstDiagnosticSeverity;
+import dev.superice.gdparser.frontend.ast.AstMappingResult;
 import dev.superice.gdparser.frontend.ast.Block;
 import dev.superice.gdparser.frontend.ast.ClassDeclaration;
 import dev.superice.gdparser.frontend.ast.CommentStatement;
@@ -38,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -324,6 +326,54 @@ class DiagnosticRecoveryFoundationTest {
             assertNotNull(diagnostic.recovery());
             assertSame(rootVariable, diagnostic.recovery().owner());
             assertEquals("variable.property", diagnostic.recovery().facet());
+        }
+    }
+
+    @Test
+    void abandonedFallbackChainsVisitAndCacheEachFrameOnlyOncePerCode() {
+        var source = "var root = 1";
+        var parser = new GdScriptParser();
+        var tracker = new RecoveryTransactionTracker();
+        for (var n : List.of(256, 512, 1024, 2048)) {
+            var ast = parser.parse(source).ast();
+            var owner = assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst());
+            var parent = tracker.pushFrame("variable.initializer");
+            tracker.commit(parent, owner);
+            var frames = new ArrayList<RecoveryTransactionTracker.ProvisionalFrame>(n);
+            for (var i = 0; i < n; i++) {
+                var child = tracker.pushChildFrame("annotation.target", parent,
+                        i == 0 ? "variable.property" : "annotation.target");
+                tracker.abandon(child);
+                frames.add(child);
+                parent = child;
+            }
+            // Resolve deepest first for a full walk followed by cache hits at every shallower depth.
+            for (var frame : frames.reversed()) {
+                tracker.emitError("Dangling annotation", owner.range(), DiagnosticCodes.ANNOTATION_DANGLING,
+                        AttributionPolicy.TARGET_FRAME, frame);
+            }
+            for (var i = 0; i <= n; i++) {
+                tracker.popFrame();
+            }
+            assertTrue(tracker.isBalanced());
+            var diagnostics = tracker.finalizeDiagnostics(ast);
+            var steps = tracker.fallbackResolutionSteps();
+            // Each discarded frame is visited and cached once, then each remaining diagnostic hits the cache.
+            var limit = 3L * n - 1;
+            assertTrue(steps >= 2L * n && steps <= limit, () -> "fallback steps: " + steps);
+            assertEquals(n, diagnostics.size());
+            for (var diagnostic : diagnostics) {
+                assertEquals(owner.range(), diagnostic.range());
+                assertSame(owner, diagnostic.recovery().owner());
+                assertEquals("variable.property", diagnostic.recovery().facet());
+            }
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source,
+                    new AstMappingResult(ast, diagnostics), () -> "discarded frames: " + n);
+            assertTrue(tracker.isBalanced());
+            assertTrue(parser.bracketOracleScanCount() <= 1);
+            assertTrue(parser.parse(source).diagnostics().isEmpty());
+            tracker.reset();
+            assertEquals(0, tracker.fallbackResolutionSteps());
         }
     }
 

@@ -25,6 +25,7 @@ import dev.superice.gdparser.frontend.ast.ConstructorDeclaration;
 import dev.superice.gdparser.frontend.ast.ContinueStatement;
 import dev.superice.gdparser.frontend.ast.DeclarationKind;
 import dev.superice.gdparser.frontend.ast.DictionaryExpression;
+import dev.superice.gdparser.frontend.ast.DictionaryPatternFixture;
 import dev.superice.gdparser.frontend.ast.EnumDeclaration;
 import dev.superice.gdparser.frontend.ast.ErrorExpression;
 import dev.superice.gdparser.frontend.ast.ExpressionStatement;
@@ -71,6 +72,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Behavior-anchoring tests for the declaration-layer parser: positive cases pin AST shapes and
@@ -165,11 +167,38 @@ class GdScriptParserTest {
         for (var source : emptyCases) {
             var ast = cleanAst(source);
             assertTrue(ast.statements().isEmpty(), () -> "expected empty AST for: " + source);
-            var index = SourceTextIndex.of(source);
-            var eof = index.utf8Length();
-            assertEquals(index.rangeOf(eof, eof), ast.range(), () -> "expected zero-width EOF range for: " + source);
-            assertTrue(facade.parseStrict(source).statements().isEmpty());
+            assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, source.length(), source.length()), ast.range());
+            assertEquals(ast, facade.parseStrict(source));
         }
+    }
+
+    @Test
+    void managedParsePreservesLambdaSuiteAndResumesOuterIndentation() {
+        var ast = cleanAst(GdTokenizerTest.MULTILINE_LAMBDA);
+        var outer = assertInstanceOf(FunctionDeclaration.class, ast.statements().getFirst());
+        assertEquals(2, outer.body().statements().size());
+        var initializer = assertInstanceOf(VariableDeclaration.class, outer.body().statements().getFirst());
+        var call = assertInstanceOf(CallExpression.class, initializer.value());
+        var lambda = assertInstanceOf(LambdaExpression.class, call.arguments().getFirst());
+        var innerReturn = assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst());
+        var chain = assertInstanceOf(AttributeExpression.class, innerReturn.value());
+        assertEquals("node", assertInstanceOf(IdentifierExpression.class, chain.base()).name());
+        assertEquals("part", assertInstanceOf(AttributePropertyStep.class, chain.steps().getFirst()).name());
+        var outerReturn = assertInstanceOf(ReturnStatement.class, outer.body().statements().getLast());
+        assertEquals("x", assertInstanceOf(IdentifierExpression.class, outerReturn.value()).name());
+        assertEquals("tail", assertInstanceOf(VariableDeclaration.class, ast.statements().getLast()).name());
+    }
+
+    @Test
+    void dictionaryPatternKeyOnlySyntaxDoesNotChangeDictionaryLiteralValues() {
+        var ast = cleanAst(DictionaryPatternFixture.SOURCE);
+        var patterns = DictionaryPatternFixture.patternEntries(ast);
+        var literals = DictionaryPatternFixture.literalEntries(ast);
+        DictionaryPatternFixture.assertKeys(patterns);
+        DictionaryPatternFixture.assertKeys(literals);
+        patterns.forEach(entry -> assertNull(entry.value()));
+        assertEquals(List.of("4", "5", "6"), literals.stream()
+                .map(entry -> assertInstanceOf(LiteralExpression.class, entry.value()).sourceText()).toList());
     }
 
     @Test
@@ -196,6 +225,29 @@ class GdScriptParserTest {
 
         var regionNoTrailingNewline = facade.parseStrict("#region foo\n#endregion");
         assertEquals(2, regionNoTrailingNewline.statements().size());
+
+        for (var newline : List.of("\n", "\r\n")) {
+            for (var terminal : List.of("", newline)) {
+                var source = "#region 组😀" + newline + "# 注😀" + newline + "#endregion" + terminal;
+                var parsed = facade.parseStrict(source);
+                var begin = assertInstanceOf(RegionDirectiveStatement.class, parsed.statements().getFirst());
+                var comment = assertInstanceOf(CommentStatement.class, parsed.statements().get(1));
+                var close = assertInstanceOf(RegionDirectiveStatement.class, parsed.statements().getLast());
+                assertEquals(3, parsed.statements().size());
+                assertEquals("start", begin.directive());
+                assertEquals("组😀", begin.label());
+                assertEquals("end", close.directive());
+                assertNull(close.label());
+                var commentStart = source.indexOf("# 注");
+                var closeStart = source.indexOf("#endregion");
+                assertEquals(source.substring(commentStart, closeStart - 1), comment.text());
+                assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, 0, commentStart - 1), begin.range());
+                assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, commentStart, closeStart - 1),
+                        comment.range());
+                var closeEnd = terminal.isEmpty() ? source.length() : source.length() - 1;
+                assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, closeStart, closeEnd), close.range());
+            }
+        }
     }
 
     @Test
@@ -297,6 +349,38 @@ class GdScriptParserTest {
         assertTrue(classResult.ast().statements().stream().anyMatch(ClassDeclaration.class::isInstance));
         assertTrue(classResult.ast().statements().stream()
                 .anyMatch(s -> s instanceof VariableDeclaration v && v.name().equals("ok")));
+
+        for (var header : List.of("func f():", "class C:")) {
+            var suffix = header.startsWith("func") ? "func g(): pass" : "var ok = 1";
+            var source = header + "\r\n\t# 注😀\r\n" + suffix;
+            var result = parse(source);
+            GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+            assertThrows(IllegalStateException.class, () -> new GdScriptParserFacade().parseStrict(source));
+            var statements = result.ast().statements();
+            assertEquals(3, statements.size());
+            var owner = statements.getFirst();
+            var diagnostic = result.diagnostics().getFirst();
+            assertEquals(1, result.diagnostics().size());
+            assertEquals(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, diagnostic.code());
+            assertSame(owner, diagnostic.recovery().owner());
+            assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, header.length() + 1, header.length() + 2),
+                    diagnostic.range());
+            var trivia = assertInstanceOf(CommentStatement.class, statements.get(1));
+            assertEquals("# 注😀\r", trivia.text());
+            assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, source.indexOf('#'),
+                    source.lastIndexOf('\n')), trivia.range());
+            if (owner instanceof FunctionDeclaration function) {
+                assertEquals("suite.body", diagnostic.recovery().facet());
+                assertTrue(function.body().statements().isEmpty());
+                var sibling = assertInstanceOf(FunctionDeclaration.class, statements.getLast());
+                assertEquals("g", sibling.name());
+                assertInstanceOf(PassStatement.class, sibling.body().statements().getFirst());
+            } else {
+                assertTrue(assertInstanceOf(ClassDeclaration.class, owner).body().statements().isEmpty());
+                assertEquals("class.body", diagnostic.recovery().facet());
+                assertEquals("ok", assertInstanceOf(VariableDeclaration.class, statements.getLast()).name());
+            }
+        }
     }
 
     @Test
@@ -709,33 +793,71 @@ class GdScriptParserTest {
     }
 
     @Test
-    void staticInitIsAPlainFunctionDeclarationAndEnforcesSignatureRules() {
+    void staticInitAndSameNamedLambdaRetainTheirLegalRoles() {
         var ast = cleanAst("static func _static_init(): pass\n");
         var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(ast));
         assertEquals("_static_init", function.name());
         assertTrue(function.isStatic());
 
         var typedClean = cleanAst("static func _static_init() -> void:\n\treturn\n");
-        assertEquals("void", requireNotNull(assertInstanceOf(FunctionDeclaration.class, onlyStatement(typedClean))
-                .returnType()).sourceText());
+        var typed = assertInstanceOf(FunctionDeclaration.class, onlyStatement(typedClean));
+        assertEquals("void", requireNotNull(typed.returnType()).sourceText());
+        assertNull(assertInstanceOf(ReturnStatement.class, typed.body().statements().getFirst()).value());
 
         // Same-named lambda expression is unaffected by `_static_init` rules.
         var lambdaClean = cleanAst("var f = func _static_init(a): return a\n");
         var lambdaVar = assertInstanceOf(VariableDeclaration.class, onlyStatement(lambdaClean));
-        assertEquals("_static_init", assertInstanceOf(LambdaExpression.class, lambdaVar.value()).name());
+        var lambda = assertInstanceOf(LambdaExpression.class, lambdaVar.value());
+        assertEquals("_static_init", lambda.name());
+        assertEquals("a", lambda.parameters().getFirst().name());
+        assertEquals("a", assertInstanceOf(IdentifierExpression.class,
+                assertInstanceOf(ReturnStatement.class, lambda.body().statements().getFirst()).value()).name());
+    }
 
-        var nonStatic = parse("func _static_init(): pass\n");
-        var nonStaticFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(nonStatic.ast()));
-        assertEquals(List.of("Static constructor must be declared static."), errorMessages(nonStatic));
-        assertEquals(DiagnosticCodes.FUNCTION_INVALID_STATIC_INIT, nonStatic.diagnostics().getFirst().code());
-        assertEquals(new RecoveryLink(nonStaticFn, "function.signature"), nonStatic.diagnostics().getFirst().recovery());
+    @Test
+    void staticInitRejectsMissingStatic() {
+        var function = assertStaticInitSignatureError("func _static_init(): pass\n",
+                "Static constructor must be declared static.");
+        assertFalse(function.isStatic());
+        assertTrue(function.parameters().isEmpty());
+    }
 
-        var withParams = parse("static func _static_init(a, ...rest): pass\n");
-        var withParamsFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(withParams.ast()));
-        assertEquals(List.of("Static constructor cannot have parameters."), errorMessages(withParams));
-        assertEquals(DiagnosticCodes.FUNCTION_INVALID_STATIC_INIT, withParams.diagnostics().getFirst().code());
-        assertEquals(new RecoveryLink(withParamsFn, "function.signature"), withParams.diagnostics().getFirst().recovery());
+    @Test
+    void staticInitRejectsOrdinaryParameters() {
+        var function = assertStaticInitSignatureError("static func _static_init(a): pass\n",
+                "Static constructor cannot have parameters.");
+        assertEquals("a", function.parameters().getFirst().name());
+        assertFalse(function.parameters().getFirst().variadic());
+    }
 
+    @Test
+    void staticInitRejectsRestParameters() {
+        var function = assertStaticInitSignatureError("static func _static_init(...rest): pass\n",
+                "Static constructor cannot have parameters.");
+        assertEquals("rest", function.parameters().getFirst().name());
+        assertTrue(function.parameters().getFirst().variadic());
+        assertStaticInitSignatureError("static func _static_init(a, ...rest): pass\n",
+                "Static constructor cannot have parameters.");
+    }
+
+    private static FunctionDeclaration assertStaticInitSignatureError(String source, String message) {
+        var result = parse(source);
+        assertEquals(List.of(message), errorMessages(result));
+        var owner = assertInstanceOf(FunctionDeclaration.class, onlyStatement(result.ast()));
+        var diagnostic = result.diagnostics().getFirst();
+        var start = source.indexOf("_static_init");
+        assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, start, start + "_static_init".length()),
+                diagnostic.range());
+        assertEquals(DiagnosticCodes.FUNCTION_INVALID_STATIC_INIT, diagnostic.code());
+        assertSame(owner, diagnostic.recovery().owner());
+        assertEquals("function.signature", diagnostic.recovery().facet());
+        assertInstanceOf(PassStatement.class, owner.body().statements().getFirst());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
+        return owner;
+    }
+
+    @Test
+    void staticInitReportsBothIndependentSignatureErrors() {
         var bothInvalid = parse("func _static_init(a): pass\n");
         var bothFn = assertInstanceOf(FunctionDeclaration.class, onlyStatement(bothInvalid.ast()));
         assertEquals(2, bothInvalid.diagnostics().size(), () -> bothInvalid.diagnostics().toString());
@@ -1067,6 +1189,7 @@ class GdScriptParserTest {
                 new String[]{"const A = -0b10 ** 2\n", "-", "0b10"},
                 new String[]{"const A = -0.5 ** 2\n", "-", "0.5"}
         )) {
+            assertUnsignedNumericTokens(tightPower[0], List.of(tightPower[2], "2"));
             var ast = cleanAst(tightPower[0]);
             var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
             var power = assertInstanceOf(BinaryExpression.class, constant.value());
@@ -1083,6 +1206,8 @@ class GdScriptParserTest {
                 "const A = -n ** 2\n",
                 "const A = -.5 ** 2\n"
         )) {
+            assertUnsignedNumericTokens(spacedPower, spacedPower.contains("-n")
+                    ? List.of("2") : spacedPower.contains("-.5") ? List.of(".5", "2") : List.of("2", "2"));
             var ast = cleanAst(spacedPower);
             var constant = assertInstanceOf(VariableDeclaration.class, onlyStatement(ast));
             var unary = assertInstanceOf(UnaryExpression.class, constant.value());
@@ -1115,6 +1240,7 @@ class GdScriptParserTest {
 
         // Left-associative `**` with tight vs spaced right operand.
         var leftAssoc = cleanAst("const A = -2 ** 2 ** 3\n");
+        assertUnsignedNumericTokens("const A = -2 ** 2 ** 3\n", List.of("2", "2", "3"));
         var leftAssocOuter = assertInstanceOf(BinaryExpression.class,
                 assertInstanceOf(VariableDeclaration.class, onlyStatement(leftAssoc)).value());
         assertEquals("**", leftAssocOuter.operator());
@@ -1151,12 +1277,14 @@ class GdScriptParserTest {
 
         // Type test `-2 is int` vs `- 2 is int`.
         var tightIs = cleanAst("const A = -2 is int\n");
+        assertUnsignedNumericTokens("const A = -2 is int\n", List.of("2"));
         var tightIsExpr = assertInstanceOf(TypeTestExpression.class,
                 assertInstanceOf(VariableDeclaration.class, onlyStatement(tightIs)).value());
         assertInstanceOf(UnaryExpression.class, tightIsExpr.value());
         assertEquals("int", tightIsExpr.targetType().sourceText());
 
         var spacedIs = cleanAst("const A = - 2 is int\n");
+        assertUnsignedNumericTokens("const A = - 2 is int\n", List.of("2"));
         var spacedIsUnary = assertInstanceOf(UnaryExpression.class,
                 assertInstanceOf(VariableDeclaration.class, onlyStatement(spacedIs)).value());
         assertInstanceOf(TypeTestExpression.class, spacedIsUnary.operand());
@@ -1170,6 +1298,8 @@ class GdScriptParserTest {
                 "var a = (x)-2\n",
                 "var a = (\n\t1\n\t-2\n)\n"
         )) {
+            assertUnsignedNumericTokens(binaryCase, binaryCase.contains("1") ? List.of("1", "2")
+                    : binaryCase.contains("[0]") ? List.of("0", "2") : List.of("2"));
             var binAst = cleanAst(binaryCase);
             var binExpr = assertInstanceOf(BinaryExpression.class,
                     assertInstanceOf(VariableDeclaration.class, onlyStatement(binAst)).value());
@@ -1202,6 +1332,14 @@ class GdScriptParserTest {
         var minLiteral = assertInstanceOf(LiteralExpression.class, minUnary.operand());
         assertEquals("integer", minLiteral.kind());
         assertEquals("9223372036854775808", minLiteral.sourceText());
+    }
+
+    private static void assertUnsignedNumericTokens(String source, List<String> numbers) {
+        for (var tokens : List.of(new GdScriptParserFacade().tokenize(source), GdTokenizerTest.tokenizeManaged(source))) {
+            assertTrue(tokens.stream().noneMatch(GdToken::isError), source);
+            assertEquals(numbers, tokens.stream().filter(token -> token.type() == GdTokenType.LITERAL)
+                    .map(GdToken::source).toList(), source);
+        }
     }
 
     @Test
@@ -1659,7 +1797,7 @@ class GdScriptParserTest {
     }
 
     @Test
-    void damagedSuperInsideLambdaArgumentStopsFold() {
+    void damagedSuperInsideLambdaArgumentContinuesFoldingWithoutStealingOuterComma() {
         // `f(func(): super. + 1)`: the damaged `super.` continues folding `+ 1` inside the
         // lambda body while preserving the closing `)` and the outer call statement.
         var result = parse("func f():\n\tf(func(): super. + 1)\n");
@@ -2453,9 +2591,8 @@ class GdScriptParserTest {
     }
 
     @Test
-    void circuitBreakerCountsAnnotatedFailuresLikeGodot() {
-        // Legal leading annotations return ConsumedPrefix and never consume the failure budget:
-        // 120 valid `@warning_ignore(...)` prefixes before a target statement parse cleanly.
+    void circuitBreakerIgnoresLegalAnnotationPrefixesButCountsRealFailures() {
+        // Legal leading annotations never consume the failure budget.
         var validMany = "func f():\n" + "\t@warning_ignore(\"unused_variable\")\n".repeat(120) + "\tvar ok = 1\n";
         var clean = cleanAst(validMany);
         var cleanFn = assertInstanceOf(FunctionDeclaration.class, clean.statements().getFirst());
@@ -2599,6 +2736,28 @@ class GdScriptParserTest {
         assertEquals(": =", requireNotNull(c.type()).sourceText());
         var f = assertInstanceOf(FunctionDeclaration.class, constAndParam.statements().get(1));
         assertEquals(": =", requireNotNull(f.parameters().getFirst().type()).sourceText());
+
+        for (var separator : List.of(":=", ": =", ":\t=")) {
+            var source = "var 数 " + separator + " 1\r\nconst C " + separator
+                    + " 2\r\nfunc f(p " + separator + " 4): pass";
+            var result = parse(source);
+            assertTrue(result.diagnostics().isEmpty());
+            var statements = result.ast().statements();
+            var variable = assertInstanceOf(VariableDeclaration.class, statements.getFirst());
+            var constant = assertInstanceOf(VariableDeclaration.class, statements.get(1));
+            var function = assertInstanceOf(FunctionDeclaration.class, statements.getLast());
+            var parameter = function.parameters().getFirst();
+            var cursor = 0;
+            for (var type : List.of(variable.type(), constant.type(), parameter.type())) {
+                var start = source.indexOf(separator, cursor);
+                cursor = start + separator.length();
+                assertEquals(separator, type.sourceText());
+                assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, start, cursor), type.range());
+            }
+            assertEquals("1", assertInstanceOf(LiteralExpression.class, variable.value()).sourceText());
+            assertEquals("2", assertInstanceOf(LiteralExpression.class, constant.value()).sourceText());
+            assertEquals("4", assertInstanceOf(LiteralExpression.class, parameter.defaultValue()).sourceText());
+        }
     }
 
     @Test
@@ -2773,10 +2932,25 @@ class GdScriptParserTest {
         assertNotNull(assertInstanceOf(ReturnStatement.class,
                 constructor.body().statements().getFirst()).value());
 
-        var staticResult = parse("static func _static_init():\n\treturn 1\n");
-        assertTrue(errorMessages(staticResult).contains("Constructor cannot return a value."));
         // A plain function named like a constructor keeps returning values legally.
         cleanAst("func _initish():\n\treturn 1\n");
+    }
+
+    @Test
+    void staticInitRejectsValuedReturnButKeepsTheValueNode() {
+        var source = "static func _static_init():\r\n\treturn 1";
+        var result = parse(source);
+        assertEquals(List.of("Constructor cannot return a value."), errorMessages(result));
+        var function = assertInstanceOf(FunctionDeclaration.class, onlyStatement(result.ast()));
+        var owner = assertInstanceOf(ReturnStatement.class, function.body().statements().getFirst());
+        assertEquals("1", assertInstanceOf(LiteralExpression.class, owner.value()).sourceText());
+        var diagnostic = result.diagnostics().getFirst();
+        var start = source.indexOf("return");
+        assertEquals(GdScriptParserErrorRecoveryTest.utf8Range(source, start, start + 6), diagnostic.range());
+        assertEquals(DiagnosticCodes.SYNTAX_UNEXPECTED_TOKEN, diagnostic.code());
+        assertSame(owner, diagnostic.recovery().owner());
+        assertEquals("statement.control", diagnostic.recovery().facet());
+        GdScriptParserRangeInvariantTest.assertDiagnosticInvariants(source, result, () -> source);
     }
 
     @Test

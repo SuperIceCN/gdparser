@@ -288,6 +288,7 @@ public final class GdScriptParser {
     private int circuitBreakerOracleResolutions;
     private int forIteratorTypeSyncSteps;
     private long annotationWorkSteps;
+    private long separatedListSteps;
 
     public GdScriptParser() {
     }
@@ -357,6 +358,7 @@ public final class GdScriptParser {
         poisonedBracketScanSteps = 0;
         poisonedBracketStackOps = 0;
         poisonedBracketOpenerLookups = 0;
+        separatedListSteps = 0;
         nestingDepth = 0;
         nestingBudgetExceeded = false;
         poisonedLineIndent = 0;
@@ -1304,6 +1306,11 @@ public final class GdScriptParser {
     /// Counts pending annotation entry work and buffer transfers in the current parse.
     long annotationWorkSteps() {
         return annotationWorkSteps;
+    }
+
+    /// Counts dictionary item attempts, separated-list decisions, and discarded list-tail tokens.
+    long separatedListSteps() {
+        return separatedListSteps;
     }
 
     private @Nullable StructuralFrame enclosingLambdaDelimiterFrame() {
@@ -9524,6 +9531,7 @@ public final class GdScriptParser {
         var hasChildDamage = false;
         if (!check(GdTokenType.BRACE_CLOSE) || hasCurrentSlotLexicalErrors()) {
             do {
+                separatedListSteps++;
                 if (!canContinueBracketedList(dictionaryFrame)
                         || (check(GdTokenType.BRACE_CLOSE) && !hasCurrentSlotLexicalErrors())) {
                     // Allow for trailing comma at closer.
@@ -10471,6 +10479,7 @@ public final class GdScriptParser {
             boolean itemEmittedDiagnostic,
             @NotNull BooleanSupplier isTrustedNextItemStarter
     ) {
+        separatedListSteps++;
         if (!canContinueBracketedList(frame) || isAtEnd()) {
             return false;
         }
@@ -10533,6 +10542,7 @@ public final class GdScriptParser {
         var localBrackets = 0;
         var localBraces = 0;
         while (!isAtEnd() && canContinueBracketedList(frame)) {
+            separatedListSteps++;
             if (current.type() == GdTokenType.DEDENT
                     || current.type() == GdTokenType.NEWLINE
                     || isAtUnclosedMultilineStop()

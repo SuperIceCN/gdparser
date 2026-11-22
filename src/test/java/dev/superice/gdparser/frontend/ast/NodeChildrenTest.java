@@ -11,6 +11,8 @@ import java.util.Comparator;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -86,6 +88,23 @@ class NodeChildrenTest {
         assertThrows(NullPointerException.class, () -> new RecoveredInfixExpression(key, null, problem, RANGE));
         assertThrows(NullPointerException.class, () -> new RecoveredInfixExpression(key, "as", null, RANGE));
         assertThrows(NullPointerException.class, () -> new RecoveredInfixExpression(key, "as", problem, null));
+    }
+
+    @Test
+    void parsedDictionaryPatternEntriesOmitValuesButLiteralEntriesKeepThem() {
+        var root = DictionaryPatternFixture.parse();
+        var patterns = DictionaryPatternFixture.patternEntries(root);
+        var literals = DictionaryPatternFixture.literalEntries(root);
+        DictionaryPatternFixture.assertKeys(patterns);
+        DictionaryPatternFixture.assertKeys(literals);
+        for (var entry : patterns) {
+            assertNull(entry.value());
+            assertEquals(List.of(entry.key()), entry.getChildren());
+        }
+        for (var entry : literals) {
+            assertNotNull(entry.value());
+            assertEquals(List.of(entry.key(), entry.value()), entry.getChildren());
+        }
     }
 
     private static List<Class<? extends Node>> concreteNodeTypes() {
