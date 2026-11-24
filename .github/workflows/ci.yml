@@ -18,7 +18,7 @@ jobs:
       matrix:
         os:
           - windows-latest
-          - ubuntu-latest
+          - ubuntu-24.04
           - ubuntu-24.04-arm
           - macos-latest
 
@@ -46,19 +46,34 @@ jobs:
       - name: Compile classes (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\gradlew.bat classes --no-daemon --info --console=plain
+        run: .\gradlew.bat :classes --no-daemon --info --console=plain
 
       - name: Compile classes (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
-        run: ./gradlew classes --no-daemon --info --console=plain
+        run: ./gradlew :classes --no-daemon --info --console=plain
 
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\gradlew.bat test --no-daemon --info --console=plain
+        run: .\gradlew.bat :test --no-daemon --info --console=plain
 
       - name: Run tests (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
-        run: ./gradlew test --no-daemon --info --console=plain
+        run: ./gradlew :test --no-daemon --info --console=plain
+
+      - name: Set up Node.js 24 for explorer-web
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Build and test explorer-web
+        if: matrix.os == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          node --test explorer-web/src/test/web/controller.test.mjs explorer-web/src/test/web/worker.test.mjs
+          ./gradlew :explorer-web:installExplorerChromium --args="install --with-deps chromium" \
+            :explorer-web:assemble :explorer-web:test :explorer-web:browserTest \
+            --no-daemon --info --console=plain

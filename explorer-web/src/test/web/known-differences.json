@@ -1,0 +1,166 @@
+{
+  "control-identifier-start": {
+    "source": "var \u0001x = 1\n",
+    "jvm": {
+      "treeText": "SourceFile [0,11) (0:0..1:0)\n  VariableDeclaration name=x [0,10) (0:0..0:10)\n    LiteralExpression kind=integer raw=1 [9,10) (0:9..0:10)",
+      "diagnostics": [
+        {
+          "severity": "ERROR",
+          "code": "parse.lexical.error",
+          "message": "Invalid character \"\u0001\" (U+0001).",
+          "startByte": 4,
+          "endByte": 5,
+          "startRow": 0,
+          "startColumn": 4,
+          "endRow": 0,
+          "endColumn": 5
+        }
+      ],
+      "omittedDiagnostics": 0,
+      "treeTruncated": false
+    },
+    "browser": {
+      "treeText": "SourceFile [0,11) (0:0..1:0)\n  VariableDeclaration name=\\u0001x [0,10) (0:0..0:10)\n    LiteralExpression kind=integer raw=1 [9,10) (0:9..0:10)",
+      "diagnostics": [],
+      "omittedDiagnostics": 0,
+      "treeTruncated": false
+    }
+  },
+  "script-p-identifier-start": {
+    "source": "var ℘x = 1\n",
+    "jvm": {
+      "treeText": "SourceFile [0,13) (0:0..1:0)\n  VariableDeclaration name=℘x [0,12) (0:0..0:12)\n    LiteralExpression kind=integer raw=1 [11,12) (0:11..0:12)",
+      "diagnostics": [],
+      "omittedDiagnostics": 0,
+      "treeTruncated": false
+    },
+    "browser": {
+      "treeText": "SourceFile [0,13) (0:0..1:0)\n  VariableDeclaration name=x [0,12) (0:0..0:12)\n    LiteralExpression kind=integer raw=1 [11,12) (0:11..0:12)",
+      "diagnostics": [
+        {
+          "severity": "ERROR",
+          "code": "parse.lexical.error",
+          "message": "Invalid character \"℘\" (U+2118).",
+          "startByte": 4,
+          "endByte": 7,
+          "startRow": 0,
+          "startColumn": 4,
+          "endRow": 0,
+          "endColumn": 7
+        }
+      ],
+      "omittedDiagnostics": 0,
+      "treeTruncated": false
+    }
+  },
+  "script-p-identifier-part": {
+    "source": "var x℘y = 1\n",
+    "jvm": {
+      "treeText": "SourceFile [0,14) (0:0..1:0)\n  VariableDeclaration name=x℘y [0,13) (0:0..0:13)\n    LiteralExpression kind=integer raw=1 [12,13) (0:12..0:13)",
+      "diagnostics": [],
+      "omittedDiagnostics": 0,
+      "treeTruncated": false
+    },
+    "browser": {
+      "treeText": "SourceFile [0,14) (0:0..1:0)\n  VariableDeclaration name=x [0,5) (0:0..0:5)",
+      "diagnostics": [
+        {
+          "severity": "ERROR",
+          "code": "parse.lexical.error",
+          "message": "Invalid character \"℘\" (U+2118).",
+          "startByte": 5,
+          "endByte": 8,
+          "startRow": 0,
+          "startColumn": 5,
+          "endRow": 0,
+          "endColumn": 8
+        },
+        {
+          "severity": "ERROR",
+          "code": "parse.statement.trailing",
+          "message": "Expected end of statement after variable declaration, found \"Identifier\" instead.",
+          "startByte": 8,
+          "endByte": 13,
+          "startRow": 0,
+          "startColumn": 8,
+          "endRow": 0,
+          "endColumn": 13
+        }
+      ],
+      "omittedDiagnostics": 0,
+      "treeTruncated": false
+    }
+  },
+  "bracket-recovery": {
+    "source": "var x = [1,\n\u0001func after(): pass\n",
+    "jvm": {
+      "treeText": "SourceFile [0,32) (0:0..2:0)\n  VariableDeclaration name=x [0,11) (0:0..0:11)\n    ArrayExpression [8,11) (0:8..0:11)\n      LiteralExpression kind=integer raw=1 [9,10) (0:9..0:10)\n  FunctionDeclaration name=after [13,31) (1:1..1:19)\n    FunctionBody [27,31) (1:15..1:19)\n      PassStatement [27,31) (1:15..1:19)",
+      "diagnostics": [
+        {
+          "severity": "ERROR",
+          "code": "parse.lexical.error",
+          "message": "Invalid character \"\u0001\" (U+0001).",
+          "startByte": 12,
+          "endByte": 13,
+          "startRow": 1,
+          "startColumn": 0,
+          "endRow": 1,
+          "endColumn": 1
+        },
+        {
+          "severity": "ERROR",
+          "code": "parse.missing_closer.array",
+          "message": "Expected closing \"]\" after array elements.",
+          "startByte": 11,
+          "endByte": 11,
+          "startRow": 0,
+          "startColumn": 11,
+          "endRow": 0,
+          "endColumn": 11
+        }
+      ],
+      "omittedDiagnostics": 0,
+      "treeTruncated": false
+    },
+    "browser": {
+      "treeText": "SourceFile [0,32) (0:0..2:0)\n  VariableDeclaration name=x [0,31) (0:0..1:19)\n    ArrayExpression [8,31) (0:8..1:19)\n      LiteralExpression kind=integer raw=1 [9,10) (0:9..0:10)\n      IdentifierExpression name=\\u0001func [12,17) (1:0..1:5)\n      CallExpression [18,25) (1:6..1:13)\n        IdentifierExpression name=after [18,23) (1:6..1:11)",
+      "diagnostics": [
+        {
+          "severity": "ERROR",
+          "code": "parse.missing_separator.comma",
+          "message": "Expected \",\" between array elements.",
+          "startByte": 17,
+          "endByte": 17,
+          "startRow": 1,
+          "startColumn": 5,
+          "endRow": 1,
+          "endColumn": 5
+        },
+        {
+          "severity": "ERROR",
+          "code": "parse.syntax.unexpected_token",
+          "message": "Unexpected \":\" in array elements.",
+          "startByte": 25,
+          "endByte": 26,
+          "startRow": 1,
+          "startColumn": 13,
+          "endRow": 1,
+          "endColumn": 14
+        },
+        {
+          "severity": "ERROR",
+          "code": "parse.missing_closer.array",
+          "message": "Expected closing \"]\" after array elements.",
+          "startByte": 31,
+          "endByte": 31,
+          "startRow": 1,
+          "startColumn": 19,
+          "endRow": 1,
+          "endColumn": 19
+        }
+      ],
+      "omittedDiagnostics": 0,
+      "treeTruncated": false
+    }
+  }
+}

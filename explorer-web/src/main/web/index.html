@@ -3,37 +3,32 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>GDScript Explorer Scaffold</title>
+    <title>GDScript Explorer</title>
+    <link rel="stylesheet" href="./style.css">
+    <script type="module" src="./app.js"></script>
 </head>
 <body>
-    <h1>GDScript Explorer Scaffold</h1>
-    <p id="probe-status" role="status">Loading TeaVM probe…</p>
-    <script>
-        const statusOutput = document.getElementById("probe-status");
-
-        try {
-            const worker = new Worker("./worker.js", { type: "module" });
-            let settled = false;
-            const timeout = setTimeout(() => finish("Error: TeaVM probe timed out."), 10000);
-
-            function finish(message) {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                clearTimeout(timeout);
-                worker.terminate();
-                statusOutput.textContent = message;
-            }
-
-            worker.onmessage = ({ data }) => finish(
-                typeof data === "string" ? `Ready: ${data}` : "Error: invalid TeaVM probe result."
-            );
-            worker.onerror = () => finish("Error: Worker could not load or run the TeaVM probe.");
-            worker.onmessageerror = () => finish("Error: Could not read the TeaVM probe result.");
-        } catch {
-            statusOutput.textContent = "Error: Could not start the Worker.";
-        }
-    </script>
+<header>
+    <h1>GDScript Explorer</h1>
+    <p>Parse GDScript in your browser without uploading or running it.</p>
+</header>
+<main>
+    <section class="editor">
+        <h2><label for="source">GDScript source</label></h2>
+        <textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"></textarea>
+    </section>
+    <section aria-label="Parse results">
+        <p id="parse-status" role="status">Starting the local parser…</p>
+        <h2>Diagnostics</h2>
+        <p id="diagnostics-empty" hidden>No diagnostics.</p>
+        <p id="range-key" hidden>Ranges are half-open UTF-8 byte offsets. Rows and byte columns start at zero.</p>
+        <ul id="diagnostics" hidden></ul>
+        <p id="diagnostics-omitted" class="notice" hidden></p>
+        <h2 id="tree-heading">AST</h2>
+        <p id="tree-truncated" class="notice" hidden>The AST display was truncated.</p>
+        <pre id="tree" role="region" aria-labelledby="tree-heading" tabindex="0"></pre>
+    </section>
+</main>
+<noscript>JavaScript is required to parse GDScript in this browser.</noscript>
 </body>
 </html>
