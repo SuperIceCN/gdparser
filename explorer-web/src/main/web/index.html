@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GDScript Explorer Scaffold</title>
+</head>
+<body>
+    <h1>GDScript Explorer Scaffold</h1>
+    <p id="probe-status" role="status">Loading TeaVM probe…</p>
+    <script>
+        const statusOutput = document.getElementById("probe-status");
+
+        try {
+            const worker = new Worker("./worker.js", { type: "module" });
+            let settled = false;
+            const timeout = setTimeout(() => finish("Error: TeaVM probe timed out."), 10000);
+
+            function finish(message) {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(timeout);
+                worker.terminate();
+                statusOutput.textContent = message;
+            }
+
+            worker.onmessage = ({ data }) => finish(
+                typeof data === "string" ? `Ready: ${data}` : "Error: invalid TeaVM probe result."
+            );
+            worker.onerror = () => finish("Error: Worker could not load or run the TeaVM probe.");
+            worker.onmessageerror = () => finish("Error: Could not read the TeaVM probe result.");
+        } catch {
+            statusOutput.textContent = "Error: Could not start the Worker.";
+        }
+    </script>
+</body>
+</html>

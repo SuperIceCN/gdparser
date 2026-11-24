@@ -392,7 +392,7 @@ class GdTokenizerTest {
 
         var keepsOuterMultiline = tokenize("((]\n1)");
         assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.PARENTHESIS_OPEN, GdTokenType.ERROR,
-                GdTokenType.LITERAL, GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
+                        GdTokenType.LITERAL, GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
                 typesOf(keepsOuterMultiline));
         assertEquals("Closing \"]\" doesn't match the opening \"(\".", keepsOuterMultiline.get(2).errorMessage());
 
@@ -406,7 +406,7 @@ class GdTokenizerTest {
         // Multi-opener ancestor mismatch `([{)`: `)` names every skipped opener in opening order.
         var multiSkipped = tokenize("([{)");
         assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN,
-                GdTokenType.BRACE_OPEN, GdTokenType.ERROR, GdTokenType.NEWLINE, GdTokenType.EOF),
+                        GdTokenType.BRACE_OPEN, GdTokenType.ERROR, GdTokenType.NEWLINE, GdTokenType.EOF),
                 typesOf(multiSkipped));
         assertEquals("Closing \")\" skips unclosed \"[\", \"{\".", multiSkipped.get(3).errorMessage());
 
@@ -433,13 +433,13 @@ class GdTokenizerTest {
 
         var ancestor = tokenizeManaged("([)]");
         assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN,
-                GdTokenType.PARENTHESIS_CLOSE, GdTokenType.BRACKET_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
+                        GdTokenType.PARENTHESIS_CLOSE, GdTokenType.BRACKET_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
                 typesOf(ancestor));
         assertTrue(errorsOf(ancestor).isEmpty());
 
         var deep = tokenizeManaged("([}])");
         assertEquals(List.of(GdTokenType.PARENTHESIS_OPEN, GdTokenType.BRACKET_OPEN, GdTokenType.BRACE_CLOSE,
-                GdTokenType.BRACKET_CLOSE, GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
+                        GdTokenType.BRACKET_CLOSE, GdTokenType.PARENTHESIS_CLOSE, GdTokenType.NEWLINE, GdTokenType.EOF),
                 typesOf(deep));
         assertTrue(errorsOf(deep).isEmpty());
 
@@ -1504,7 +1504,7 @@ class GdTokenizerTest {
                     .sorted(Comparator.comparing(path -> path.getFileName().toString()))
                     .toList();
         }
-        assertEquals(13, scripts.size(), "fixture corpus size changed; review parity prerequisites");
+        assertEquals(13, scripts.size(), "fixture corpus size changed");
 
         var tests = new ArrayList<DynamicTest>();
         for (var script : scripts) {

@@ -27,8 +27,7 @@ public final class GdScriptParserFacade {
         return new GdScriptParser().parse(source);
     }
 
-    /// Strict parse: throws on the first ERROR diagnostic (mirroring
-    /// `CstToAstMapper.mapStrict`); warnings alone do not fail.
+    /// Strict parse: throws on the first `ERROR` diagnostic; warnings alone do not fail.
     ///
     /// @throws IllegalStateException with message `Parsing failed at <nodeType>: <message>`
     public @NotNull SourceFile parseStrict(@NotNull String source) {

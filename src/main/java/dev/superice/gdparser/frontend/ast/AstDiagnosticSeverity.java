@@ -1,6 +1,6 @@
 package dev.superice.gdparser.frontend.ast;
 
-/// Diagnostic severity emitted during CST to AST lowering.
+/// Severity of a parser diagnostic.
 public enum AstDiagnosticSeverity {
     WARNING,
     ERROR

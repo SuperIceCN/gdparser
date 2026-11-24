@@ -43,9 +43,6 @@ import dev.superice.gdparser.frontend.ast.UnknownExpression;
 import dev.superice.gdparser.frontend.ast.VariableDeclaration;
 import dev.superice.gdparser.frontend.cst.CstIssueKind;
 import dev.superice.gdparser.frontend.gdscript.GdScriptParser;
-import dev.superice.gdparser.frontend.lowering.CstToAstMapper;
-import dev.superice.gdparser.infra.treesitter.GdParserFacade;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
@@ -68,25 +65,15 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 
-@SuppressWarnings("deprecation") // The legacy backend remains a regression reference.
 class AstSexprSerdeTest {
 
     private static final Path FIXTURE_DIR = Path.of("src", "test", "resources", "gdscript");
 
-    private static GdParserFacade parserFacade;
-    private static CstToAstMapper mapper;
-
     private final AstSexprSerializer serializer = new AstSexprSerializer();
     private final AstSexprDeserializer deserializer = new AstSexprDeserializer();
 
-    @BeforeAll
-    static void setUp() {
-        parserFacade = GdParserFacade.withDefaultLanguage();
-        mapper = new CstToAstMapper();
-    }
-
     @Test
-    void shouldRoundTripMappedAstAndKeepCanonicalTextStable() {
+    void shouldRoundTripParsedAstAndKeepCanonicalTextStable() {
         var source = """
                 class_name Player
                 extends Node
@@ -105,17 +92,15 @@ class AstSexprSerdeTest {
                     pass
                 """;
 
-        var cstRoot = parserFacade.parseCstRoot(source);
-        var mappingResult = mapper.map(source, cstRoot);
+        var result = new GdScriptParser().parse(source);
 
         assertFalse(
-                mappingResult.diagnostics().stream().anyMatch(diagnostic -> diagnostic.severity() == AstDiagnosticSeverity.ERROR),
-                () -> "Unexpected lowering errors: " + mappingResult.diagnostics()
+                result.diagnostics().stream().anyMatch(diagnostic -> diagnostic.severity() == AstDiagnosticSeverity.ERROR),
+                () -> "Unexpected parser errors: " + result.diagnostics()
         );
 
-        var ast = mappingResult.ast();
+        var ast = result.ast();
         var text = serializer.serialize(ast);
-        IO.println(serializer.serializePretty(ast, AstSexprSerializer.PrettyMode.OMIT_RANGE));
         var restored = deserializer.deserialize(text);
 
         assertEquals(ast, restored);
@@ -410,16 +395,15 @@ class AstSexprSerdeTest {
         for (var script : scripts) {
             tests.add(dynamicTest("fixture-ast-serde-roundtrip: " + script.getFileName(), () -> {
                 var source = Files.readString(script, StandardCharsets.UTF_8);
-                var cstRoot = parserFacade.parseCstRoot(source);
-                var mappingResult = mapper.map(source, cstRoot);
+                var result = new GdScriptParser().parse(source);
 
                 assertFalse(
-                        mappingResult.diagnostics().stream()
+                        result.diagnostics().stream()
                                 .anyMatch(diagnostic -> diagnostic.severity() == AstDiagnosticSeverity.ERROR),
-                        () -> "Unexpected lowering errors in " + script.getFileName() + ": " + mappingResult.diagnostics()
+                        () -> "Unexpected parser errors in " + script.getFileName() + ": " + result.diagnostics()
                 );
 
-                var ast = mappingResult.ast();
+                var ast = result.ast();
                 var text = serializer.serialize(ast);
                 var prettyText = serializer.serializePretty(ast);
                 var restored = deserializer.deserialize(text);
