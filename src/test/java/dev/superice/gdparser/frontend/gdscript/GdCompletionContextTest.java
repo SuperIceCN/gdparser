@@ -597,10 +597,10 @@ class GdCompletionContextTest {
                 "a % b / %Child", "a / await %Child", "a % await %Child")) {
             var expectedReceiver = expression.equals("a % (b)") ? "(b)"
                     : expression.equals("value%-name") ? "name"
-                    : expression.equals("a % b") ? "b"
-                    : (expression.equals("a % b / %Child") || expression.equals("a / await %Child")
-                            || expression.equals("a % await %Child")) ? "%Child"
-                    : expression;
+                      : expression.equals("a % b") ? "b"
+                        : (expression.equals("a % b / %Child") || expression.equals("a / await %Child")
+                    || expression.equals("a % await %Child")) ? "%Child"
+                          : expression;
             var source = "func f():\n    " + expression + ".method(1+) + 2";
             var cursor = source.indexOf(".method") + ".method".length();
             var context = CompletionContextAnalyzer.analyze(source, emptyAst, cursor);
@@ -1470,39 +1470,6 @@ class GdCompletionContextTest {
             assertEquals(kind, context.kind());
             assertThrows(IllegalArgumentException.class,
                     () -> new CompletionContext(kind, zero, kind == MEMBER_ACCESS ? null : zero));
-        }
-    }
-
-    @Test
-    @SuppressWarnings("deprecation")
-    void exampleLegacyProjectionLeavesNewKindsWithoutCandidates() {
-        var legacyKinds = List.of(dev.superice.gdparser.infra.treesitter.CompletionContext.Kind.values());
-        assertEquals(Set.of("MEMBER_ACCESS", "IDENTIFIER", "TYPE_POSITION", "CALL_ARGUMENT", "UNKNOWN"),
-                Set.copyOf(legacyKinds.stream().map(Enum::name).toList()));
-        record Projection(Case completion, String expectedLegacyKind, boolean exampleHasCandidateProvider) {
-        }
-        for (var testCase : List.of(
-                new Projection(member("对象.属|性", "属性", "对象"), "MEMBER_ACCESS", true),
-                new Projection(plain("数|值", IDENTIFIER, "数值"), "IDENTIFIER", true),
-                new Projection(plain("var x: 数|值", TYPE_POSITION, "数值"), "TYPE_POSITION", true),
-                new Projection(plain("foo(|)", CALL_ARGUMENT, ""), "CALL_ARGUMENT", false),
-                new Projection(plain("|", UNKNOWN, ""), "UNKNOWN", false),
-                new Projection(plain("func f(|): pass", PARAMETER_NAME, ""), "UNKNOWN", false),
-                new Projection(plain("func f():|", SUITE_START, ""), "UNKNOWN", false),
-                new Projection(plain("x not |", EXPECTED_KEYWORD, ""), "UNKNOWN", false))) {
-            var completion = testCase.completion();
-            var context = assertCase(completion, true);
-            // This local projection illustrates one adapter rule without running downstream code.
-            var legacy = legacyKinds.stream().filter(kind -> kind.name().equals(context.kind().name()))
-                    .findFirst().orElse(dev.superice.gdparser.infra.treesitter.CompletionContext.Kind.UNKNOWN);
-            var projected = new dev.superice.gdparser.infra.treesitter.CompletionContext(
-                    legacy, context.replaceableRange(), context.receiverRange());
-            var routed = switch (legacy) {
-                case MEMBER_ACCESS, IDENTIFIER, TYPE_POSITION -> true;
-                case CALL_ARGUMENT, UNKNOWN -> false;
-            };
-            assertEquals(testCase.expectedLegacyKind(), projected.kind().name(), completion.markedSource());
-            assertEquals(testCase.exampleHasCandidateProvider(), routed, completion.markedSource());
         }
     }
 

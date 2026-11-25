@@ -20,8 +20,7 @@ class SourceTextIndexTest {
         assertEquals(3, index.lineCount());
         assertEquals(0, index.lineStartByte(0));
         assertEquals(3, index.lineStartByte(1));
-        // A trailing newline introduces the (empty) last row's start at EOF, matching
-        // tree-sitter's end-point convention for newline-terminated files.
+        // A trailing newline introduces an empty last row that starts at EOF.
         assertEquals(6, index.lineStartByte(2));
 
         // The '\n' byte belongs to the row it terminates.
@@ -153,8 +152,7 @@ class SourceTextIndexTest {
 
     @Test
     void unpairedSurrogatesMatchJdkUtf8ReplacementEncoding() {
-        // The tree-sitter path parses `source.getBytes(UTF_8)`, where an unpaired
-        // surrogate is replaced with a single '?' byte; the index must follow.
+        // JDK UTF-8 encoding replaces an unpaired surrogate with a single '?' byte.
         var source = "a\uD800b\n";
         assertEquals(4, source.getBytes(StandardCharsets.UTF_8).length, "sanity: JDK replacement encoding");
 

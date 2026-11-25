@@ -59,7 +59,7 @@ class GdScriptParserFacadeTest {
         // not the later `static` misuse — pins ordering, not just presence.
         var exception = assertThrows(IllegalStateException.class,
                 () -> facade.parseStrict("var a = \nstatic const B = 1\n"));
-        // Mirrors CstToAstMapper.mapStrict: first ERROR diagnostic, "<phase> failed at <nodeType>: <message>".
+        // Format: "<phase> failed at <nodeType>: <message>".
         assertEquals("Parsing failed at ERROR: Expected expression for variable initial value after \"=\".",
                 exception.getMessage());
     }

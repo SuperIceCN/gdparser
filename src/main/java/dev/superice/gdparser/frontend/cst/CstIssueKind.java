@@ -1,6 +1,6 @@
 package dev.superice.gdparser.frontend.cst;
 
-/// Structural problem categories detected in CST traversal.
+/// Structural issue kinds used in AST recovery placeholders.
 public enum CstIssueKind {
     ERROR,
     MISSING

@@ -1,0 +1,89 @@
+:root {
+    color-scheme: light dark;
+    font: 1rem/1.5 system-ui, sans-serif;
+}
+
+body {
+    margin: 0 auto;
+    max-inline-size: 96rem;
+    padding: 1rem;
+}
+
+h1, h2, p {
+    margin-block: 0 0.5rem;
+}
+
+h2 {
+    font-size: 1.125rem;
+}
+
+main {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1.5rem;
+    margin-block-start: 1.5rem;
+}
+
+.editor {
+    display: flex;
+    flex-direction: column;
+}
+
+textarea, pre {
+    box-sizing: border-box;
+    border: 1px solid GrayText;
+    border-radius: 0.25rem;
+    margin: 0;
+    padding: 0.75rem;
+    font: 0.9rem/1.5 ui-monospace, monospace;
+    overflow: auto;
+    white-space: pre;
+    tab-size: 4;
+}
+
+textarea {
+    inline-size: 100%;
+    min-block-size: 22rem;
+    flex: 1;
+    resize: vertical;
+}
+
+pre {
+    min-block-size: 8rem;
+    max-block-size: 28rem;
+}
+
+#parse-status, .notice {
+    font-weight: 600;
+}
+
+#diagnostics {
+    margin-block: 0 0.75rem;
+    padding-inline-start: 1.5rem;
+    max-block-size: 16rem;
+    overflow: auto;
+    overflow-wrap: anywhere;
+}
+
+#diagnostics li + li {
+    margin-block-start: 0.5rem;
+}
+
+.diagnostic-message {
+    white-space: pre-wrap;
+}
+
+.diagnostic-range {
+    display: block;
+    font-size: 0.875rem;
+}
+
+@media (max-width: 48rem) {
+    main {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    textarea {
+        min-block-size: 14rem;
+    }
+}

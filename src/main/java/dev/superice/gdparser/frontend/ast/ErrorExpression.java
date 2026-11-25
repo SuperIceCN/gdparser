@@ -2,8 +2,8 @@ package dev.superice.gdparser.frontend.ast;
 
 import dev.superice.gdparser.frontend.cst.CstIssueKind;
 
-/// Expression placeholder for a CST `ERROR`/`MISSING` node that could not be lowered faithfully.
-/// Keeps the structural issue kind, the original CST node type, and the raw source fragment so
-/// downstream passes can reason about broken regions without guessing.
-public record ErrorExpression(CstIssueKind kind, String nodeType, String sourceText, Range range) implements Expression {
+/// Placeholder for malformed or missing expression syntax.
+/// Carries the issue kind, a node or slot identifier, and the source fragment when present.
+public record ErrorExpression(CstIssueKind kind, String nodeType, String sourceText,
+                              Range range) implements Expression {
 }

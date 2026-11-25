@@ -77,8 +77,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Behavior-anchoring tests for the declaration-layer parser: positive cases pin AST shapes and
 /// physical byte-based ranges; negative cases pin Godot's exact diagnostics, recovery and
-/// termination. Parity with the tree-sitter path on legal sources is covered separately by
-/// `GdParserParityTest`.
+/// termination.
 class GdScriptParserTest {
 
     private static AstMappingResult parse(String source) {
@@ -484,9 +483,7 @@ class GdScriptParserTest {
 
     @Test
     void nestedClassWithInBodyExtendsUsesGodotShape() {
-        // Godot treats an extends line at the start of an indented class body as the superclass;
-        // the tree-sitter path instead emits an ExtendsStatement inside the body. This pins the
-        // Godot behavior (registered parity divergence).
+        // Godot treats an extends line at the start of an indented class body as the superclass.
         var ast = cleanAst("class Inner:\n\textends Base\n\tpass\n");
         var declaration = assertInstanceOf(ClassDeclaration.class, onlyStatement(ast));
         assertEquals("Base", declaration.extendsTarget());
@@ -1389,7 +1386,7 @@ class GdScriptParserTest {
         var times = assertInstanceOf(BinaryExpression.class, constant.value());
         assertEquals("*", times.operator());
         // The grouping produces the inner expression itself (no wrapper node); the enclosing
-        // node's range still spans the consumed parentheses (tree-sitter-path range contract).
+        // node's range still spans the consumed parentheses.
         assertEquals("+", assertInstanceOf(BinaryExpression.class, times.left()).operator());
         assertEquals(new Range(10, 21, new Point(0, 10), new Point(0, 21)), times.range());
         assertEquals(new Range(11, 16, new Point(0, 11), new Point(0, 16)), times.left().range());
@@ -1620,7 +1617,6 @@ class GdScriptParserTest {
 
     @Test
     void getNodeGodotOnlyForms() {
-        // A registered divergence: legal in Godot, rejected by the tree-sitter path — no parity, Godot shapes.
         var ast = cleanAst("var a = $%Child\nvar b = $Root/%Child\n");
         assertEquals("$%Child", requireNotNull(assertInstanceOf(GetNodeExpression.class,
                 assertInstanceOf(VariableDeclaration.class, ast.statements().getFirst()).value())).sourceText());
@@ -1870,8 +1866,7 @@ class GdScriptParserTest {
 
     @Test
     void castBindsWeakerThanAdditionLikeGodot() {
-        // Godot anchors `1 + 2 as int` as `(1 + 2) as int` (PREC_CAST below addition); the
-        // tree-sitter path groups `1 + (2 as int)` (a registered precedence divergence, no parity).
+        // Godot parses `1 + 2 as int` as `(1 + 2) as int` because casts bind weaker than addition.
         var ast = cleanAst("const A = 1 + 2 as int\n");
         var cast = requireNotNull(assertInstanceOf(CastExpression.class,
                 assertInstanceOf(VariableDeclaration.class, onlyStatement(ast)).value()));
@@ -2607,7 +2602,7 @@ class GdScriptParserTest {
         // 105 genuinely failing `var` lines preceded by `@x` still trip STATEMENT_TOO_MANY_ERRORS.
         var overLimit = parse("func f():\n" + "\t@x\n\tvar\n".repeat(105));
         assertTrue(overLimit.diagnostics().stream()
-                .anyMatch(d -> DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS.equals(d.code())),
+                        .anyMatch(d -> DiagnosticCodes.STATEMENT_TOO_MANY_ERRORS.equals(d.code())),
                 () -> overLimit.diagnostics().toString());
     }
 
